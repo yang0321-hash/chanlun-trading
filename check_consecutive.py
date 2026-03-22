@@ -86,8 +86,8 @@ for date in all_dates:
                 max_cons = cons
                 max_code = code
 
-    status = "✓" if max_cons >= 4 else " "
-    print(f"{date.strftime('%Y-%m-%d')} {status}  最高连板: {max_cons}天 ({max_code})")
+    status = "OK" if max_cons >= 4 else "--"
+    print(f"{date.strftime('%Y-%m-%d')} {status}  Max: {max_cons} days ({max_code})")
 
 # 统计
 ge_4 = sum(1 for d in all_dates if any(
