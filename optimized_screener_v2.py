@@ -123,16 +123,23 @@ class WeightedScreenerV2:
 
         # ========================================
         # 优化后的评分系统 - 只保留有效指标
-        # 总分最高 10 分
+        # 总分最高 11 分
         # ========================================
 
-        # 【市场环境】最多 2 分
+        # 【市场环境】最多 3 分
         # 1. 大盘下跌 + 个股上涨 (2分) - 最强信号
         if market_stats['index_change'] < 0 and stock_change > 0:
             scores['market_stock_up'] = 2
             details['大盘跌个股涨'] = 2
         else:
             scores['market_stock_up'] = 0
+
+        # 2. 市场最高连板 >= 4 (1分) - 市场情绪指标
+        if market_stats['max_consecutive'] >= 4:
+            scores['max_consecutive'] = 1
+            details['高连板'] = 1
+        else:
+            scores['max_consecutive'] = 0
 
         # 【板块强度】最多 3 分
         # 板块排名
@@ -380,8 +387,8 @@ def main():
     screener = WeightedScreenerV2(tdx_path)
     screener.load_data(max_stocks=2000)
 
-    # 测试不同阈值
-    for min_score in [5, 6, 7]:
+    # 测试不同阈值 (总分11分)
+    for min_score in [6, 7, 8]:
         print(f"\n{'='*60}")
         print(f"评分阈值: {min_score}分")
         print(f"{'='*60}")
