@@ -1,6 +1,6 @@
 # 缠论交易系统 (ChanLun Trading System)
 
-[![CI/CD](https://github.com/你的用户名/chanlun-trading/workflows/CI%2FCD%20Pipeline/badge.svg)](https://github.com/你的用户名/chanlun-trading/actions)
+[![CI/CD](https://github.com/yang0321-hash/chanlun-trading/actions/workflows/ci.yml/badge.svg)](https://github.com/yang0321-hash/chanlun-trading/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
