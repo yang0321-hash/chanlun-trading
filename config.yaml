@@ -1,0 +1,40 @@
+# 缠论交易系统配置
+
+# 数据配置
+data:
+  # 数据源: akshare, tushare
+  source: akshare
+  # 数据存储路径
+  storage_path: ./data/storage
+  # 默认K线周期: 1min, 5min, 15min, 30min, 60min, daily, weekly, monthly
+  default_period: daily
+  # 复权方式: qfq(前复权), hfq(后复权), ''(不复权)
+  fq: qfq
+
+# 缠论参数
+chanlun:
+  # 分型确认: 是否等待K线确认
+  fractal_confirm: true
+  # 笔的最小K线数
+  min_stroke_bars: 5
+  # 线段最小笔数
+  min_segment_strokes: 3
+  # 是否使用严格模式（包含关系处理）
+  strict_mode: true
+
+# 回测配置
+backtest:
+  # 初始资金
+  initial_capital: 100000
+  # 手续费率
+  commission: 0.0003
+  # 滑点
+  slippage: 0.0001
+  # 最小交易单位
+  min_unit: 100
+
+# 日志配置
+logging:
+  level: INFO
+  file: ./logs/chanlun.log
+  rotation: 100 MB
