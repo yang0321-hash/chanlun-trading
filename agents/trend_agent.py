@@ -261,21 +261,36 @@ class TrendAgent(BaseAgent):
         highs = data['high'].values
         lows = data['low'].values
 
-        # 简单的支撑阻力算法：找局部高低点
-        from scipy.signal import argrelextrema
+        try:
+            # 简单的支撑阻力算法：找局部高低点
+            from scipy.signal import argrelextrema
 
-        # 找局部高点作为阻力
-        resistance_indices = argrelextrema(highs, np.greater, order=5)[0]
-        resistance_levels = sorted(highs[resistance_indices], reverse=True)[:n_levels]
+            # 找局部高点作为阻力
+            resistance_indices = argrelextrema(highs, np.greater, order=5)[0]
+            if len(resistance_indices) > 0:
+                resistance_levels = sorted(highs[resistance_indices].tolist(), reverse=True)[:n_levels]
+            else:
+                # 如果没找到，使用简单的最高点
+                resistance_levels = [float(max(highs))] * n_levels
 
-        # 找局部低点作为支撑
-        support_indices = argrelextrema(lows, np.less, order=5)[0]
-        support_levels = sorted(lows[support_indices])[:n_levels]
+            # 找局部低点作为支撑
+            support_indices = argrelextrema(lows, np.less, order=5)[0]
+            if len(support_indices) > 0:
+                support_levels = sorted(lows[support_indices].tolist())[:n_levels]
+            else:
+                # 如果没找到，使用简单的最低点
+                support_levels = [float(min(lows))] * n_levels
 
-        return {
-            'support': support_levels.tolist(),
-            'resistance': resistance_levels.tolist()
-        }
+            return {
+                'support': support_levels,
+                'resistance': resistance_levels
+            }
+        except Exception as e:
+            # 降级方案：使用简单的高低点
+            return {
+                'support': [float(min(lows))] * n_levels,
+                'resistance': [float(max(highs))] * n_levels
+            }
 
     def _determine_trend(self, ma_analysis: Dict, adx_analysis: Dict,
                          price_structure: Dict) -> tuple[TrendDirection, float]:

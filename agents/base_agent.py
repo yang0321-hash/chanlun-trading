@@ -3,7 +3,7 @@
 定义所有智能体的通用接口和行为
 """
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, asdict
 from typing import Any, Dict, Optional, List
 from datetime import datetime
 import pandas as pd
@@ -133,10 +133,13 @@ class AgentChain:
             results[agent.name] = output
 
             # 将当前输出添加到下一个智能体的输入中
-            current_input = AgentInput(
-                **{k: v for k, v in input_data.items() if k != 'previous_results'},
-                previous_results={**current_input.previous_results, agent.name: output}
-            )
+            # 使用 asdict 转换为字典，但排除 previous_results
+            input_dict = asdict(input_data)
+            input_dict.pop('previous_results', None)
+            input_dict['previous_results'] = {
+                **current_input.previous_results, agent.name: output
+            }
+            current_input = AgentInput(**input_dict)
 
         return results
 

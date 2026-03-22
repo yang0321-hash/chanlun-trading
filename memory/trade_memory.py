@@ -167,12 +167,20 @@ class TradeMemory:
         trade.commission = commission
 
         # 计算盈亏
-        if trade.is_long():
-            trade.pnl = (exit_price - trade.entry_price) * trade.quantity - commission
-        else:
-            trade.pnl = (trade.entry_price - exit_price) * trade.quantity - commission
+        if trade.quantity > 0:
+            if trade.is_long():
+                trade.pnl = (exit_price - trade.entry_price) * trade.quantity - commission
+            else:
+                trade.pnl = (trade.entry_price - exit_price) * trade.quantity - commission
 
-        trade.pnl_pct = trade.pnl / (trade.entry_price * trade.quantity)
+            trade.pnl_pct = trade.pnl / (trade.entry_price * trade.quantity)
+        else:
+            # 如果没有设置数量，只计算百分比盈亏
+            if trade.is_long():
+                trade.pnl_pct = (exit_price - trade.entry_price) / trade.entry_price
+            else:
+                trade.pnl_pct = (trade.entry_price - exit_price) / trade.entry_price
+            trade.pnl = trade.pnl_pct * trade.entry_price  # 假设1股
 
         self._save()
 
@@ -312,9 +320,9 @@ class TradeMemory:
         recent = sorted(self.trades, key=lambda x: x.entry_datetime, reverse=True)[:5]
         for trade in recent:
             status_emoji = "🟢" if trade.status == TradeStatus.OPEN else ("✅" if trade.pnl > 0 else "❌")
+            pnl_str = f"PnL:{trade.pnl_pct:.2%}" if trade.is_closed() else trade.status.value
             lines.append(f"  {status_emoji} {trade.trade_id} {trade.symbol} "
-                        f"{trade.side.value} @ {trade.entry_price:.2f} "
-                        f"{'PnL:' + str(trade.pnl_pct:.2%) if trade.is_closed() else trade.status.value}")
+                        f"{trade.side.value} @ {trade.entry_price:.2f} {pnl_str}")
 
         lines.append("\n" + "=" * 60)
         return "\n".join(lines)

@@ -1,0 +1,15 @@
+{
+  "BUY_2_600519": {
+    "pattern_id": "BUY_2_600519",
+    "signal_type": "2买",
+    "total_count": 7,
+    "win_count": 0,
+    "lose_count": 3,
+    "avg_pnl_pct": 0.0,
+    "max_profit_pct": 0.0,
+    "max_loss_pct": 0.0,
+    "avg_hold_days": 0.0,
+    "win_rate": 0.0,
+    "confidence_score": 0.0
+  }
+}
