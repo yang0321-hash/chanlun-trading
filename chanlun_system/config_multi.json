@@ -1,0 +1,13 @@
+{
+  "source": "tushare",
+  "codes": ["002600.SZ", "600519.SH", "000858.SZ", "601318.SH", "000333.SZ", "002415.SZ", "600036.SH", "000001.SZ"],
+  "start_date": "2020-01-01",
+  "end_date": "2026-04-10",
+  "interval": "1D",
+  "initial_cash": 1000000,
+  "commission": 0.001,
+  "extra_fields": null,
+  "optimizer": null,
+  "optimizer_params": {},
+  "engine": "daily"
+}
