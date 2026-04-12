@@ -81,6 +81,9 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+hermes/.env
+hermes/cli-config.yaml
+hermes/data/
 
 # Spyder project settings
 .spyderproject
@@ -120,6 +123,7 @@ tdx-updater-workspace/
 
 # Claude Code
 .claude/
+!.claude/skills/
 
 # OS
 .DS_Store
@@ -128,3 +132,4 @@ Thumbs.db
 # Data files
 *.day
 *.day.json
+.env
