@@ -1,0 +1,12 @@
+# Backtest data artifacts
+artifacts/*.csv
+artifacts/*.png
+
+# Walk-forward results
+wf/*/
+wf50/*/
+
+# Cache
+__pycache__/
+.home/
+*.pyc
