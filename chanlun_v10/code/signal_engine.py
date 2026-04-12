@@ -46,13 +46,14 @@ class SignalEngine:
         self.max_position = 0.30
         self.base_position = 0.15
 
-        # 移动止损 [v11c] 参数扫描最优组合
-        # 扫描: tight(0.025~0.05) x medium(0.05~0.07) x start(0.02~0.04)
-        # 最优: tight=0.025 + medium=0.06 + start=0.02
-        # Sharpe=3.508 vs 3.211, Calmar=8.04 vs 7.62, DD不变
-        self.trailing_start = 0.02       # [v11c] 更早启动(2%即保本)
-        self.trailing_tight = 0.025      # [v11c] 盈利2-6%: 回撤2.5%平仓
-        self.trailing_medium = 0.06      # [v11c] 盈利6-15%: 回撤6%平仓
+        # 移动止损 [v11d] 增量优化最优组合
+        # V11c→V11d: weekly_not_down 0.95→0.97 + trailing 更紧
+        # 扫描: weekly(0.955~0.975) x trailing(4组合)
+        # 最优: weekly=0.97, start=0.015, tight=0.02, medium=0.05
+        # Sharpe=3.793 vs V11c 3.508, 年化=78.5% vs 58.7%
+        self.trailing_start = 0.015      # [v11d] 更早启动(1.5%即保本)
+        self.trailing_tight = 0.02       # [v11d] 盈利1.5-6%: 回撤2%平仓
+        self.trailing_medium = 0.05      # [v11d] 盈利6-15%: 回撤5%平仓
         self.trailing_wide = 0.07        # 盈利>15%: 回撤7%平仓
         self.trailing_tier1 = 0.06       # 分界线1
         self.trailing_tier2 = 0.15       # 分界线2
@@ -436,6 +437,10 @@ class SignalEngine:
                 if not bi_buy.iloc[i]:
                     continue
 
+                # [v11d] 严格MA20过滤: 价格必须在MA20之上
+                if not pd.isna(ma20.iloc[i]) and price < ma20.iloc[i]:
+                    continue
+
                 # [v8] 涨跌停过滤: 涨停封板买不进，跳过
                 if i > 0 and close.iloc[i-1] > 0:
                     pct_change = (price - close.iloc[i-1]) / close.iloc[i-1]
@@ -705,7 +710,7 @@ class SignalEngine:
                 w_idx = len(prev_weekly) - 1
                 if pd.isna(ma10.iloc[w_idx]) or pd.isna(ma5.iloc[w_idx]):
                     continue
-                if ma5.iloc[w_idx] < ma10.iloc[w_idx] * 0.95:
+                if ma5.iloc[w_idx] < ma10.iloc[w_idx] * 0.97:  # [v11d] 收紧熊市过滤(0.95→0.97)
                     trends.iloc[i] = False
         except Exception:
             pass
