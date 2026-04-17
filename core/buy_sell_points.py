@@ -617,7 +617,8 @@ class BuySellPointDetector:
         bounce_amplitude = abs(last_bounce.price_change_pct)
 
         # ===== 置信度计算 =====
-        base_confidence = 0.5 + min(abs(first_sell.price - last_bounce.end_value) / first_sell.price * 5, 0.3)
+        # 标定：2卖置信度虚高严重(0.92 vs 34%胜率)，下调基础值
+        base_confidence = 0.4 + min(abs(first_sell.price - last_bounce.end_value) / first_sell.price * 5, 0.2)
 
         # 子级别递归确认（有数据时加分，无数据时不惩罚）
         sub_ok, sub_conf, sub_desc = self._check_sub_level_sell(
@@ -1493,7 +1494,8 @@ class BuySellPointDetector:
                             continue  # 振幅过大可能反转，不是2卖
 
                         # 置信度按反弹深度计算
-                        confidence = 0.5 + min(abs(sp.price - b.end_value) / sp.price * 5, 0.3)
+                        # 标定数据：2卖置信度0.92但胜率仅34%，大幅下调
+                        confidence = 0.4 + min(abs(sp.price - b.end_value) / sp.price * 5, 0.2)
 
                         # 子级别确认（有数据时加分，无数据不惩罚）
                         if self._sub_sell_points:
@@ -1538,7 +1540,8 @@ class BuySellPointDetector:
                     pivot_div, amp_ratio, macd_ratio = self._compute_pivot_divergence(
                         pivot, bo
                     )
-                    confidence = 0.6
+                    # 标定：3buy平均0.73但胜率55%，微调基础值
+                    confidence = 0.55
 
                     # 模糊区穿透惩罚
                     if pb.end_value < zg:
@@ -1622,7 +1625,8 @@ class BuySellPointDetector:
                     pivot_div, amp_ratio, macd_ratio = self._compute_pivot_divergence(
                         pivot, bd
                     )
-                    confidence = 0.6
+                    # 标定：3sell胜率59%，置信度基本匹配
+                    confidence = 0.55
 
                     # 模糊区穿透惩罚
                     if b.end_value > zd:
@@ -1768,8 +1772,9 @@ class BuySellPointDetector:
                     continue
 
                 # 置信度：基于不破前低的程度（差距越大越好）
+                # 标定数据：quasi2buy平均0.75但胜率仅50%，下调基础值
                 margin = (curr_down.end_value - prev_down.end_value) / prev_down.end_value
-                confidence = 0.45 + min(margin * 10, 0.25)
+                confidence = 0.35 + min(margin * 10, 0.20)
 
                 # MACD辅助：如果当前笔MACD面积小于前一笔，加分
                 if self.macd:
@@ -1870,7 +1875,8 @@ class BuySellPointDetector:
                     # 置信度
                     margin_above_zd = (pb.end_value - zd) / zd
                     penetration = (zg - pb.end_value) / zg  # 回调穿透ZG的深度
-                    confidence = 0.45 + min(margin_above_zd * 10, 0.2)
+                    # 标定数据：quasi3buy平均0.78但胜率仅48%，下调基础值
+                    confidence = 0.35 + min(margin_above_zd * 10, 0.15)
 
                     # 穿透越浅，信号越强
                     if penetration < 0.01:
@@ -1983,8 +1989,9 @@ class BuySellPointDetector:
                     continue
 
                 # 置信度：前高与当前反弹高点的差距
+                # 标定数据：quasi2sell置信度偏高但胜率仅36%，下调
                 margin = (prev_up.end_value - curr_up.end_value) / prev_up.end_value
-                confidence = 0.45 + min(margin * 10, 0.25)
+                confidence = 0.35 + min(margin * 10, 0.20)
 
                 # MACD辅助
                 if self.macd:
@@ -2085,7 +2092,8 @@ class BuySellPointDetector:
                     # 置信度
                     margin_below_zg = (zg - b.end_value) / zg
                     penetration = (b.end_value - zd) / zd  # 反弹穿透ZD的深度
-                    confidence = 0.45 + min(margin_below_zg * 10, 0.2)
+                    # 标定数据：quasi3sell胜率偏低，下调基础值
+                    confidence = 0.35 + min(margin_below_zg * 10, 0.15)
 
                     # 穿透越浅，信号越强
                     if penetration < 0.01:
