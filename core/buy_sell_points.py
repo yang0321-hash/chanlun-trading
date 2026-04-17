@@ -19,7 +19,7 @@
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 from loguru import logger
 
 from .fractal import Fractal
@@ -157,6 +157,12 @@ class BuySellPointDetector:
 
         # 统一的趋势轨道修正
         self._apply_trend_modifier()
+
+        # 多中枢趋势强度修正
+        self._apply_trend_strength_modifier()
+
+        # 量价确认修正
+        self._apply_volume_confirmation()
 
         return self._buy_points, self._sell_points
 
@@ -925,8 +931,9 @@ class BuySellPointDetector:
         amp_ratio = leaving_amp / adjacent_amp if adjacent_amp > 0 else 0.0
         has_divergence = amp_ratio < 1.0
 
-        # ===== 辅助指标：MACD面积比较 =====
+        # ===== 辅助指标：MACD面积比较 + 多笔趋势 =====
         macd_ratio = 0.0
+        macd_declining = False  # 多笔MACD面积递减趋势
         if self.macd:
             direction = 'up' if leaving_stroke.is_up else 'down'
 
@@ -940,6 +947,38 @@ class BuySellPointDetector:
                     leaving_stroke.start_index, leaving_stroke.end_index, direction
                 )
                 macd_ratio = leaving_area / adjacent_area
+
+            # 多笔MACD面积递减趋势检测
+            # 收集所有同向笔的MACD面积，检查是否逐笔递减
+            all_same_dir = [s for s in self.strokes
+                           if (s.is_up if leaving_stroke.is_up else s.is_down)
+                           and s.end_index <= leaving_stroke.end_index]
+            if len(all_same_dir) >= 3:
+                areas = []
+                for s in all_same_dir[-5:]:  # 最近5笔
+                    a = self.macd.compute_area(s.start_index, s.end_index, direction)
+                    areas.append(abs(a))
+                # 检查递减趋势（允许1笔例外）
+                if len(areas) >= 3:
+                    declines = sum(1 for i in range(1, len(areas)) if areas[i] < areas[i-1])
+                    macd_declining = declines >= len(areas) - 2  # 至少n-2次递减
+
+        # ===== 辅助指标：时间维度背驰 =====
+        # 离开笔持续时间 < 进入笔持续时间 → 时间背驰（动能衰竭更快）
+        time_divergence = False
+        time_ratio = 0.0
+        if adjacent_entering.length > 0 and leaving_stroke.length > 0:
+            time_ratio = leaving_stroke.length / adjacent_entering.length
+            time_divergence = time_ratio < 0.8  # 离开笔时间不到进入笔80%
+
+        # ===== 综合背驰评分 =====
+        # 如果多维度都指向背驰，加强信号
+        if macd_declining and time_divergence:
+            # 多维共振：MACD面积递减 + 时间缩短 → 强背驰
+            has_divergence = True  # 即使振幅比>1也覆盖
+        elif macd_declining and amp_ratio < 1.2:
+            # MACD面积趋势 + 弱振幅 → 中等背驰
+            has_divergence = True
 
         return (has_divergence, amp_ratio, macd_ratio)
 
@@ -964,7 +1003,271 @@ class BuySellPointDetector:
             sp.confidence = max(0.1, min(1.0, sp.confidence + modifier))
             sp.trend_modifier = modifier
 
-    def _find_implied_first_buy(self) -> Optional[BuySellPoint]:
+    # ==================== 量价确认 ====================
+
+    def _stroke_volume_ratio(self, stroke: Stroke) -> float:
+        """
+        计算笔的量比（笔内均量 / 之前笔的均量基准）
+
+        Returns:
+            量比 >1.2 放量, <0.8 缩量, 0=无数据
+        """
+        if not stroke.bars or len(stroke.bars) < 2:
+            return 0.0
+
+        stroke_vol = sum(b.volume for b in stroke.bars) / len(stroke.bars)
+
+        # 用当前笔之前的笔作为基准
+        prev_bars = []
+        for s in self.strokes:
+            if s.end_index < stroke.start_index and s.bars:
+                prev_bars.extend(s.bars)
+
+        if not prev_bars:
+            return 0.0
+
+        # 取最近20根K线作为基准
+        baseline = prev_bars[-20:] if len(prev_bars) >= 20 else prev_bars
+        baseline_vol = sum(b.volume for b in baseline) / len(baseline)
+
+        if baseline_vol <= 0:
+            return 0.0
+        return stroke_vol / baseline_vol
+
+    def _check_volume_breakout(self, stroke: Stroke) -> Tuple[float, str]:
+        """
+        检查突破笔的量价确认
+
+        Returns:
+            (置信度修正值, 描述)
+            放量突破: +0.1
+            温和放量: +0.05
+            缩量突破: -0.1 (不可靠)
+        """
+        vol_ratio = self._stroke_volume_ratio(stroke)
+        if vol_ratio <= 0:
+            return (0.0, '')
+        if vol_ratio > 1.5:
+            return (0.1, f'放量突破(量比{vol_ratio:.1f})')
+        elif vol_ratio > 1.2:
+            return (0.05, f'温和放量(量比{vol_ratio:.1f})')
+        elif vol_ratio < 0.7:
+            return (-0.1, f'缩量突破(量比{vol_ratio:.1f})')
+        return (0.0, '')
+
+    def _check_volume_pullback(self, stroke: Stroke) -> Tuple[float, str]:
+        """
+        检查回调/反弹笔的量价确认
+
+        Returns:
+            (置信度修正值, 描述)
+            缩量回调: +0.08 (健康的回调)
+            温和缩量: +0.03
+            放量回调: -0.1 (恐慌抛售，信号不可靠)
+        """
+        vol_ratio = self._stroke_volume_ratio(stroke)
+        if vol_ratio <= 0:
+            return (0.0, '')
+        if vol_ratio < 0.7:
+            return (0.08, f'缩量回调(量比{vol_ratio:.1f})')
+        elif vol_ratio < 0.9:
+            return (0.03, f'温和缩量(量比{vol_ratio:.1f})')
+        elif vol_ratio > 1.5:
+            return (-0.1, f'放量回调(量比{vol_ratio:.1f})')
+        return (0.0, '')
+
+    def _apply_volume_confirmation(self) -> None:
+        """
+        对所有已检测到的买卖点应用量价确认修正
+
+        - 买点：突破笔放量 +回调缩量为正
+        - 卖点：突破笔放量 +反弹缩量为正
+        """
+        for bp in self._buy_points:
+            if not bp.related_strokes:
+                continue
+            modifier = 0.0
+            vol_notes = []
+
+            # 突破笔（最后一根向上的related_stroke）
+            breakout = [s for s in bp.related_strokes if s.is_up]
+            if breakout:
+                m, desc = self._check_volume_breakout(breakout[-1])
+                modifier += m
+                if desc:
+                    vol_notes.append(desc)
+
+            # 回调笔（最后一根向下的related_stroke）
+            pullback = [s for s in bp.related_strokes if s.is_down]
+            if pullback:
+                m, desc = self._check_volume_pullback(pullback[-1])
+                modifier += m
+                if desc:
+                    vol_notes.append(desc)
+
+            if modifier != 0:
+                bp.confidence = max(0.1, min(1.0, bp.confidence + modifier))
+                if vol_notes:
+                    bp.reason += ' | ' + ', '.join(vol_notes)
+
+        for sp in self._sell_points:
+            if not sp.related_strokes:
+                continue
+            modifier = 0.0
+            vol_notes = []
+
+            # 突破笔（向下的）
+            breakout = [s for s in sp.related_strokes if s.is_down]
+            if breakout:
+                m, desc = self._check_volume_breakout(breakout[-1])
+                modifier += m
+                if desc:
+                    vol_notes.append(desc)
+
+            # 反弹笔（向上的）
+            bounce = [s for s in sp.related_strokes if s.is_up]
+            if bounce:
+                m, desc = self._check_volume_pullback(bounce[-1])
+                modifier += m
+                if desc:
+                    vol_notes.append(desc)
+
+            if modifier != 0:
+                sp.confidence = max(0.1, min(1.0, sp.confidence + modifier))
+                if vol_notes:
+                    sp.reason += ' | ' + ', '.join(vol_notes)
+
+    # ==================== 多中枢趋势分析 ====================
+
+    def _analyze_pivot_trend(self) -> Dict:
+        """
+        分析中枢序列的趋势方向和强度
+
+        Returns:
+            {
+                'direction': 'up'/'down'/''/flat,
+                'strength': 0.0-1.0,
+                'acceleration': 加速度（正=加速，负=减速）,
+                'pivot_count': 中枢数量,
+            }
+        """
+        if len(self.pivots) < 2:
+            return {'direction': '', 'strength': 0.0, 'acceleration': 0.0, 'pivot_count': len(self.pivots)}
+
+        # 比较相邻中枢的ZG/ZD位置
+        up_count = 0
+        down_count = 0
+        zg_changes = []
+
+        for i in range(1, len(self.pivots)):
+            prev = self.pivots[i - 1]
+            curr = self.pivots[i]
+            zg_diff = curr.zg - prev.zg
+            zd_diff = curr.zd - prev.zd
+
+            zg_changes.append(zg_diff)
+
+            # 两个维度都上升才算上升趋势
+            if zg_diff > 0 and zd_diff > 0:
+                up_count += 1
+            elif zg_diff < 0 and zd_diff < 0:
+                down_count += 1
+
+        n = len(self.pivots) - 1
+        if up_count > down_count and up_count >= n * 0.5:
+            direction = 'up'
+        elif down_count > up_count and down_count >= n * 0.5:
+            direction = 'down'
+        else:
+            direction = ''
+
+        # 趋势强度：一致方向的比例
+        if direction == 'up':
+            strength = up_count / n
+        elif direction == 'down':
+            strength = down_count / n
+        else:
+            strength = 0.0
+
+        # 加速度：后段趋势是否比前段更强
+        if len(zg_changes) >= 4:
+            half = len(zg_changes) // 2
+            first_half = sum(abs(x) for x in zg_changes[:half]) / half
+            second_half = sum(abs(x) for x in zg_changes[half:]) / (len(zg_changes) - half)
+            if first_half > 0:
+                acceleration = (second_half - first_half) / first_half
+            else:
+                acceleration = 0.0
+        else:
+            acceleration = 0.0
+
+        return {
+            'direction': direction,
+            'strength': min(1.0, strength),
+            'acceleration': acceleration,
+            'pivot_count': len(self.pivots),
+        }
+
+    def _apply_trend_strength_modifier(self) -> None:
+        """
+        根据多中枢趋势分析调整买卖点置信度
+
+        规则：
+        - 强上升趋势中：1买更可靠（+0.1），3买更可靠（+0.05）
+        - 强下降趋势中：1卖更可靠（+0.1），3卖更可靠（+0.05）
+        - 弱趋势/横盘中：quasi买点降权（-0.1）
+        - 加速趋势中：标准买点加分（+0.05）
+        """
+        trend = self._analyze_pivot_trend()
+        direction = trend['direction']
+        strength = trend['strength']
+        acceleration = trend['acceleration']
+
+        if strength < 0.5:
+            # 弱趋势：quasi买点降权
+            for bp in self._buy_points:
+                if 'quasi' in bp.point_type:
+                    bp.confidence = max(0.1, bp.confidence - 0.1)
+            for sp in self._sell_points:
+                if 'quasi' in sp.point_type:
+                    sp.confidence = max(0.1, sp.confidence - 0.1)
+            return
+
+        # 强趋势修正
+        if direction == 'up':
+            for bp in self._buy_points:
+                if bp.point_type == '1buy':
+                    bp.confidence = min(1.0, bp.confidence + 0.1)
+                    bp.reason += ', 强上升趋势确认'
+                elif bp.point_type == '3buy':
+                    bp.confidence = min(1.0, bp.confidence + 0.05)
+            # 上升趋势中1卖不可靠（可能只是回调）
+            for sp in self._sell_points:
+                if sp.point_type == '1sell':
+                    sp.confidence = max(0.1, sp.confidence - 0.05)
+
+        elif direction == 'down':
+            for sp in self._sell_points:
+                if sp.point_type == '1sell':
+                    sp.confidence = min(1.0, sp.confidence + 0.1)
+                    sp.reason += ', 强下降趋势确认'
+                elif sp.point_type == '3sell':
+                    sp.confidence = min(1.0, sp.confidence + 0.05)
+            # 下降趋势中1买不可靠
+            for bp in self._buy_points:
+                if bp.point_type == '1buy':
+                    bp.confidence = max(0.1, bp.confidence - 0.05)
+
+        # 加速趋势加分
+        if abs(acceleration) > 0.3:
+            if direction == 'up':
+                for bp in self._buy_points:
+                    if bp.point_type in ('1buy', '2buy', '3buy'):
+                        bp.confidence = min(1.0, bp.confidence + 0.05)
+            elif direction == 'down':
+                for sp in self._sell_points:
+                    if sp.point_type in ('1sell', '2sell', '3sell'):
+                        sp.confidence = min(1.0, sp.confidence + 0.05)
         """从笔结构推断隐含的1买点（用于2买检测），增加背驰验证"""
         if not self.pivots or len(self.strokes) < 3:
             return None
