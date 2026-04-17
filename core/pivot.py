@@ -138,6 +138,21 @@ class Pivot:
         """
         return self.low <= price <= self.high
 
+    def contains_fuzzy(self, price: float, tolerance: float = 0.005) -> bool:
+        """
+        判断价格是否在模糊中枢区间内
+
+        Args:
+            price: 价格
+            tolerance: 模糊容忍度（百分比，默认0.5%）
+
+        Returns:
+            是否在模糊中枢内
+        """
+        fuzzy_zg = self.zg * (1 + tolerance) if self.zg > 0 else self.high
+        fuzzy_zd = self.zd * (1 - tolerance) if self.zd > 0 else self.low
+        return fuzzy_zd <= price <= fuzzy_zg
+
     def is_above(self, price: float) -> bool:
         """判断价格是否在中枢上方"""
         return price > self.high
@@ -415,7 +430,92 @@ def detect_pivots(
     return detector.get_pivots()
 
 
-class MultiLevelPivot:
+def detect_segment_pivots(
+    kline: KLine,
+    segments: List[Segment],
+    level: PivotLevel = PivotLevel.DAY
+) -> List[Pivot]:
+    """
+    从线段构建中枢（线段级别中枢）
+
+    线段级别中枢比笔级别中枢范围更精确，用于验证3买/3卖信号。
+    复用3元素重叠区间逻辑，但以线段为基本单位。
+
+    Args:
+        kline: K线对象
+        segments: 线段列表
+        level: 中枢级别
+
+    Returns:
+        线段级别中枢列表
+    """
+    if len(segments) < 3:
+        return []
+
+    pivots = []
+    i = 0
+    while i <= len(segments) - 3:
+        s1, s2, s3 = segments[i], segments[i + 1], segments[i + 2]
+
+        # 检查方向交替
+        if s1.direction == s2.direction or s2.direction == s3.direction:
+            i += 1
+            continue
+
+        # ZG/ZD 由前两个线段确定
+        zg = min(s1.high, s2.high)
+        zd = max(s1.low, s2.low)
+
+        # 有效重叠区间
+        if zg <= zd:
+            i += 1
+            continue
+
+        # 第3个线段必须与 [ZD, ZG] 有重叠
+        if not (s3.high >= zd and s3.low <= zg):
+            i += 1
+            continue
+
+        seg_list = [s1, s2, s3]
+        direction = 'up' if s1.is_up else 'down'
+        start_index = s1.start_index
+        end_index = s3.end_index
+
+        # 扩展中枢
+        idx = i + 3
+        while idx < len(segments):
+            next_seg = segments[idx]
+            if next_seg.low <= zg and next_seg.high >= zd:
+                seg_list.append(next_seg)
+                end_index = next_seg.end_index
+                idx += 1
+            else:
+                break
+
+        gg = max(s.high for s in seg_list)
+        dd = min(s.low for s in seg_list)
+
+        pivot = Pivot(
+            level=level,
+            start_index=start_index,
+            end_index=end_index,
+            high=zg,
+            low=zd,
+            zg=zg,
+            zd=zd,
+            gg=gg,
+            dd=dd,
+            strokes=[],  # 线段中枢不含笔列表
+            direction=direction,
+            confirmed=True,
+        )
+        # 存储线段引用（附加属性）
+        pivot.segments = seg_list
+        pivots.append(pivot)
+
+        i += len(seg_list) - 1
+
+    return pivots
     """
     多级别中枢分析
 

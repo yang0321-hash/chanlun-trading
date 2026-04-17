@@ -190,7 +190,18 @@ class StrokeGenerator:
         # ---- 阶段1: Swing High/Low 检测 ----
         # 找到所有局部极值点: 左右各lookback根K线内, 当前K线是最高/最低
         # lookback越大, 笔越少越长 (类似TDX的 SUMBARS N层展开)
+        # 自适应lookback: 根据近期波动率动态调整
         lookback = max(3, self.min_bars)
+        if n > 20:
+            recent_range = np.mean([kline_data[j].high - kline_data[j].low
+                                     for j in range(-20, 0)])
+            avg_price = np.mean([kline_data[j].close for j in range(-20, 0)])
+            if avg_price > 0:
+                vol_pct = recent_range / avg_price
+                if vol_pct < 0.01:      # 低波动 (<1%日振幅): 更敏感
+                    lookback = max(3, self.min_bars - 1)
+                elif vol_pct > 0.04:     # 高波动 (>4%日振幅): 更平滑
+                    lookback = self.min_bars + 2
 
         swing_points = []  # (index, 'high'|'low')
 

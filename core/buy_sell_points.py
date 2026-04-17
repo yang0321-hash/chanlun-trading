@@ -83,12 +83,16 @@ class BuySellPointDetector:
         # 参数
         divergence_threshold: float = 0.3,  # 背驰面积比阈值
         min_strokes_for_divergence: int = 2,  # 背驰比较最少需要的同向笔数
+        fuzzy_tolerance: float = 0.005,  # ZG/ZD模糊容忍区(0.5%)
+        segment_pivots: Optional[List[Pivot]] = None,  # 线段级别中枢
     ):
         self.fractals = fractals
         self.strokes = strokes
         self.segments = segments
         self.pivots = pivots
         self.macd = macd
+        self.fuzzy_tolerance = fuzzy_tolerance
+        self._segment_pivots = segment_pivots or []
         self.divergence_threshold = divergence_threshold
         self.min_strokes_for_divergence = min_strokes_for_divergence
 
@@ -236,6 +240,9 @@ class BuySellPointDetector:
         )
         if not pivot_div:
             return None
+
+        # 置信度基准
+        base_confidence = 0.5 + min((1.0 - amp_ratio) * 0.5, 0.4)
 
         # 辅助：MACD面积确认
         macd_confirmed = macd_ratio > 0 and macd_ratio < 1.0
@@ -388,13 +395,20 @@ class BuySellPointDetector:
 
         last_pullback = pullback_strokes[-1]
 
-        # 核心条件：回调低点不跌破ZG
-        if last_pullback.end_value <= zg:
+        # 核心条件：回调低点不跌破ZG（含模糊容忍区）
+        fuzzy_zg = zg * (1 - self.fuzzy_tolerance)
+        if last_pullback.end_value <= fuzzy_zg:
             return None
 
+        # 模糊区穿透惩罚：进入模糊区但未跌破fuzzy_zg
+        fuzzy_penalty = 0.0
+        if last_pullback.end_value < zg:
+            penetration = (zg - last_pullback.end_value) / zg
+            fuzzy_penalty = min(penetration * 20, 0.15)  # 穿透越深惩罚越大
+
         # 置信度
-        margin = (last_pullback.end_value - zg) / zg
-        confidence = 0.5 + min(margin * 10, 0.3)
+        margin = (last_pullback.end_value - fuzzy_zg) / zg
+        confidence = 0.5 + min(margin * 10, 0.3) - fuzzy_penalty
 
         # 中枢背驰修正（振幅主判定）
         if pivot_div:
@@ -414,8 +428,21 @@ class BuySellPointDetector:
         elif self._sub_strokes:
             confidence -= 0.05
 
+        # 线段级别中枢验证（更强的确认）
+        seg_pivot_info = ''
+        if self._segment_pivots:
+            for sp in reversed(self._segment_pivots):
+                # 突破笔穿透了线段级别中枢ZG → 强信号
+                if last_breakout.end_value > sp.zg > 0 and sp.start_index < last_breakout.start_index:
+                    confidence += 0.1
+                    # 线段级别ZG作为更精确的止损
+                    seg_zg = sp.zg
+                    seg_pivot_info = f', 线段中枢ZG={seg_zg:.2f}确认突破'
+                    break
+
         confidence = max(0.1, min(1.0, confidence))
-        stop_loss = zg * 0.99
+        # 止损：优先用线段级别ZG，其次用笔级别ZG
+        stop_loss = seg_zg * 0.99 if seg_pivot_info else zg * 0.99
 
         # 持仓引导
         if confidence >= 0.8:
@@ -438,6 +465,8 @@ class BuySellPointDetector:
             reason_suffix += f', MACD确认({macd_ratio:.2f})'
         if sub_ok:
             reason_suffix += f', {sub_desc}'
+        if seg_pivot_info:
+            reason_suffix += seg_pivot_info
 
         return BuySellPoint(
             point_type='3buy',
@@ -503,6 +532,9 @@ class BuySellPointDetector:
         )
         if not pivot_div:
             return None
+
+        # 置信度基准
+        base_confidence = 0.5 + min((1.0 - amp_ratio) * 0.5, 0.4)
 
         # 辅助：MACD面积确认
         macd_confirmed = macd_ratio > 0 and macd_ratio < 1.0
@@ -644,11 +676,18 @@ class BuySellPointDetector:
 
         last_bounce = bounce_strokes[-1]
 
-        # 反弹不进入中枢
-        if last_bounce.end_value >= zd:
+        # 反弹不进入中枢（含模糊容忍区）
+        fuzzy_zd = zd * (1 + self.fuzzy_tolerance)
+        if last_bounce.end_value >= fuzzy_zd:
             return None
 
-        confidence = 0.5 + min(abs(zd - last_bounce.end_value) / zd * 10, 0.3)
+        # 模糊区穿透惩罚
+        fuzzy_penalty = 0.0
+        if last_bounce.end_value > zd:
+            penetration = (last_bounce.end_value - zd) / zd
+            fuzzy_penalty = min(penetration * 20, 0.15)
+
+        confidence = 0.5 + min(abs(fuzzy_zd - last_bounce.end_value) / zd * 10, 0.3) - fuzzy_penalty
 
         # 中枢背驰修正（振幅主判定）
         if pivot_div:
@@ -1008,6 +1047,18 @@ class BuySellPointDetector:
 
                 macd_info = f', MACD确认({macd_ratio:.2f})' if macd_confirmed else ''
 
+                # 子级别递归确认
+                sub_ok, sub_conf, sub_desc = self._check_sub_level_buy(
+                    leave_s.end_index, ['1buy']
+                )
+                if sub_ok:
+                    confidence += 0.15
+                elif self._sub_buy_points:
+                    confidence -= 0.1
+                sub_info = f', {sub_desc}' if sub_ok else ''
+
+                confidence = max(0.1, min(1.0, confidence))
+
                 self._buy_points.append(BuySellPoint(
                     point_type='1buy',
                     price=leave_s.end_value,
@@ -1018,7 +1069,7 @@ class BuySellPointDetector:
                     pivot_divergence_ratio=amp_ratio,
                     confidence=confidence,
                     stop_loss=leave_s.low * 0.99,
-                    reason=f'1买: 振幅背驰(离开/进入={amp_ratio:.2f}), 下跌趋势, ZD={pivot.zd:.2f}{macd_info}'
+                    reason=f'1买: 振幅背驰(离开/进入={amp_ratio:.2f}), 下跌趋势, ZD={pivot.zd:.2f}{macd_info}{sub_info}'
                 ))
 
     def _detect_first_sell(self) -> None:
@@ -1058,6 +1109,18 @@ class BuySellPointDetector:
 
                 macd_info = f', MACD确认({macd_ratio:.2f})' if macd_confirmed else ''
 
+                # 子级别递归确认
+                sub_ok, sub_conf, sub_desc = self._check_sub_level_sell(
+                    leave_s.end_index, ['1sell']
+                )
+                if sub_ok:
+                    confidence += 0.15
+                elif self._sub_sell_points:
+                    confidence -= 0.1
+                sub_info = f', {sub_desc}' if sub_ok else ''
+
+                confidence = max(0.1, min(1.0, confidence))
+
                 self._sell_points.append(BuySellPoint(
                     point_type='1sell',
                     price=leave_s.end_value,
@@ -1067,7 +1130,7 @@ class BuySellPointDetector:
                     divergence_ratio=macd_ratio,
                     pivot_divergence_ratio=amp_ratio,
                     confidence=confidence,
-                    reason=f'1卖: 振幅背驰(离开/进入={amp_ratio:.2f}), 上涨趋势{macd_info}'
+                    reason=f'1卖: 振幅背驰(离开/进入={amp_ratio:.2f}), 上涨趋势{macd_info}{sub_info}'
                 ))
 
     def _detect_second_buy(self) -> None:
@@ -1166,13 +1229,19 @@ class BuySellPointDetector:
             for bo in breakout:
                 pullback = [s for s in self.strokes
                             if s.is_down and s.start_index > bo.end_index
-                            and s.end_value > zg
+                            and s.end_value > zg * (1 - self.fuzzy_tolerance)
                             and s.end_index <= bo.end_index + 50]
                 for pb in pullback:
                     pivot_div, amp_ratio, macd_ratio = self._compute_pivot_divergence(
                         pivot, bo
                     )
                     confidence = 0.6
+
+                    # 模糊区穿透惩罚
+                    if pb.end_value < zg:
+                        penetration = (zg - pb.end_value) / zg
+                        confidence -= min(penetration * 20, 0.15)
+
                     if pivot_div:
                         confidence += 0.1
                     elif amp_ratio > 5.0:
@@ -1189,6 +1258,15 @@ class BuySellPointDetector:
                         reason_suffix = f', 离开力度={amp_ratio:.2f}'
                     if macd_confirmed:
                         reason_suffix += f', MACD确认({macd_ratio:.2f})'
+
+                    # 子级别递归确认
+                    sub_ok, sub_low, sub_desc = self._check_sub_level_3buy(zg)
+                    if sub_ok:
+                        confidence += 0.1
+                    elif self._sub_strokes:
+                        confidence -= 0.05
+                    if sub_ok:
+                        reason_suffix += f', {sub_desc}'
 
                     # 持仓引导
                     if confidence >= 0.8:
@@ -1235,13 +1313,19 @@ class BuySellPointDetector:
             for bd in breakdown:
                 bounce = [s for s in self.strokes
                           if s.is_up and s.start_index > bd.end_index
-                          and s.end_value < zd
+                          and s.end_value < zd * (1 + self.fuzzy_tolerance)
                           and s.end_index <= bd.end_index + 50]
                 for b in bounce:
                     pivot_div, amp_ratio, macd_ratio = self._compute_pivot_divergence(
                         pivot, bd
                     )
                     confidence = 0.6
+
+                    # 模糊区穿透惩罚
+                    if b.end_value > zd:
+                        penetration = (b.end_value - zd) / zd
+                        confidence -= min(penetration * 20, 0.15)
+
                     if pivot_div:
                         confidence += 0.1
                     elif amp_ratio > 5.0:
