@@ -28,10 +28,13 @@ class Trade:
 class BacktestConfig:
     """回测配置"""
     initial_capital: float = 100000
-    commission: float = 0.0003  # 手续费率
+    commission: float = 0.0003       # 手续费率 (买入, 向后兼容)
+    commission_buy: float = 0.0003   # 买入综合费率 (万3: 佣金万2.5+过户费万0.1+证管费万0.2≈0.028%)
+    commission_sell: float = 0.0013  # 卖出综合费率 (千1.3: 佣金万2.5+过户费万0.1+证管费万0.2+印花税千1≈0.128%)
     slippage: float = 0.0001    # 滑点
     min_unit: int = 100         # 最小交易单位
     position_limit: float = 0.95 # 仓位上限
+    allow_fractional_shares: bool = True  # R2: 允许零股交易(高价股适配)
 
 
 class BacktestEngine:
@@ -186,17 +189,26 @@ class BacktestEngine:
                 # 先计算能买多少股，然后取整到min_unit
                 shares = int(available_cash / execution_price)
                 quantity = (shares // self.config.min_unit) * self.config.min_unit
+                # R2: 如果不足1手(100股)但资金够买零股, 允许买入(高价股适配)
+                # A股实际规则: 买入必须100股整数倍, 但回测中放宽以验证策略逻辑
+                if quantity == 0 and shares > 0 and self.config.allow_fractional_shares:
+                    quantity = shares  # 零股买入
             else:
                 quantity = self.strategy.get_position(symbol)
         else:
             quantity = signal.quantity
 
-        # 检查最小交易单位
-        if quantity < self.config.min_unit:
+        # 检查最小交易单位(R2: 从硬性min_unit改为1, 允许零股)
+        if quantity < 1:
             return
 
-        # 计算手续费
-        commission = execution_price * quantity * self.config.commission
+        # 计算手续费 (A股非对称佣金模型)
+        # 买入: 佣金+过户费 ≈ 万3; 卖出: 佣金+过户费+印花税 ≈ 千1.3
+        if signal.is_buy():
+            commission_rate = self.config.commission_buy
+        else:
+            commission_rate = self.config.commission_sell
+        commission = execution_price * quantity * commission_rate
         commission = max(commission, 5)  # 最低5元
 
         # 执行交易

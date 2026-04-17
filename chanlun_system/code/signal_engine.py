@@ -1,5 +1,35 @@
 """
-缠论交易信号引擎 v9
+缠论交易信号引擎 v14.1 (中枢背驰, 2026-04-15)
+
+v14→v14.1 新增:
+1. [P0] 中枢识别: 3笔重叠区域形成中枢[ZD, ZG]
+2. [P0] 趋势背驰1买: 2个下跌中枢+离开段MACD面积<进入段面积+分型确认
+3. [P0] 趋势背驰1卖: 2个上涨中枢+离开段MACD面积<进入段面积+分型确认
+4. 中枢背驰信号仓位加成0.18(与笔级背驰/2买/3买同等)
+
+继承v14核心:
+v13→v14 新增:
+1. [P0] 线段检测: 3笔重叠+极值突破, 笔级别背驰升级为线段级别
+2. [P0] 线段级别MACD面积背驰: 两段同向线段面积缩小=大级别背驰
+3. [P0] 2卖检测: 1卖后下跌→反弹不过前高=确认顶部离场
+4. 背驰合并: 笔级别+线段级别取并集, 不遗漏
+
+继承v13核心:
+1. [P0] 背驰检测: 从DIF/hist时点值改为MACD面积(缠论标准)
+2. [P0] 新增2买检测: 1买后反弹再回调不破前低(最实用买点)
+3. [P1] 修复3买or True bug: 弱3买不再无条件覆盖标准3买
+4. [P1] 笔检测返回strokes: 为背驰面积计算和中枢检测提供结构数据
+
+继承v12核心:
+1. [T0] 动态月度轮换池: 从200只CSI500候选中每月评分选top50
+   - 评分因子: ATR波动率(0.35) + 动量(0.30) + 量能活跃度(0.20) + 趋势强度(0.15)
+   - 不在池中的股票不允许新开仓, 已持仓可继续管理(止损/止盈正常执行)
+   - 目标: 过滤死票, 提高信号密度和资金效率
+
+继承v11.1核心:
+- 3买独立入场 + 中高端tier+1%空间
+- 分阶段移动止损 + 背驰信号加成
+- 自研确定性笔检测(消除CZSC前视)
 
 v8→v9 优化清单:
 1. [T1] 分阶段移动止损: 盈利3-6%回撤3%/6-15%回撤5%/>15%回撤7%
@@ -67,22 +97,84 @@ class SignalEngine:
         self.atr_period = 14             # ATR计算周期
 
         # 笔参数(自研确定性检测)
-        self.bi_min_gap = 4             # 笔的最小包含处理后K线数(含端点)
+        self.bi_min_gap = 3             # 笔的最小包含处理后K线数(含端点)
         self.bi_confirm_delay = 1       # 分型确认延迟(1根原始K线)
+
+        # ===== v10 新增: 动量仓位因子 =====
+        self.momentum_factor_enabled = True
+        self.momentum_period = 60        # 动量计算周期
+
+        # ===== v10 新增: 波动率自适应 =====
+        self.vol_regime_enabled = True
+        self.vol_lookback = 120          # ATR百分位计算窗口
 
         # 组合级共享状态(由generate()初始化)
         self._active_positions = 0
+        self._active_industries = {}  # {industry: count} [v12.2]
         self._last_loss_codes = {}       # code -> (last_loss_bar_idx, loss_pct)
         self._portfolio_peak = 0.0       # 组合权益峰值(用于回撤计算)
         self._portfolio_equity = 0.0     # 组合权益当前值
         self._trading_halted = False     # 回撤暂停标志
         self._consecutive_losses = 0     # 连续亏损计数
-        self._last_loss_bar = -999       # 上次亏损的bar索引
-        self._loss_pause_until = -1      # 连续亏损暂停截止bar
+        self._last_loss_bar = -999
+        self._loss_pause_until = -1
 
-    def generate(self, data_map: Dict[str, pd.DataFrame]) -> Dict[str, pd.Series]:
-        """组合层信号生成，初始化共享状态"""
+        # ===== v11: 3买信号 =====
+        self.third_buy_enabled = True    # 启用3买检测
+        self.third_buy_boost = 0.18      # 3买仓位保底(与背驰加成相同)
+        # 3买专项移动止损: 只在盈利>8%时给额外1%空间
+        # 低端(3-8%)和普通完全一致 — 3买的小利润交易不需要特殊对待
+        # 中高端多1% — 3买趋势确认后让利润多跑一点
+        self.third_buy_tier1 = 0.03       # 盈利3%启动(和普通一致)
+        self.third_buy_tight = 0.03       # 3-8%: 回撤3%(和普通完全一致)
+        self.third_buy_medium = 0.06     # 8-15%: 回撤6%(vs普通5%, +1%)
+        self.third_buy_wide = 0.08       # >15%: 回撤8%(vs普通7%, +1%)
+
+        # ===== v12: 动态月度轮换池 =====
+        self.dynamic_pool_enabled = True  # 启用动态轮换
+        self.pool_size = 50              # 每月选出的股票数
+        self.pool_score_lookback = 60    # 评分回看天数
+        # 评分权重: ATR波动率 + 动量 + 量能活跃度 + 趋势强度
+        self.pool_w_atr = 0.35
+        self.pool_w_momentum = 0.30
+        self.pool_w_volume = 0.20
+        self.pool_w_trend = 0.15
+
+        # ===== v12.2: 板块去重 =====
+        self.sector_dedup_enabled = True
+        self.sector_max_holdings = 2  # 同行业最多持仓数
+        self._load_industry_map()
+
+    def _load_industry_map(self):
+        """加载股票→行业映射"""
+        self._industry_map = {}
+        try:
+            import os, json
+            map_path = os.path.join(os.path.dirname(__file__), '..', 'industry_map.json')
+            if os.path.exists(map_path):
+                with open(map_path) as f:
+                    self._industry_map = json.load(f)
+        except Exception:
+            pass
+
+    def generate(self, data_map: Dict[str, pd.DataFrame], live_mode: bool = False) -> Dict[str, pd.Series]:
+        """组合层信号生成，初始化共享状态
+
+        live_mode=True: 只算当月动态池top50(秒级), 用于实盘扫描
+        live_mode=False: 算所有月份进入过池的股票(分钟级), 用于回测
+        """
+        # 标准化: 确保datetime列设为index
+        normalized_map = {}
+        for code, df in data_map.items():
+            if 'datetime' in df.columns and not isinstance(df.index, pd.DatetimeIndex):
+                df = df.set_index('datetime')
+            elif 'trade_date' in df.columns and not isinstance(df.index, pd.DatetimeIndex):
+                df = df.set_index('trade_date')
+            normalized_map[code] = df
+        data_map = normalized_map
+
         self._active_positions = 0
+        self._active_industries = {}  # {industry: count} [v12.2]
         self._last_loss_codes = {}
         self._portfolio_peak = 1_000_000  # 初始资金
         self._portfolio_equity = 1_000_000
@@ -90,15 +182,274 @@ class SignalEngine:
         self._consecutive_losses = 0
         self._last_loss_bar = -999
         self._loss_pause_until = -1
+        self.pivot_buy_pending = {}  # {code: {'date': str, 'price': float}} [v14.1] 日线中枢背驰1买待确认
+
+        # ===== v10: 预计算月度动量排名(用于仓位调节) =====
+        monthly_momentum_rank = {}
+        if self.momentum_factor_enabled:
+            monthly_momentum_rank = self._get_momentum_ranking(data_map)
+
+        # ===== v12: 预计算动态月度轮换池 =====
+        dynamic_pool = {}
+        if self.dynamic_pool_enabled and len(data_map) > self.pool_size:
+            dynamic_pool = self._get_dynamic_pool(data_map)
+
+        # live模式: 只保留当月池
+        if live_mode and dynamic_pool:
+            latest_month = sorted(dynamic_pool.keys())[-1]
+            dynamic_pool = {latest_month: dynamic_pool[latest_month]}
+            print(f"  [live模式] 仅计算{latest_month}池({len(dynamic_pool[latest_month])}只)", flush=True)
 
         signals = {}
         for code in sorted(data_map.keys()):
             df = data_map[code]
-            signals[code] = self._generate_single(code, df)
+            # 优化: 不在动态池中的股票直接返回全0，跳过昂贵的缠论计算
+            if dynamic_pool:
+                in_pool = False
+                for month_set in dynamic_pool.values():
+                    if code in month_set:
+                        in_pool = True
+                        break
+                if not in_pool:
+                    signals[code] = pd.Series(0.0, index=df.index)
+                    continue
+            signals[code] = self._generate_single(code, df, monthly_momentum_rank, dynamic_pool)
 
         return signals
 
-    def _generate_single(self, code: str, df: pd.DataFrame) -> pd.Series:
+    def _get_momentum_ranking(self, data_map: Dict[str, pd.DataFrame]) -> Dict[str, Dict[str, float]]:
+        """动量排名: 缓存版, 每天只算一次"""
+        import os, pickle
+        cache_dir = os.path.join(os.path.dirname(__file__), '..', 'live_signals')
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file = os.path.join(cache_dir, 'momentum_rank_cache.pkl')
+        sample_code = next(iter(data_map))
+        last_date = str(data_map[sample_code].index[-1].date())
+
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'rb') as f:
+                    cached = pickle.load(f)
+                if cached.get('data_date') == last_date:
+                    print(f"  [缓存] 动量排名命中 ({last_date})", flush=True)
+                    return cached['rank']
+            except Exception:
+                pass
+
+        print(f"  [计算] 动量排名全量 ({len(data_map)}只)...", flush=True)
+        rank = self._build_momentum_ranking(data_map)
+
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump({'rank': rank, 'data_date': last_date}, f)
+            print(f"  [缓存] 动量排名已缓存", flush=True)
+        except Exception:
+            pass
+
+        return rank
+
+    def _build_momentum_ranking(self, data_map: Dict[str, pd.DataFrame]) -> Dict[str, Dict[str, float]]:
+        """构建月度动量排名 [v10] (并发优化版)
+
+        返回每月每只股票的动量分位数(0~1), 1=最强
+
+        Returns: {month_key: {code: momentum_rank}}
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _momentum_one(code, df):
+            if len(df) < 120:
+                return {}
+            close = df['close']
+            ret = close.pct_change(self.momentum_period)
+            try:
+                monthly_first = df.resample('MS').first()
+            except Exception:
+                return {}
+            scores = {}
+            for dt in monthly_first.index:
+                if dt not in ret.index:
+                    valid = ret.index[ret.index <= dt]
+                    if len(valid) == 0:
+                        continue
+                    dt = valid[-1]
+                if pd.isna(ret.loc[dt]):
+                    continue
+                month_key = dt.strftime('%Y-%m')
+                scores[month_key] = ret.loc[dt]
+            return scores
+
+        monthly_scores = {}
+        codes = list(data_map.keys())
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(_momentum_one, code, data_map[code]): code for code in codes}
+            for f in as_completed(futures):
+                scores = f.result()
+                for month, score in scores.items():
+                    if month not in monthly_scores:
+                        monthly_scores[month] = {}
+                    monthly_scores[month][futures[f]] = score
+
+        monthly_rank = {}
+        for month, scores in monthly_scores.items():
+            if len(scores) < 5:
+                continue
+            sorted_items = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+            n = len(sorted_items)
+            ranks = {}
+            for rank_idx, (code, _) in enumerate(sorted_items):
+                ranks[code] = (rank_idx + 1) / n  # 1/n ~ 1.0
+            monthly_rank[month] = ranks
+        return monthly_rank
+
+    def _score_single_for_pool(self, code: str, df: pd.DataFrame) -> Dict[str, float]:
+        """计算单只股票的月度评分(用于动态池)"""
+        lb = self.pool_score_lookback
+        if len(df) < lb + 30:
+            return {}
+
+        close = df['close']
+        high = df['high']
+        low = df['low']
+        vol = df['volume']
+
+        # ATR
+        tr = pd.concat([
+            high - low,
+            (high - close.shift(1)).abs(),
+            (low - close.shift(1)).abs(),
+        ], axis=1).max(axis=1)
+        atr = tr.rolling(14).mean()
+
+        # MA60
+        ma60 = close.rolling(60).mean()
+        vol_ma60 = vol.rolling(60).mean()
+
+        # 动量
+        momentum = close.pct_change(lb)
+
+        # 遍历每个月末
+        try:
+            monthly_dates = df.resample('MS').first().index
+        except Exception:
+            return {}
+
+        scores = {}
+        for dt in monthly_dates:
+            valid = df.index[df.index >= dt]
+            if len(valid) == 0:
+                continue
+            bar_idx = df.index.get_loc(valid[0])
+            if bar_idx < lb + 30:
+                continue
+
+            prev_idx = bar_idx - 1
+
+            # 1. ATR波动率百分位
+            atr_window = atr.iloc[max(0, prev_idx-120):prev_idx+1]
+            atr_val = atr.iloc[prev_idx]
+            if pd.isna(atr_val) or atr_val <= 0 or len(atr_window) < 30:
+                atr_score = 0.5
+            else:
+                atr_score = (atr_window < atr_val).sum() / len(atr_window)
+
+            # 2. 动量
+            mom_val = momentum.iloc[prev_idx]
+            if pd.isna(mom_val):
+                momentum_score = 0.5
+            else:
+                momentum_score = np.clip((mom_val + 0.3) / 0.6, 0, 1)
+
+            # 3. 量能活跃度
+            vol_ratio = vol.iloc[prev_idx] / vol_ma60.iloc[prev_idx] if not pd.isna(vol_ma60.iloc[prev_idx]) and vol_ma60.iloc[prev_idx] > 0 else 1.0
+            volume_score = np.clip(vol_ratio / 2.0, 0, 1)
+
+            # 4. 趋势强度
+            ma60_val = ma60.iloc[prev_idx]
+            price_val = close.iloc[prev_idx]
+            if pd.isna(ma60_val) or ma60_val <= 0:
+                trend_score = 0.5
+            else:
+                trend_score = np.clip((price_val / ma60_val - 0.9) / 0.2, 0, 1)
+
+            total = (self.pool_w_atr * atr_score
+                     + self.pool_w_momentum * momentum_score
+                     + self.pool_w_volume * volume_score
+                     + self.pool_w_trend * trend_score)
+
+            month_key = dt.strftime('%Y-%m')
+            scores[month_key] = total
+
+        return scores
+
+    def _get_dynamic_pool(self, data_map: Dict[str, pd.DataFrame]) -> Dict[str, set]:
+        """动态池: 优先读缓存(每月初刷新), 避免每天重算5287只"""
+        import os, pickle
+        cache_dir = os.path.join(os.path.dirname(__file__), '..', 'live_signals')
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file = os.path.join(cache_dir, 'dynamic_pool_cache.pkl')
+        # 用数据的最后日期作为key(避免不同数据源日期不一致)
+        sample_code = next(iter(data_map))
+        last_date = str(data_map[sample_code].index[-1].date())
+        current_month = last_date[:7]  # YYYY-MM
+
+        # 尝试读缓存
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'rb') as f:
+                    cached = pickle.load(f)
+                if cached.get('data_month') == current_month and cached.get('data_date') == last_date:
+                    print(f"  [缓存] 动态池命中 ({last_date})", flush=True)
+                    return cached['pool']
+            except Exception:
+                pass
+
+        # 缓存失效或不存在, 重新计算
+        print(f"  [计算] 动态池全量计算 ({len(data_map)}只)...", flush=True)
+        pool = self._build_dynamic_pool(data_map)
+
+        # 写缓存
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump({'pool': pool, 'data_month': current_month, 'data_date': last_date}, f)
+            print(f"  [缓存] 动态池已缓存", flush=True)
+        except Exception:
+            pass
+
+        return pool
+
+    def _build_dynamic_pool(self, data_map: Dict[str, pd.DataFrame]) -> Dict[str, set]:
+        """构建动态月度轮换池 [v12] (并发优化版)"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # Step 1: 并发计算每只股票评分
+        monthly_scores = {}
+        codes = list(data_map.keys())
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(self._score_single_for_pool, code, data_map[code]): code for code in codes}
+            for f in as_completed(futures):
+                scores = f.result()
+                for month, score in scores.items():
+                    if month not in monthly_scores:
+                        monthly_scores[month] = {}
+                    monthly_scores[month][futures[f]] = score
+
+        # Step 2: 每月选top pool_size
+        dynamic_pool = {}
+        for month, scores in monthly_scores.items():
+            if len(scores) <= self.pool_size:
+                dynamic_pool[month] = set(scores.keys())
+            else:
+                sorted_items = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+                selected = set(code for code, _ in sorted_items[:self.pool_size])
+                dynamic_pool[month] = selected
+
+        return dynamic_pool
+
+    def _generate_single(self, code: str, df: pd.DataFrame,
+                         monthly_momentum_rank: Dict[str, Dict[str, float]] = None,
+                         dynamic_pool: Dict[str, set] = None) -> pd.Series:
         """单只股票信号生成
 
         信号语义:
@@ -117,13 +468,38 @@ class SignalEngine:
         low = df['low']
 
         # ===== 预计算指标 =====
-        bi_buy, bi_sell = self._detect_bi_deterministic(df)
+        bi_buy, bi_sell, filtered_fractals, strokes = self._detect_bi_deterministic(df)
 
+        # MACD (v13: 提前计算, 面积背驰需要)
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
         dif = ema12 - ema26
         dea = dif.ewm(span=9, adjust=False).mean()
         macd_hist = 2 * (dif - dea)
+
+        # ===== v11: 3买上下文检测 =====
+        third_buy = pd.Series(False, index=df.index)
+        if self.third_buy_enabled:
+            third_buy = self._detect_3buy_context(filtered_fractals, df)
+
+        # ===== v13→v15: 面积背驰(区分趋势/盘整) + 2买预计算 =====
+        buy_div_set, sell_div_set = self._compute_area_divergence(strokes, macd_hist, n)
+        buy_2buy_set = self._detect_2buy(strokes, buy_div_set, n)
+
+        # ===== v14: 线段检测 + 线段背驰 + 2卖 =====
+        segments = self._detect_segments(strokes)
+        seg_buy_div, seg_sell_div = self._compute_segment_divergence(segments, strokes, macd_hist, n)
+        sell_2sell_set = self._detect_2sell(strokes, sell_div_set, n)
+
+        # 合并: 笔级别 + 线段级别背驰取并集
+        buy_divergence_set = buy_div_set | seg_buy_div
+        sell_divergence_set = sell_div_set | seg_sell_div
+
+        # ===== v14.1: 中枢识别 + 趋势背驰 =====
+        pivots = self._detect_pivots(strokes)
+        pivot_buy_div, pivot_sell_div = self._detect_pivot_divergence(
+            pivots, strokes, macd_hist, n
+        )
 
         # ATR [v8新增]
         tr = pd.concat([
@@ -132,6 +508,11 @@ class SignalEngine:
             (low - close.shift(1)).abs(),
         ], axis=1).max(axis=1)
         atr = tr.rolling(self.atr_period).mean()
+
+        # ===== v10: ATR滚动百分位(无前视偏差) =====
+        atr_pct = pd.Series(0.5, index=df.index)
+        if self.vol_regime_enabled:
+            atr_pct = atr.rolling(self.vol_lookback, min_periods=60).rank(pct=True)
 
         weekly_not_down = self._compute_weekly_not_down(df)
         ma20 = close.rolling(20).mean()
@@ -147,55 +528,17 @@ class SignalEngine:
         original_position = 0.0
         trailing_activated = False
         reduced = False  # [v8] 是否已减仓
-
-        # 增量MACD背驰: 底背驰(买) + 顶背驰(卖) [v8扩展]
-        macd_buy_points: List[Dict] = []
-        macd_sell_points: List[Dict] = []
+        is_3buy_trade = False  # [v11.1] 当前持仓是否为3买入场
 
         for i in range(120, n):
             price = close.iloc[i]
 
-            # --- 增量收集分型点(用于背驰检测) ---
-            has_buy_divergence = False
-            has_sell_divergence = False
-
-            if bi_buy.iloc[i]:
-                curr_point = {
-                    'idx': i,
-                    'price': low.iloc[i],
-                    'dif': dif.iloc[i],
-                    'hist': macd_hist.iloc[i],
-                }
-                # 底背驰: 价格更低 + DIF或hist更高
-                for k in range(len(macd_buy_points) - 1, -1, -1):
-                    prev = macd_buy_points[k]
-                    if curr_point['idx'] - prev['idx'] > 120:
-                        break
-                    if curr_point['price'] >= prev['price']:
-                        continue
-                    if curr_point['dif'] > prev['dif'] or curr_point['hist'] > prev['hist']:
-                        has_buy_divergence = True
-                        break
-                macd_buy_points.append(curr_point)
-
-            if bi_sell.iloc[i]:
-                curr_sell = {
-                    'idx': i,
-                    'price': high.iloc[i],
-                    'dif': dif.iloc[i],
-                    'hist': macd_hist.iloc[i],
-                }
-                # 顶背驰: 价格更高 + DIF或hist更低 [v8新增]
-                for k in range(len(macd_sell_points) - 1, -1, -1):
-                    prev = macd_sell_points[k]
-                    if curr_sell['idx'] - prev['idx'] > 120:
-                        break
-                    if curr_sell['price'] <= prev['price']:
-                        continue
-                    if curr_sell['dif'] < prev['dif'] or curr_sell['hist'] < prev['hist']:
-                        has_sell_divergence = True
-                        break
-                macd_sell_points.append(curr_sell)
+            # 增量MACD背驰: 已由v13面积法预计算, 此处仅查询
+            has_buy_divergence = i in buy_divergence_set
+            has_sell_divergence = i in sell_divergence_set
+            is_2buy = i in buy_2buy_set
+            has_pivot_buy_div = i in pivot_buy_div
+            has_pivot_sell_div = i in pivot_sell_div
 
             # [v8] 组合回撤跟踪
             if position > 0:
@@ -225,9 +568,9 @@ class SignalEngine:
                     signals.iloc[i] = 0.0
                     self._last_loss_codes[code] = (i, capped_profit_pct)
                     self._update_loss_streak(capped_profit_pct, i)
-                    self._active_positions = max(0, self._active_positions - 1)
+                    self._close_position(code)
                     position = 0.0; original_position = 0.0; has_added = False
-                    trailing_activated = False; reduced = False
+                    trailing_activated = False; reduced = False; is_3buy_trade = False
                     continue
 
                 # 1. 结构止损
@@ -239,53 +582,79 @@ class SignalEngine:
                     if struct_profit_pct < 0:
                         self._last_loss_codes[code] = (i, struct_profit_pct)
                     self._update_loss_streak(struct_profit_pct, i)
-                    self._active_positions = max(0, self._active_positions - 1)
+                    self._close_position(code)
                     position = 0.0; original_position = 0.0; has_added = False
-                    trailing_activated = False; reduced = False
+                    trailing_activated = False; reduced = False; is_3buy_trade = False
                     continue
 
-                # 2. 分阶段移动止损 [v9]
+                # 2. 分阶段移动止损 [v9] + [v11.1 3买更宽tier]
                 # 盈利越多,回撤容忍越大,避免小震洗出大趋势
-                if profit_pct > self.trailing_start:
+                # 3买是趋势确认信号, 给更宽的止损让利润多跑
+                if is_3buy_trade:
+                    active_start = self.third_buy_tier1
+                else:
+                    active_start = self.trailing_start
+                if profit_pct > active_start:
                     trailing_activated = True
                 if trailing_activated:
-                    # 根据最高盈利区间选择回撤容忍度
                     max_profit = (highest - entry_price) / entry_price if entry_price > 0 else 0
-                    if max_profit >= self.trailing_tier2:
-                        # 盈利>15%: 宽止损8%,让大趋势跑完
-                        trailing_dist = self.trailing_wide
-                    elif max_profit >= self.trailing_tier1:
-                        # 盈利6-15%: 中止损5%
-                        trailing_dist = self.trailing_medium
+                    if is_3buy_trade:
+                        # 3买专项tier: 3-8%→4%, 8-15%→6%, >15%→8%
+                        if max_profit >= 0.15:
+                            trailing_dist = self.third_buy_wide
+                        elif max_profit >= 0.08:
+                            trailing_dist = self.third_buy_medium
+                        else:
+                            trailing_dist = self.third_buy_tight
                     else:
-                        # 盈利3-6%: 紧止损3%,快速保本
-                        trailing_dist = self.trailing_tight
+                        # 普通tier: 3-6%→3%, 6-15%→5%, >15%→7%
+                        if max_profit >= self.trailing_tier2:
+                            trailing_dist = self.trailing_wide
+                        elif max_profit >= self.trailing_tier1:
+                            trailing_dist = self.trailing_medium
+                        else:
+                            trailing_dist = self.trailing_tight
                     trailing_stop = highest * (1 - trailing_dist)
                     if price <= trailing_stop:
                         signals.iloc[i] = 0.0
                         if profit_pct < 0:
                             self._last_loss_codes[code] = (i, profit_pct)
                         self._update_loss_streak(profit_pct, i)
-                        self._active_positions = max(0, self._active_positions - 1)
+                        self._close_position(code)
                         position = 0.0; original_position = 0.0; has_added = False
-                        trailing_activated = False; reduced = False
+                        trailing_activated = False; reduced = False; is_3buy_trade = False
                         continue
 
                 # 3. 顶背驰卖出 [v8新增]
                 # 1卖信号: 顶背驰 + 盈利 > 5% [v9 P1.2: 从3%提高到5%]
                 if (bars_held >= self.min_hold_before_sell
-                        and has_sell_divergence
+                        and (has_sell_divergence or has_pivot_sell_div)
                         and profit_pct > 0.05):
                     signals.iloc[i] = 0.0
                     if profit_pct < 0:
                         self._last_loss_codes[code] = (i, profit_pct)
                     self._update_loss_streak(profit_pct, i)
-                    self._active_positions = max(0, self._active_positions - 1)
+                    self._close_position(code)
                     position = 0.0; original_position = 0.0; has_added = False
-                    trailing_activated = False; reduced = False
+                    trailing_activated = False; reduced = False; is_3buy_trade = False
                     continue
 
-                # 4. 2卖出局 [v9 P1.1: 盈利>5%才允许2卖出局,避免小盈利被2卖洗出]
+                # 3.5. 2卖出局 [v14: 缠论标准2卖, 反弹不过前高]
+                # 1卖后下跌→反弹不过1卖高点 = 确认顶部, 立即离场
+                is_2sell = i in sell_2sell_set
+                if (bars_held >= self.min_hold_before_sell
+                        and is_2sell
+                        and profit_pct > 0.03):
+                    signals.iloc[i] = 0.0
+                    if profit_pct < 0:
+                        self._last_loss_codes[code] = (i, profit_pct)
+                    self._update_loss_streak(profit_pct, i)
+                    self._close_position(code)
+                    position = 0.0; original_position = 0.0; has_added = False
+                    trailing_activated = False; reduced = False; is_3buy_trade = False
+                    continue
+
+                # 4. bi_sell+盈利卖出(旧2卖替代, 保留作为兜底)
                 if (bars_held >= self.min_hold_before_sell
                         and bi_sell.iloc[i]
                         and profit_pct > 0.05):
@@ -293,9 +662,9 @@ class SignalEngine:
                     if profit_pct < 0:
                         self._last_loss_codes[code] = (i, profit_pct)
                     self._update_loss_streak(profit_pct, i)
-                    self._active_positions = max(0, self._active_positions - 1)
+                    self._close_position(code)
                     position = 0.0; original_position = 0.0; has_added = False
-                    trailing_activated = False; reduced = False
+                    trailing_activated = False; reduced = False; is_3buy_trade = False
                     continue
 
                 # 5. 时间止损
@@ -304,9 +673,9 @@ class SignalEngine:
                     if profit_pct < 0:
                         self._last_loss_codes[code] = (i, profit_pct)
                     self._update_loss_streak(profit_pct, i)
-                    self._active_positions = max(0, self._active_positions - 1)
+                    self._close_position(code)
                     position = 0.0; original_position = 0.0; has_added = False
-                    trailing_activated = False; reduced = False
+                    trailing_activated = False; reduced = False; is_3buy_trade = False
                     continue
 
                 # 6. 减仓机制 [v8新增]
@@ -359,6 +728,12 @@ class SignalEngine:
                 if self._active_positions >= self.max_positions:
                     continue
 
+                # ===== v12.2: 板块去重 =====
+                if self.sector_dedup_enabled:
+                    industry = self._industry_map.get(code, '')
+                    if industry and self._active_industries.get(industry, 0) >= self.sector_max_holdings:
+                        continue
+
                 if code in self._last_loss_codes:
                     loss_idx, loss_pct = self._last_loss_codes[code]
                     # 大亏(>3%)后30天冷却, 小亏1天冷却
@@ -369,8 +744,15 @@ class SignalEngine:
                 if not weekly_not_down.iloc[i]:
                     continue
 
-                if not bi_buy.iloc[i]:
+                if not bi_buy.iloc[i] and not third_buy.iloc[i] and not is_2buy and not has_pivot_buy_div:
                     continue
+
+                # ===== v12: 动态池过滤 =====
+                # 不在当月池中的股票不允许新开仓(已持仓的止损/止盈不受影响)
+                if dynamic_pool:
+                    month_key = df.index[i].strftime('%Y-%m')
+                    if month_key in dynamic_pool and code not in dynamic_pool[month_key]:
+                        continue
 
                 # [v8] 涨跌停过滤: 涨停封板买不进，跳过
                 if i > 0 and close.iloc[i-1] > 0:
@@ -393,6 +775,9 @@ class SignalEngine:
 
                 if has_buy_divergence:
                     macd_factor = 0.05
+                # [v14.1] 中枢背驰信号同等加成
+                if has_pivot_buy_div:
+                    macd_factor = 0.05
 
                 # 量能因子
                 vol_factor = 0.0
@@ -406,12 +791,14 @@ class SignalEngine:
                         vol_factor = -0.02
 
                 # 弱信号过滤: MACD弱+量弱+MA20弱势 → 跳过
+                # [v11] 3买有中枢结构确认, 跳过弱信号过滤
+                is_3buy = third_buy.iloc[i]
                 macd_weak = macd_hist.iloc[i] < macd_hist.iloc[i-1] and macd_hist.iloc[i] < 0
                 vol_very_weak = (not pd.isna(vol_ma20.iloc[i]) and vol_ma20.iloc[i] > 0
                                  and df['volume'].iloc[i] / vol_ma20.iloc[i] < 0.5)
                 ma_very_weak = (not pd.isna(ma20.iloc[i]) and price < ma20.iloc[i] * 0.93)
-                if macd_weak and vol_very_weak and ma_very_weak and not has_buy_divergence:
-                    continue  # 三重弱势无背驰,跳过
+                if macd_weak and vol_very_weak and ma_very_weak and not has_buy_divergence and not is_3buy and not is_2buy and not has_pivot_buy_div:
+                    continue  # 三重弱势无背驰无3买无2买无中枢背驰,跳过
 
                 # 止损位 [v8] ATR动态止损
                 stop = self._compute_stop_loss(price, atr, i, low, df)
@@ -436,6 +823,38 @@ class SignalEngine:
                 # 背驰信号额外加成: 从0.15提升到0.18(不超0.20)
                 if has_buy_divergence:
                     final_pos = max(final_pos, 0.18)
+                # [v13] 2买信号同等加成: 回踩不破前低确认底部
+                if is_2buy:
+                    final_pos = max(final_pos, 0.18)
+                # [v14.1] 中枢背驰1买信号同等加成
+                if has_pivot_buy_div:
+                    final_pos = max(final_pos, 0.18)
+                    # 记录到pending，供30分钟区间套使用
+                    self.pivot_buy_pending[code] = {
+                        'date': str(df.index[i].date()),
+                        'price': float(price),
+                        'stop_loss': float(stop),
+                        '2buy_confirmed': False,
+                    }
+                # [v14.1] 2买确认区间套: 日线1买+2买组合后才允许30分入场
+                # 必须在1买后30个交易日内确认，否则视为不同波段
+                if is_2buy and code in self.pivot_buy_pending:
+                    pending_entry = self.pivot_buy_pending[code]
+                    if not pending_entry.get('2buy_confirmed'):
+                        buy1_date = pd.Timestamp(pending_entry['date'])
+                        buy2_date = df.index[i]
+                        days_gap = len(df[buy1_date:buy2_date])  # 交易天数
+                        if 0 < days_gap <= 30:
+                            pending_entry['2buy_confirmed'] = True
+                            pending_entry['2buy_date'] = str(buy2_date.date())
+                            pending_entry['2buy_price'] = float(price)
+                            pending_entry['stop_loss'] = float(stop)
+                        else:
+                            # 超时清除pending(不同波段，1买失效)
+                            del self.pivot_buy_pending[code]
+                # [v11] 3买信号同等加成: 中枢突破回踩确认
+                if is_3buy:
+                    final_pos = max(final_pos, self.third_buy_boost)
                 final_pos = max(self.min_position, min(final_pos, self.max_position))
 
                 # 硬性单笔风险上限
@@ -449,17 +868,51 @@ class SignalEngine:
                     if not macd_confirm and not has_buy_divergence:
                         final_pos = self.min_position
 
+                # ===== v10: 动量仓位因子(加法,与MACD/量能一致) =====
+                # 动量排名0~1, 1=最强。高动量加分，低动量微扣
+                if (self.momentum_factor_enabled
+                        and monthly_momentum_rank
+                        and not has_buy_divergence):
+                    month_key = df.index[i].strftime('%Y-%m')
+                    if month_key in monthly_momentum_rank:
+                        mom_rank = monthly_momentum_rank[month_key].get(code, 0.5)
+                        # rank>0.7: +0.01, rank<0.3: -0.01, 中间: 0
+                        if mom_rank > 0.7:
+                            final_pos += 0.01
+                        elif mom_rank < 0.3:
+                            final_pos -= 0.01
+
+                # ===== v10: 波动率自适应 =====
+                # 高波动(>70%): 仓位×0.85, 止损×1.15
+                # 低波动(<30%): 仓位×1.05, 止损×0.95
+                if self.vol_regime_enabled and not pd.isna(atr_pct.iloc[i]):
+                    pct_val = atr_pct.iloc[i]
+                    if pct_val > 0.70:
+                        final_pos *= 0.85
+                        stop_pct *= 1.15
+                    elif pct_val < 0.30:
+                        final_pos *= 1.05
+                        stop_pct *= 0.95
+                    # 重新检查约束
+                    final_pos = max(self.min_position * 0.5, min(final_pos, self.max_position))
+                    stop_pct = min(stop_pct, self.max_stop_pct)
+
                 # 输出买入信号
                 signals.iloc[i] = final_pos
                 position = final_pos
                 original_position = final_pos
                 has_added = False
                 reduced = False
+                is_3buy_trade = is_3buy  # [v11.1] 标记3买交易
                 entry_idx = i
                 entry_price = price
                 stop_loss = stop
                 highest = price
                 self._active_positions += 1
+                # v12.2: 更新行业计数
+                industry = self._industry_map.get(code, '')
+                if industry:
+                    self._active_industries[industry] = self._active_industries.get(industry, 0) + 1
 
         return signals
 
@@ -488,7 +941,7 @@ class SignalEngine:
 
         return stop
 
-    def _detect_bi_deterministic(self, df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+    def _detect_bi_deterministic(self, df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, List[Dict], List[Dict]]:
         """确定性笔检测(替代CZSC，完全无前视偏差)
 
         算法:
@@ -508,7 +961,7 @@ class SignalEngine:
         sell_signals = pd.Series(False, index=df.index)
 
         if n < 5:
-            return buy_signals, sell_signals
+            return buy_signals, sell_signals, [], []
 
         high_arr = df['high'].values.astype(float)
         low_arr = df['low'].values.astype(float)
@@ -552,7 +1005,7 @@ class SignalEngine:
                 fractals.append({'type': 'bottom', 'midx': j, 'idx': merged[j]['idx'], 'val': merged[j]['low']})
 
         if not fractals:
-            return buy_signals, sell_signals
+            return buy_signals, sell_signals, [], []
 
         # Step 3: 顶底交替 + 间距检查
         filtered = [fractals[0]]
@@ -565,11 +1018,8 @@ class SignalEngine:
             else:
                 if f['midx'] - filtered[-1]['midx'] >= self.bi_min_gap:
                     filtered.append(f)
-                else:
-                    if f['type'] == 'top' and f['val'] > filtered[-1]['val']:
-                        filtered[-1] = f
-                    elif f['type'] == 'bottom' and f['val'] < filtered[-1]['val']:
-                        filtered[-1] = f
+                # 不同类型+间距不足: 跳过，保留当前filtered[-1]
+                # 注意: 不能用val比较(top=high, bottom=low, 跨类型比较无意义)
 
         # Step 4: 生成信号(带确认延迟)
         for j in range(1, len(filtered)):
@@ -585,7 +1035,657 @@ class SignalEngine:
             elif prev['type'] == 'bottom' and curr['type'] == 'top':
                 sell_signals.iloc[signal_idx] = True
 
-        return buy_signals, sell_signals
+        # Step 5: 构建笔列表 [v13] 用于背驰面积计算和中枢检测
+        # [P1-4] 笔的high/low用原始K线极值(而非两端分型价格), 更精确计算中枢ZG/ZD
+        strokes = []
+        for j in range(len(filtered) - 1):
+            f1, f2 = filtered[j], filtered[j + 1]
+            start_idx = f1['idx']
+            end_idx = f2['idx']
+            # 笔内原始K线极值
+            stroke_high = high_arr[start_idx:end_idx + 1].max() if end_idx >= start_idx else max(f1['val'], f2['val'])
+            stroke_low = low_arr[start_idx:end_idx + 1].min() if end_idx >= start_idx else min(f1['val'], f2['val'])
+            strokes.append({
+                'start_idx': start_idx,
+                'end_idx': end_idx,
+                'start_type': f1['type'],
+                'end_type': f2['type'],
+                'start_val': f1['val'],
+                'end_val': f2['val'],
+                'high': stroke_high,
+                'low': stroke_low,
+            })
+
+        return buy_signals, sell_signals, filtered, strokes
+
+    def _compute_area_divergence(self, strokes: list, macd_hist, n: int):
+        """v13: MACD面积背驰检测(缠论标准)
+
+        Returns:
+            buy_divergence: set of signal_idx — 底背驰(1买)位置
+            sell_divergence: set of signal_idx — 顶背驰(1卖)位置
+        """
+        buy_divergence = set()
+        sell_divergence = set()
+
+        # 分类下跌笔和上涨笔
+        down_strokes = [s for s in strokes
+                        if s['start_type'] == 'top' and s['end_type'] == 'bottom']
+        up_strokes = [s for s in strokes
+                      if s['start_type'] == 'bottom' and s['end_type'] == 'top']
+
+        # 底背驰: 连续下跌笔, 价格新低但MACD面积缩小
+        # 缠论标准: 面积取下跌笔中macd_hist<0(绿柱)的绝对值之和
+        for k in range(1, len(down_strokes)):
+            prev = down_strokes[k - 1]
+            curr = down_strokes[k]
+
+            prev_hist = macd_hist.iloc[prev['start_idx']:prev['end_idx'] + 1].values
+            curr_hist = macd_hist.iloc[curr['start_idx']:curr['end_idx'] + 1].values
+            prev_area = sum(abs(x) for x in prev_hist if x < 0)
+            curr_area = sum(abs(x) for x in curr_hist if x < 0)
+
+            if curr['end_val'] < prev['end_val'] and curr_area < prev_area:
+                signal_idx = curr['end_idx'] + self.bi_confirm_delay
+                if 0 <= signal_idx < n:
+                    buy_divergence.add(signal_idx)
+
+        # 顶背驰: 连续上涨笔, 价格新高但MACD面积缩小
+        # 缠论标准: 面积取上涨笔中macd_hist>0(红柱)的绝对值之和
+        for k in range(1, len(up_strokes)):
+            prev = up_strokes[k - 1]
+            curr = up_strokes[k]
+
+            prev_hist = macd_hist.iloc[prev['start_idx']:prev['end_idx'] + 1].values
+            curr_hist = macd_hist.iloc[curr['start_idx']:curr['end_idx'] + 1].values
+            prev_area = sum(abs(x) for x in prev_hist if x > 0)
+            curr_area = sum(abs(x) for x in curr_hist if x > 0)
+
+            if curr['end_val'] > prev['end_val'] and curr_area < prev_area:
+                signal_idx = curr['end_idx'] + self.bi_confirm_delay
+                if 0 <= signal_idx < n:
+                    sell_divergence.add(signal_idx)
+
+        return buy_divergence, sell_divergence
+
+
+
+    def _detect_2buy(self, strokes: List[Dict], buy_divergence: set, n: int) -> set:
+        """v13: 2买检测
+
+        缠论2买 = 1买(底背驰)后反弹, 再回调不破1买低点
+        2买是最实用的买点: 既确认了底部, 价格又不差
+
+        Returns:
+            set of signal_idx — 2买位置
+        """
+        buy_2 = set()
+
+        down_strokes = [s for s in strokes
+                        if s['start_type'] == 'top' and s['end_type'] == 'bottom']
+        up_strokes = [s for s in strokes
+                      if s['start_type'] == 'bottom' and s['end_type'] == 'top']
+
+        for ds in down_strokes:
+            signal_1buy = ds['end_idx'] + self.bi_confirm_delay
+            if signal_1buy not in buy_divergence:
+                continue  # 不是1买, 跳过
+
+            low_1buy = ds['end_val']  # 1买的低点
+
+            # 找1买后的下一笔上涨(反弹)
+            bounce = None
+            for us in up_strokes:
+                if us['start_idx'] > ds['end_idx']:
+                    bounce = us
+                    break
+            if bounce is None:
+                continue
+
+            # 找反弹后的下一笔下跌(回调)
+            pullback = None
+            for ds2 in down_strokes:
+                if ds2['start_idx'] > bounce['end_idx']:
+                    pullback = ds2
+                    break
+            if pullback is None:
+                continue
+
+            # 回调不破1买低点 = 2买 (严格不破: 回调低点 > 1买低点)
+            if pullback['end_val'] > low_1buy:
+                signal_2buy = pullback['end_idx'] + self.bi_confirm_delay
+                if 0 <= signal_2buy < n and signal_2buy not in buy_divergence:
+                    buy_2.add(signal_2buy)
+
+        return buy_2
+
+    def _detect_segments(self, strokes: List[Dict]) -> List[Dict]:
+        """v14: 线段检测
+
+        缠论线段破坏条件(两种任一):
+        A. 笔破坏: 反向笔突破线段极值点(上涨线段的最新上涨笔高点<前高,或下跌线段最新下跌笔低点>前低)
+        B. 中枢破坏: 反向笔突破线段中枢的ZG/ZD
+
+        算法: 滑动窗口, 逐笔判断是否需要结束当前线段
+
+        Returns:
+            segments: [{
+                'direction': 'up'|'down',
+                'start_idx': int, 'end_idx': int,
+                'start_val': float, 'end_val': float,
+                'high': float, 'low': float,
+                'stroke_start': int, 'stroke_end': int,
+            }]
+        """
+        if len(strokes) < 3:
+            return []
+
+        segments = []
+        seg_start = 0  # 当前线段起始笔索引
+
+        for j in range(1, len(strokes)):
+            seg_strokes = strokes[seg_start:j + 1]
+            if len(seg_strokes) < 3:
+                continue
+
+            # 线段方向: 第一笔
+            first = seg_strokes[0]
+            seg_dir = 'up' if first['start_type'] == 'bottom' else 'down'
+
+            # 线段中所有笔的高低
+            seg_high = max(s['high'] for s in seg_strokes)
+            seg_low = min(s['low'] for s in seg_strokes)
+
+            # 线段中枢: 最近3笔的ZG/ZD (缠论标准: ZG=各笔高点最低值, ZD=各笔低点最高值)
+            last3 = seg_strokes[-3:]
+            zg = min(s['high'] for s in last3)
+            zd = max(s['low'] for s in last3)
+
+            current = strokes[j]
+            break_seg = False
+
+            if seg_dir == 'up':
+                # 上涨线段破坏条件:
+                # A: 最新下跌笔低点 < 线段起始低点(跌破起点)
+                # B: 最新下跌笔低点 < 前一个下跌笔的低点(创新低)
+                # C: 最新下跌笔的end_val < 中枢下沿ZD (笔破坏)
+                down_strokes_in_seg = [s for s in seg_strokes[:-1]
+                                       if s['end_type'] == 'bottom']
+                if current['end_type'] == 'bottom':
+                    if down_strokes_in_seg:
+                        prev_lowest = min(s['end_val'] for s in down_strokes_in_seg)
+                        # 跌破前一个下跌笔低点 (包含前一根)
+                        all_down_ends = [s['end_val'] for s in seg_strokes
+                                         if s['end_type'] == 'bottom']
+                        if len(all_down_ends) >= 2 and current['end_val'] < all_down_ends[-2]:
+                            break_seg = True
+                    # 跌破中枢下沿
+                    if current['end_val'] < zd:
+                        break_seg = True
+            else:
+                # 下跌线段破坏条件:
+                up_strokes_in_seg = [s for s in seg_strokes[:-1]
+                                     if s['end_type'] == 'top']
+                if current['end_type'] == 'top':
+                    # 涨过前一个上涨笔高点
+                    all_up_ends = [s['end_val'] for s in seg_strokes
+                                   if s['end_type'] == 'top']
+                    if len(all_up_ends) >= 2 and current['end_val'] > all_up_ends[-2]:
+                        break_seg = True
+                    # 涨过中枢上沿
+                    if current['end_val'] > zg:
+                        break_seg = True
+
+            if break_seg:
+                # 线段结束
+                end_stroke_idx = j - 1  # 不含破坏笔
+                if end_stroke_idx - seg_start >= 2:  # 至少3笔
+                    end_segs = strokes[seg_start:end_stroke_idx + 1]
+                    segments.append({
+                        'direction': seg_dir,
+                        'start_idx': end_segs[0]['start_idx'],
+                        'end_idx': end_segs[-1]['end_idx'],
+                        'start_val': end_segs[0]['start_val'],
+                        'end_val': end_segs[-1]['end_val'],
+                        'high': max(s['high'] for s in end_segs),
+                        'low': min(s['low'] for s in end_segs),
+                        'stroke_start': seg_start,
+                        'stroke_end': end_stroke_idx,
+                    })
+                seg_start = j  # 破坏笔开始新线段
+
+        # 处理最后的线段
+        if len(strokes) - seg_start >= 3:
+            end_segs = strokes[seg_start:]
+            last_dir = 'up' if end_segs[0]['start_type'] == 'bottom' else 'down'
+            segments.append({
+                'direction': last_dir,
+                'start_idx': end_segs[0]['start_idx'],
+                'end_idx': end_segs[-1]['end_idx'],
+                'start_val': end_segs[0]['start_val'],
+                'end_val': end_segs[-1]['end_val'],
+                'high': max(s['high'] for s in end_segs),
+                'low': min(s['low'] for s in end_segs),
+                'stroke_start': seg_start,
+                'stroke_end': len(strokes) - 1,
+            })
+
+        return segments
+
+    def _compute_segment_divergence(self, segments: List[Dict],
+                                     strokes: List[Dict],
+                                     macd_hist: pd.Series, n: int):
+        """v14: 线段级别MACD面积背驰
+
+        线段级别背驰比笔级别更可靠:
+        - 上涨线段: 价格新高但MACD面积缩小 → 顶背驰(1卖)
+        - 下跌线段: 价格新低但MACD面积缩小 → 底背驰(1买)
+
+        Returns:
+            buy_divergence: set of signal_idx
+            sell_divergence: set of signal_idx
+        """
+        buy_divergence = set()
+        sell_divergence = set()
+
+        up_segs = [s for s in segments if s['direction'] == 'up']
+        down_segs = [s for s in segments if s['direction'] == 'down']
+
+        # 底背驰: 连续下跌线段, 价格新低 + 面积缩小
+        # 缠论标准: 面积取下跌线段中macd_hist<0(绿柱)的绝对值之和
+        for k in range(1, len(down_segs)):
+            prev = down_segs[k - 1]
+            curr = down_segs[k]
+
+            prev_hist = macd_hist.iloc[prev['start_idx']:prev['end_idx'] + 1].values
+            curr_hist = macd_hist.iloc[curr['start_idx']:curr['end_idx'] + 1].values
+            prev_area = sum(abs(x) for x in prev_hist if x < 0)
+            curr_area = sum(abs(x) for x in curr_hist if x < 0)
+
+            if curr['low'] < prev['low'] and curr_area < prev_area:
+                signal_idx = curr['end_idx'] + self.bi_confirm_delay
+                if 0 <= signal_idx < n:
+                    buy_divergence.add(signal_idx)
+
+        # 顶背驰: 连续上涨线段, 价格新高 + 面积缩小
+        # 缠论标准: 面积取上涨线段中macd_hist>0(红柱)的绝对值之和
+        for k in range(1, len(up_segs)):
+            prev = up_segs[k - 1]
+            curr = up_segs[k]
+
+            prev_hist = macd_hist.iloc[prev['start_idx']:prev['end_idx'] + 1].values
+            curr_hist = macd_hist.iloc[curr['start_idx']:curr['end_idx'] + 1].values
+            prev_area = sum(abs(x) for x in prev_hist if x > 0)
+            curr_area = sum(abs(x) for x in curr_hist if x > 0)
+
+            if curr['high'] > prev['high'] and curr_area < prev_area:
+                signal_idx = curr['end_idx'] + self.bi_confirm_delay
+                if 0 <= signal_idx < n:
+                    sell_divergence.add(signal_idx)
+
+        return buy_divergence, sell_divergence
+
+    def _detect_2sell(self, strokes: List[Dict], sell_divergence: set, n: int) -> set:
+        """v14: 2卖检测
+
+        缠论2卖 = 1卖(顶背驰)后下跌, 再反弹不过1卖高点
+        2卖是最实用的卖点: 确认顶部后离场, 避免A浪杀跌
+
+        Returns:
+            set of signal_idx — 2卖位置
+        """
+        sell_2 = set()
+
+        up_strokes = [s for s in strokes
+                      if s['start_type'] == 'bottom' and s['end_type'] == 'top']
+        down_strokes = [s for s in strokes
+                        if s['start_type'] == 'top' and s['end_type'] == 'bottom']
+
+        for us in up_strokes:
+            signal_1sell = us['end_idx'] + self.bi_confirm_delay
+            if signal_1sell not in sell_divergence:
+                continue  # 不是1卖, 跳过
+
+            high_1sell = us['end_val']  # 1卖的高点
+
+            # 找1卖后的下一笔下跌(回调)
+            drop = None
+            for ds in down_strokes:
+                if ds['start_idx'] > us['end_idx']:
+                    drop = ds
+                    break
+            if drop is None:
+                continue
+
+            # 找回调后的下一笔上涨(反弹)
+            bounce = None
+            for us2 in up_strokes:
+                if us2['start_idx'] > drop['end_idx']:
+                    bounce = us2
+                    break
+            if bounce is None:
+                continue
+
+            # 反弹不过1卖高点 = 2卖 (严格不过: 反弹高点 < 1卖高点)
+            if bounce['end_val'] < high_1sell:
+                signal_2sell = bounce['end_idx'] + self.bi_confirm_delay
+                if 0 <= signal_2sell < n and signal_2sell not in sell_divergence:
+                    sell_2.add(signal_2sell)
+
+        return sell_2
+
+    def _detect_pivots(self, strokes: List[Dict]) -> List[Dict]:
+        """v14.1: 中枢识别
+
+        缠论中枢定义: 至少3笔重叠区域
+        中枢区间 = [ZD, ZG]（重叠部分的高低点）
+        中枢延伸: 后续笔高低点在中枢区间内，中枢继续
+        中枢新生: 笔离开中枢区间，当前中枢结束
+
+        Returns:
+            pivots: [{
+                'zg': float,           # 中枢上沿
+                'zd': float,           # 中枢下沿
+                'stroke_start': int,   # 中枢起始笔索引
+                'stroke_end': int,     # 中枢结束笔索引(含延伸)
+                'direction': 'up'|'down',  # 中枢前的趋势方向
+                'start_idx': int,      # 起始K线索引
+                'end_idx': int,        # 结束K线索引
+            }]
+        """
+        if len(strokes) < 3:
+            return []
+
+        pivots = []
+        i = 0
+
+        while i <= len(strokes) - 3:
+            s1, s2, s3 = strokes[i], strokes[i + 1], strokes[i + 2]
+
+            # 计算3笔重叠区域
+            zg = min(s1['high'], s2['high'], s3['high'])
+            zd = max(s1['low'], s2['low'], s3['low'])
+
+            if zd < zg:
+                # 有效中枢成立
+                # 判断中枢前的趋势方向: 第1笔方向
+                direction = 'down' if s1['end_type'] == 'bottom' else 'up'
+
+                pivot_end = i + 2  # 中枢结束笔索引(初始为第3笔)
+
+                # 中枢延伸: 检查后续笔是否在中枢区间内
+                j = i + 3
+                while j < len(strokes):
+                    sj = strokes[j]
+                    # 笔的高低点完全在中枢内 → 延伸
+                    if sj['high'] <= zg and sj['low'] >= zd:
+                        pivot_end = j
+                        j += 1
+                    elif sj['high'] > zg or sj['low'] < zd:
+                        # 笔离开中枢 → 中枢结束
+                        # 但如果笔又回到中枢区间内，也算延伸
+                        if j + 1 < len(strokes):
+                            sj_next = strokes[j + 1]
+                            if sj_next['high'] <= zg and sj_next['low'] >= zd:
+                                pivot_end = j + 1
+                                j += 2
+                                continue
+                        break
+                    else:
+                        break
+
+                pivots.append({
+                    'zg': zg,
+                    'zd': zd,
+                    'stroke_start': i,
+                    'stroke_end': pivot_end,
+                    'direction': direction,
+                    'start_idx': s1['start_idx'],
+                    'end_idx': strokes[pivot_end]['end_idx'],
+                })
+
+                # 从中枢结束的下一笔继续寻找新中枢
+                i = pivot_end + 1
+            else:
+                i += 1
+
+        return pivots
+
+    def _detect_pivot_divergence(self, pivots: List[Dict], strokes: List[Dict],
+                                  macd_hist, n: int) -> Tuple[set, set]:
+        """v14.1: 趋势背驰检测(缠论标准1买/1卖)
+
+        趋势背驰定义:
+        - 下跌趋势: 2个以上下跌中枢，最后一个中枢之后离开段MACD面积 < 进入段面积
+        - 上涨趋势: 2个以上上涨中枢，最后一个中枢之后离开段MACD面积 < 进入段面积
+
+        注意: 背驰信号仅标记位置，入场还需分型确认(bi_buy)配合
+
+        Returns:
+            buy_divergence: set of signal_idx — 趋势背驰1买位置
+            sell_divergence: set of signal_idx — 趋势背驰1卖位置
+        """
+        buy_divergence = set()
+        sell_divergence = set()
+
+        if len(pivots) < 2:
+            return buy_divergence, sell_divergence
+
+        # ===== 下跌趋势背驰(1买) =====
+        # 找连续的下跌中枢(方向=down)
+        down_pivot_groups = []
+        group = []
+        for p in pivots:
+            if p['direction'] == 'down':
+                group.append(p)
+            else:
+                if len(group) >= 2:
+                    down_pivot_groups.append(group)
+                group = []
+        if len(group) >= 2:
+            down_pivot_groups.append(group)
+
+        for grp in down_pivot_groups:
+            if len(grp) < 2:
+                continue
+
+            last_pivot = grp[-1]
+
+            # 进入段: 中枢前的下跌笔
+            enter_stroke = strokes[last_pivot['stroke_start'] - 1] \
+                if last_pivot['stroke_start'] > 0 else None
+            # 离开段: 中枢后的下跌笔
+            leave_stroke = strokes[last_pivot['stroke_end'] + 1] \
+                if last_pivot['stroke_end'] + 1 < len(strokes) else None
+
+            if enter_stroke is None or leave_stroke is None:
+                continue
+            if leave_stroke['end_type'] != 'bottom':
+                continue  # 离开段必须是下跌笔(到底)
+
+            # 价格创新低(离开段低点 < 进入段低点)
+            if leave_stroke['end_val'] >= enter_stroke['end_val']:
+                continue  # 没创新低，不是趋势背驰
+
+            # MACD面积比较 (缠论标准: 下跌笔取绿柱面积)
+            enter_hist = macd_hist.iloc[enter_stroke['start_idx']:enter_stroke['end_idx'] + 1].values
+            leave_hist = macd_hist.iloc[leave_stroke['start_idx']:leave_stroke['end_idx'] + 1].values
+            enter_area = sum(abs(x) for x in enter_hist if x < 0)
+            leave_area = sum(abs(x) for x in leave_hist if x < 0)
+
+            # 离开段面积 < 进入段面积 = 背驰
+            if leave_area < enter_area:
+                signal_idx = leave_stroke['end_idx'] + self.bi_confirm_delay
+                if 0 <= signal_idx < n:
+                    buy_divergence.add(signal_idx)
+
+        # ===== 上涨趋势背驰(1卖) =====
+        up_pivot_groups = []
+        group = []
+        for p in pivots:
+            if p['direction'] == 'up':
+                group.append(p)
+            else:
+                if len(group) >= 2:
+                    up_pivot_groups.append(group)
+                group = []
+        if len(group) >= 2:
+            up_pivot_groups.append(group)
+
+        for grp in up_pivot_groups:
+            if len(grp) < 2:
+                continue
+
+            last_pivot = grp[-1]
+
+            enter_stroke = strokes[last_pivot['stroke_start'] - 1] \
+                if last_pivot['stroke_start'] > 0 else None
+            leave_stroke = strokes[last_pivot['stroke_end'] + 1] \
+                if last_pivot['stroke_end'] + 1 < len(strokes) else None
+
+            if enter_stroke is None or leave_stroke is None:
+                continue
+            if leave_stroke['end_type'] != 'top':
+                continue  # 离开段必须是上涨笔(到顶)
+
+            # 价格创新高(离开段高点 > 进入段高点)
+            if leave_stroke['end_val'] <= enter_stroke['end_val']:
+                continue
+
+            # MACD面积比较 (缠论标准: 上涨笔取红柱面积)
+            enter_hist = macd_hist.iloc[enter_stroke['start_idx']:enter_stroke['end_idx'] + 1].values
+            leave_hist = macd_hist.iloc[leave_stroke['start_idx']:leave_stroke['end_idx'] + 1].values
+            enter_area = sum(abs(x) for x in enter_hist if x > 0)
+            leave_area = sum(abs(x) for x in leave_hist if x > 0)
+
+            if leave_area < enter_area:
+                signal_idx = leave_stroke['end_idx'] + self.bi_confirm_delay
+                if 0 <= signal_idx < n:
+                    sell_divergence.add(signal_idx)
+
+        return buy_divergence, sell_divergence
+
+    def _detect_3buy_context(self, filtered_fractals: List[Dict], df: pd.DataFrame) -> pd.Series:
+        """检测3买信号上下文 [v11]
+
+        3买条件(缠论标准定义):
+        1. 中枢形成: >=3笔重叠区间 [ZD, ZG]
+        2. 向上突破: 笔的高点 > ZG
+        3. 回踩不破: 下一笔回调的低点 >= ZG
+        4. 回踩底分型 = 3买点
+
+        返回: 与bi_buy同索引的布尔Series, True表示该bi_buy同时也是3买
+
+        注意: 3买是bi_buy的子集(在结构上满足3买条件的bi_buy), 不产生额外信号
+        """
+        n = len(df)
+        third_buy = pd.Series(False, index=df.index)
+
+        if len(filtered_fractals) < 5:  # 至少需要4个分型(3笔)才能形成中枢
+            return third_buy
+
+        # 从分型序列构建笔序列
+        # filtered_fractals: [top, bottom, top, bottom, ...] 交替排列
+        strokes = []
+        for j in range(len(filtered_fractals) - 1):
+            f1, f2 = filtered_fractals[j], filtered_fractals[j + 1]
+            strokes.append({
+                'high': max(f1['val'], f2['val']),
+                'low': min(f1['val'], f2['val']),
+                'end_idx': f2['idx'],      # 原始K线索引
+                'end_type': f2['type'],     # 'top' 或 'bottom'
+            })
+
+        if len(strokes) < 3:
+            return third_buy
+
+        # Step 1: 检测中枢(Zhongshu)
+        # 中枢: >=3笔连续重叠, ZG = min(各笔高点), ZD = max(各笔低点), ZG > ZD
+        zhongshu_list = []
+        j = 0
+        while j <= len(strokes) - 3:
+            s1, s2, s3 = strokes[j], strokes[j + 1], strokes[j + 2]
+            zg = min(s1['high'], s2['high'], s3['high'])
+            zd = max(s1['low'], s2['low'], s3['low'])
+
+            if zg > zd:
+                # 中枢存在, 尝试向后延伸
+                k = j + 3
+                stroke_count = 3
+                while k < len(strokes):
+                    sk = strokes[k]
+                    new_zg = min(zg, sk['high'])
+                    new_zd = max(zd, sk['low'])
+                    if new_zg > new_zd:
+                        zg, zd = new_zg, new_zd
+                        k += 1
+                        stroke_count += 1
+                    else:
+                        break
+
+
+                zhongshu_list.append({
+                    'end_stroke': k - 1,
+                    'ZG': zg,
+                    'ZD': zd,
+                    'stroke_count': stroke_count,
+                })
+                j = k  # 跳过已属于该中枢的笔
+            else:
+                j += 1
+
+        # Step 2: 检测3买 — 中枢后向上突破 + 回踩不破ZG
+        for zs in zhongshu_list:
+            zg = zs['ZG']
+            zd = zs['ZD']
+            next_s = zs['end_stroke'] + 1
+
+            if next_s >= len(strokes):
+                continue
+
+            # Phase 1: 寻找向上突破ZG的笔
+            broke_out_idx = -1
+            for k in range(next_s, len(strokes)):
+                sk = strokes[k]
+                if sk['high'] > zg:
+                    broke_out_idx = k
+                    break
+                elif sk['low'] < zd:
+                    # 向下破中枢下沿, 此中枢3买失效
+                    break
+
+            if broke_out_idx < 0:
+                continue  # 未突破, 跳过
+
+            # Phase 2: 突破后寻找回踩 [v13 fix: 修复or True bug]
+            # 标准3买: 回踩低点 >= ZG
+            # 弱3买:   回踩低点 >= ZD (仅当无标准3买时)
+            found_standard_3buy = False
+            weak_3buy_signal = None
+            for k in range(broke_out_idx + 1, len(strokes)):
+                sk = strokes[k]
+                if sk['end_type'] == 'bottom' and sk['low'] >= zg:
+                    # 标准3买!
+                    signal_idx = sk['end_idx'] + self.bi_confirm_delay
+                    if 0 <= signal_idx < n:
+                        third_buy.iloc[signal_idx] = True
+                    found_standard_3buy = True
+                    break  # 找到标准3买, 完成
+                elif sk['end_type'] == 'bottom' and sk['low'] >= zd:
+                    # 弱3买候选: 破ZG但未破ZD
+                    if weak_3buy_signal is None:
+                        weak_3buy_signal = sk
+                elif sk['low'] < zd:
+                    # 跌破中枢下沿, 3买彻底失效
+                    break
+
+            # 无标准3买但有弱3买, 使用弱3买
+            if not found_standard_3buy and weak_3buy_signal is not None:
+                signal_idx = weak_3buy_signal['end_idx'] + self.bi_confirm_delay
+                if 0 <= signal_idx < n and not third_buy.iloc[signal_idx]:
+                    third_buy.iloc[signal_idx] = True
+
+        return third_buy
 
     def _compute_weekly_not_down(self, df):
         """周线非下跌过滤"""
@@ -618,6 +1718,13 @@ class SignalEngine:
             pass
 
         return trends
+
+    def _close_position(self, code: str):
+        """平仓辅助: 更新持仓数和行业计数 [v12.2]"""
+        self._active_positions = max(0, self._active_positions - 1)
+        industry = self._industry_map.get(code, '')
+        if industry and industry in self._active_industries:
+            self._active_industries[industry] = max(0, self._active_industries[industry] - 1)
 
     def _update_loss_streak(self, profit_pct: float, bar_idx: int):
         """更新组合级连续亏损追踪 [v9 P0.3]"""

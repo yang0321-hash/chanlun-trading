@@ -122,9 +122,14 @@ class WeightedScreenerV2:
             sector_stats = self._calc_sector_stats(date, market_stats['stock_change'])
 
         # ========================================
-        # 优化后的评分系统 - 只保留有效指标
+        # 优化后的评分系统 - 动态阈值
         # 总分最高 11 分
         # ========================================
+
+        # 市场状态标记
+        has_high_consecutive = market_stats['max_consecutive'] >= 4
+        if has_high_consecutive:
+            details['市场状态'] = '高连板'
 
         # 【市场环境】最多 3 分
         # 1. 大盘下跌 + 个股上涨 (2分) - 最强信号
@@ -135,7 +140,7 @@ class WeightedScreenerV2:
             scores['market_stock_up'] = 0
 
         # 2. 市场最高连板 >= 4 (1分) - 市场情绪指标
-        if market_stats['max_consecutive'] >= 4:
+        if has_high_consecutive:
             scores['max_consecutive'] = 1
             details['高连板'] = 1
         else:
@@ -275,18 +280,24 @@ class WeightedScreenerV2:
             'limit_up_count': sector_limit_count
         }
 
-    def backtest(self, start_idx: int = -100, min_score: int = 6,
-                 buy_at: str = 'open', hold_days: int = 1):
-        """回测"""
+    def backtest(self, start_idx: int = -100,
+                 buy_at: str = 'open', hold_days: int = 1,
+                 min_score_high: int = 5, min_score_low: int = 8):
+        """
+        回测 - 动态阈值
+        min_score_high: 高连板市场使用的低阈值
+        min_score_low: 普通市场使用的高阈值
+        """
         all_dates = set()
         for df in self.stock_data.values():
             all_dates.update(df.index)
         all_dates = sorted(list(all_dates))[start_idx:]
 
         buy_method = {'close': '信号日', 'open': '次日开盘', 'high': '次日涨停'}.get(buy_at, buy_at)
-        print(f"\n回测：{len(all_dates)}天，阈值≥{min_score}分，{buy_method}买入，持有{hold_days}天")
+        print(f"\n回测：{len(all_dates)}天，动态阈值({min_score_high}/{min_score_low}分)，{buy_method}买入，持有{hold_days}天")
 
         trades = []
+        high_consecutive_days = 0  # 统计高连板天数
 
         for i, date in enumerate(all_dates[:-3]):
             if i % 10 == 0:
@@ -295,10 +306,17 @@ class WeightedScreenerV2:
             market_stats = self._calc_market_stats(date)
             sector_stats = self._calc_sector_stats(date, market_stats['stock_change'])
 
+            # 动态阈值
+            has_high_consecutive = market_stats['max_consecutive'] >= 4
+            current_threshold = min_score_high if has_high_consecutive else min_score_low
+
+            if has_high_consecutive:
+                high_consecutive_days += 1
+
             scores = []
             for code in self.stock_data.keys():
                 result = self.score_stock(code, date, market_stats, sector_stats)
-                if result['total_score'] >= min_score:
+                if result['total_score'] >= current_threshold:
                     scores.append((code, result))
 
             if not scores:
@@ -387,13 +405,22 @@ def main():
     screener = WeightedScreenerV2(tdx_path)
     screener.load_data(max_stocks=2000)
 
-    # 测试不同阈值 (总分11分)
-    for min_score in [6, 7, 8]:
+    print("\n策略：动态阈值")
+    print("  - 高连板市场(>=4天): 低阈值选股")
+    print("  - 普通市场: 高阈值选股")
+    print("="*60)
+
+    # 测试不同的阈值组合
+    # (高连板市场阈值, 普通市场阈值)
+    threshold_pairs = [(4, 7), (5, 8), (5, 7)]
+
+    for high_thresh, low_thresh in threshold_pairs:
         print(f"\n{'='*60}")
-        print(f"评分阈值: {min_score}分")
+        print(f"阈值组合: 高连板={high_thresh}分, 普通={low_thresh}分")
         print(f"{'='*60}")
 
-        trades = screener.backtest(start_idx=-30, min_score=min_score, buy_at='open', hold_days=1)
+        trades = screener.backtest(start_idx=-30, buy_at='open', hold_days=1,
+                                   min_score_high=high_thresh, min_score_low=low_thresh)
         screener.analyze(trades)
 
 
