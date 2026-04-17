@@ -3,5 +3,7 @@
 """
 
 from .macd import MACD
+from .atr import ATR
+from .enhanced_divergence import EnhancedDivergenceDetector, DivergenceResult, DivergenceType
 
-__all__ = ['MACD']
+__all__ = ['MACD', 'ATR', 'EnhancedDivergenceDetector', 'DivergenceResult', 'DivergenceType']

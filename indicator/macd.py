@@ -166,19 +166,28 @@ class MACD:
         self,
         start_idx: int,
         end_idx: int,
-        direction: str
+        direction: str,
+        prev_start: int = None,
+        prev_end: int = None
     ) -> Tuple[bool, float]:
         """
-        检查是否存在背驰
+        检查是否存在背驰（缠论双条件）
 
-        背驰定义：
-        - 顶背驰：价格创新高，但MACD没有创新高（红柱缩短或DIF下降）
-        - 底背驰：价格创新低，但MACD没有创新低（绿柱缩短或DIF上升）
+        缠论原文（第24课 MACD定律）：
+        - 背驰条件：黄白线(DIF)背离 + 柱状面积减少，两者必须同时满足
+        - 一买总是在0轴下方背驰形成
+        - 一卖总是在0轴上方背驰形成
+
+        检测逻辑：
+        - 顶背驰：价格创新高，但DIF不创新高 AND 红柱面积减少
+        - 底背驰：价格创新低，但DIF不创新低 AND 绿柱面积减少
 
         Args:
-            start_idx: 起始索引
-            end_idx: 结束索引
+            start_idx: 当前趋势段起始索引
+            end_idx: 当前趋势段结束索引
             direction: 方向 ('up'检查顶背驰, 'down'检查底背驰)
+            prev_start: 上一趋势段起始索引（None则自动回溯等长区间）
+            prev_end: 上一趋势段结束索引
 
         Returns:
             (是否背驰, 背驰强度)
@@ -187,35 +196,124 @@ class MACD:
             return (False, 0)
 
         if direction == 'up':
-            # 顶背驰：价格新高，MACD不新高
+            # 顶背驰：价格新高，DIF不新高 + 红柱面积减少
             price_high = max(self.values[i].price for i in range(start_idx, end_idx + 1))
-            macd_high = max(self.values[i].macd for i in range(start_idx, end_idx + 1))
+            dif_high = max(self.values[i].macd for i in range(start_idx, end_idx + 1))
 
-            # 比较前一波
-            if start_idx > 10:
-                prev_price_high = max(self.values[i].price for i in range(start_idx - 10, start_idx))
-                prev_macd_high = max(self.values[i].macd for i in range(start_idx - 10, start_idx))
+            # 确定前一波区间
+            if prev_start is not None and prev_end is not None:
+                p_start = max(0, prev_start)
+                p_end = min(len(self.values) - 1, prev_end)
+            else:
+                wave_length = end_idx - start_idx + 1
+                p_end = max(0, start_idx - 1)
+                p_start = max(0, p_end - wave_length + 1)
 
-                if price_high > prev_price_high and macd_high < prev_macd_high:
-                    # 背驰强度 = (前一波MACD - 当前MACD) / 前一波MACD
-                    strength = (prev_macd_high - macd_high) / prev_macd_high if prev_macd_high != 0 else 0
-                    return (True, strength)
+            if p_start >= p_end or p_start < 0:
+                return (False, 0)
+
+            prev_price_high = max(self.values[i].price for i in range(p_start, p_end + 1))
+            prev_dif_high = max(self.values[i].macd for i in range(p_start, p_end + 1))
+
+            # 条件1：价格创新高
+            if price_high <= prev_price_high:
+                return (False, 0)
+
+            # 条件2：DIF不创新高（黄白线背离）
+            dif_divergence = dif_high < prev_dif_high
+
+            # 条件3：红柱面积减少
+            curr_area = self.compute_area(start_idx, end_idx, 'up')
+            prev_area = self.compute_area(p_start, p_end, 'up')
+            area_divergence = curr_area < prev_area if prev_area > 0 else False
+
+            # 缠论要求：DIF背离 AND 面积减少（两者同时满足）
+            if dif_divergence and area_divergence:
+                dif_strength = (prev_dif_high - dif_high) / prev_dif_high if prev_dif_high != 0 else 0
+                area_strength = (prev_area - curr_area) / prev_area if prev_area > 0 else 0
+                strength = (dif_strength + area_strength) / 2
+                return (True, strength)
+
+            # 缠论严格要求双条件，仅DIF背离不算背驰
+            # 返回False，不使用宽松模式
+
         else:
-            # 底背驰：价格新低，MACD不新低
+            # 底背驰：价格新低，DIF不新低 + 绿柱面积减少
             price_low = min(self.values[i].price for i in range(start_idx, end_idx + 1))
-            macd_low = min(self.values[i].macd for i in range(start_idx, end_idx + 1))
+            dif_low = min(self.values[i].macd for i in range(start_idx, end_idx + 1))
 
-            # 比较前一波
-            if start_idx > 10:
-                prev_price_low = min(self.values[i].price for i in range(start_idx - 10, start_idx))
-                prev_macd_low = min(self.values[i].macd for i in range(start_idx - 10, start_idx))
+            # 确定前一波区间
+            if prev_start is not None and prev_end is not None:
+                p_start = max(0, prev_start)
+                p_end = min(len(self.values) - 1, prev_end)
+            else:
+                wave_length = end_idx - start_idx + 1
+                p_end = max(0, start_idx - 1)
+                p_start = max(0, p_end - wave_length + 1)
 
-                if price_low < prev_price_low and macd_low > prev_macd_low:
-                    # 背驰强度 = (当前MACD - 前一波MACD) / 前一波MACD
-                    strength = (macd_low - prev_macd_low) / abs(prev_macd_low) if prev_macd_low != 0 else 0
-                    return (True, strength)
+            if p_start >= p_end or p_start < 0:
+                return (False, 0)
+
+            prev_price_low = min(self.values[i].price for i in range(p_start, p_end + 1))
+            prev_dif_low = min(self.values[i].macd for i in range(p_start, p_end + 1))
+
+            # 条件1：价格创新低
+            if price_low >= prev_price_low:
+                return (False, 0)
+
+            # 条件2：DIF不创新低（黄白线背离）
+            dif_divergence = dif_low > prev_dif_low
+
+            # 条件3：绿柱面积减少
+            curr_area = self.compute_area(start_idx, end_idx, 'down')
+            prev_area = self.compute_area(p_start, p_end, 'down')
+            area_divergence = curr_area < prev_area if prev_area > 0 else False
+
+            # 缠论要求：DIF背离 AND 面积减少（两者同时满足）
+            if dif_divergence and area_divergence:
+                dif_strength = (dif_low - prev_dif_low) / abs(prev_dif_low) if prev_dif_low != 0 else 0
+                area_strength = (prev_area - curr_area) / prev_area if prev_area > 0 else 0
+                strength = (dif_strength + area_strength) / 2
+                return (True, strength)
+
+            # 缠论严格要求双条件，仅DIF背离不算背驰
+            # 返回False，不使用宽松模式
 
         return (False, 0)
+
+    def compute_area(
+        self,
+        start_idx: int,
+        end_idx: int,
+        direction: str = 'auto'
+    ) -> float:
+        """
+        计算MACD柱线面积
+
+        用于比较不同笔的MACD力度，是中枢背驰检测的基础。
+
+        Args:
+            start_idx: 起始索引
+            end_idx: 结束索引
+            direction: 'up'只计算红柱, 'down'只计算绿柱, 'auto'全部绝对值
+
+        Returns:
+            MACD柱线面积
+        """
+        if start_idx < 0 or not self.values or start_idx > end_idx:
+            return 0.0
+
+        end_idx = min(end_idx, len(self.values) - 1)
+        area = 0.0
+        for i in range(start_idx, end_idx + 1):
+            h = self.values[i].histogram
+            if direction == 'up':
+                area += max(0, h)
+            elif direction == 'down':
+                area += max(0, -h)
+            else:
+                area += abs(h)
+        return area
 
     def check_golden_cross(self) -> bool:
         """

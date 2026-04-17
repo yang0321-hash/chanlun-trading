@@ -7,6 +7,8 @@ from .base_agent import (
     BaseAgent,
     AgentConfig,
     AgentState,
+    AgentInput,
+    AgentOutput,
     AgentRegistry,
     register_agent,
     AgentOrchestrator,

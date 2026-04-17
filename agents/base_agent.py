@@ -13,6 +13,27 @@ from skills.base import BaseSkill, SkillResult
 
 
 @dataclass
+class AgentInput:
+    """Agent 输入数据"""
+    ohlcv_data: Optional[pd.DataFrame] = None
+    current_index: int = -1
+    symbol: str = ""
+    config: Optional[Dict[str, Any]] = None
+    previous_results: Dict[str, Any] = field(default_factory=dict)
+    context: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class AgentOutput:
+    """Agent 输出结果"""
+    agent_name: str = ""
+    success: bool = False
+    confidence: float = 0.0
+    reasoning: str = ""
+    data: Optional[Dict[str, Any]] = None
+
+
+@dataclass
 class AgentState:
     """Agent 状态"""
     agent_name: str
@@ -72,6 +93,10 @@ class AgentConfig:
         """获取 Skill 配置"""
         return self.skill_configs.get(skill_name, {})
 
+    def get(self, key: str, default: Any = None) -> Any:
+        """获取配置项 (兼容旧架构 dict-like 访问)"""
+        return self.agent_config.get(key, default)
+
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
         return {
@@ -94,16 +119,38 @@ class BaseAgent(ABC):
     4. 维护自身状态
     """
 
-    def __init__(self, config: AgentConfig):
+    def __init__(self, config=None, config_dict=None):
         """
         初始化 Agent
 
+        支持两种调用方式:
+        1. 新架构: BaseAgent(config=AgentConfig(...))
+        2. 旧架构: BaseAgent("agent_name", config_dict)
+
         Args:
-            config: Agent 配置
+            config: AgentConfig 对象 (新架构) 或 str 名称 (旧架构)
+            config_dict: 旧架构的配置字典
         """
-        self.config = config
-        self.name = config.name
-        self.description = config.description
+        # 兼容旧架构: BaseAgent("name", dict) 调用方式
+        if isinstance(config, str):
+            name = config
+            self._raw_config = config_dict or {}
+            self.config = AgentConfig(
+                name=name,
+                agent_config=self._raw_config
+            )
+        elif isinstance(config, AgentConfig):
+            self._raw_config = config.agent_config
+            self.config = config
+        elif config is None:
+            self._raw_config = {}
+            self.config = AgentConfig(name="unknown")
+        else:
+            self._raw_config = {}
+            self.config = config
+
+        self.name = self.config.name
+        self.description = self.config.description
         self.skills: Dict[str, BaseSkill] = {}
         self.state = AgentState(
             agent_name=self.name,
@@ -111,15 +158,14 @@ class BaseAgent(ABC):
         )
 
         # 从配置中获取参数
-        for key, value in config.agent_config.items():
+        for key, value in self.config.agent_config.items():
             setattr(self, key, value)
 
         # 注册 Skills
         self._register_skills()
 
-    @abstractmethod
     def _register_skills(self) -> None:
-        """注册所需的 Skills"""
+        """注册所需的 Skills (子类可选覆写)"""
         pass
 
     @abstractmethod

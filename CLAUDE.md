@@ -8,21 +8,68 @@ A Python quantitative trading system based on ChanLun (缠论) theory for A-shar
 
 ## Running the System
 
+### Quick Start
 ```bash
+# Environment setup
+python setup_config.py              # Initialize configuration
+python test_env_config.py           # Verify environment
+
 # Quick demo with online data (AKShare)
 python run_demo.py
-
-# Basic usage example
 python examples/basic_usage.py
+```
 
-# Backtest with TDX local data
-python backtest_002600_tdx.py
+### Backtesting
+```bash
+# Single stock backtest
+python backtest_002600_tdx.py       # TDX local data
+python backtest_weekly_daily.py sh600519  # Multi-timeframe
 
-# Compare multiple strategies
-python three_strategy_compare.py
+# AAA strategy (latest)
+python aaa_backtest_v4_stable.py    # Stable version
+python quick_aaa_test.py            # Quick test
 
-# Run backtest and generate report
-python generate_optimization_report.py
+# Batch backtest
+python batch_backtest_watchlist.py  # Batch from watchlist.txt
+python three_strategy_compare.py    # Compare strategies
+```
+
+### Real-time Monitoring
+```bash
+python scan_30min_2buy.py           # 30-min level scanning
+python chanlun_30min_monitor.py     # Intraday monitoring
+python scheduled_monitor.py         # Background monitoring
+```
+
+### Data Management
+```bash
+python update_tdx_data.py           # Update TDX from AKShare
+python quick_update_tdx.py          # Quick update
+node .claude/skills/tdx-parser/scripts/parse_tdx.js --code sh600519 --format json
+```
+
+### Testing & Notifications
+```bash
+python test_notification.py         # Test notification system
+python test_wechat_notify.py        # Test WeChat notify
+```
+
+## Output Directories
+
+```
+backtest_charts/     # Backtest visualization charts (PNG)
+signals/             # Generated trade signals (JSON)
+test_output/         # Test output files
+.claude/temp/        # TDX converted JSON files
+data/storage/        # AKShare data cache
+```
+
+## Configuration Files
+
+```
+config.yaml          # Main config (data source, notifications)
+.env                 # Environment variables (API keys, tokens)
+watchlist.txt        # Watchlist for batch backtest
 ```
 
 ## Architecture
@@ -65,11 +112,16 @@ All strategies inherit from `backtest.strategy.Strategy`:
 ### Available Strategies
 
 - `strategies/chan_strategy.py`: Basic ChanLun strategy with 6 buy/sell point types
+- `strategies/aaa_strategy.py`: AAA scoring system (Trend + Momentum + Volume)
+  - Entry: AAA score > threshold
+  - Exit: AAA score < threshold or stop loss
 - `strategies/weekly_daily_strategy.py`: Multi-timeframe (周线+日线) strategy
   - Entry: 周线2买
   - Stop Loss: 跌破周线1买最低点
   - Partial Exit: 日线MACD顶背离 (sell 50%)
   - Full Exit: 日线2卖
+- `strategies/hot_money_limit_up_strategy.py`: Hot money tracking with limit-up detection
+- `strategies/intelligent_chanlun_strategy.py`: Adaptive ChanLun with dynamic parameters
 - `strategies/multilevel_chan_strategy.py`: Multi-level ChanLun with trend confirmation
 - `strategies/optimized_chan_strategy.py`: Optimized version with filters
 - `strategies/advanced_chan_strategy.py`: Advanced with re-entry rules
@@ -81,9 +133,10 @@ All strategies inherit from `backtest.strategy.Strategy`:
 
 ### 通达信数据配置
 
-**本地通达信路径**:
-```
-D:/大侠神器2.0/直接使用_大侠神器2.0.1.251231(ODM250901)/直接使用_大侠神器2.0.10B1206(260930)/new_tdx(V770)/vipdoc
+**配置路径** (在 `config.yaml` 中设置):
+```yaml
+tdx:
+  data_path: "D:/your_tdx_path/vipdoc"
 ```
 
 **数据目录结构**:
@@ -142,13 +195,36 @@ Config via `BacktestConfig(initial_capital, commission, slippage, min_unit)`
   - 3买: Breakout above pivot that doesn't re-enter
   - Mirror for sell points
 
-## Python Requirements
+## Dependencies
 
+### Python Requirements
 ```bash
 pip install akshare pandas numpy plotly loguru python-dotenv scipy matplotlib
 ```
 
+**Common Issues:**
+- scipy compatibility: If encountering errors, use `pip install scipy==1.11.4`
+
+### Node.js (for TDX parsing)
+```bash
+node --version  # Requires Node.js 14+
+```
+
 For TDX data parsing, use the `/tdx-parser` skill to convert `.day` files to JSON.
+
+## Available Skills
+
+Use these skills via `/skill-name` command:
+
+```bash
+/tdx-parser          # Parse TongDaXin .day files to JSON
+/tdx-updater         # Update TDX data from AKShare
+/backtest            # Run strategy backtest
+/backtest-viz        # Generate backtest charts
+/chanlun             # ChanLun analysis with visualization
+/stock-name-matcher  # Match stock codes to company names
+/投委会              # 投资委员会评估（6Agent+缠论买卖点）
+```
 
 ## Stock Code to Name Matching
 

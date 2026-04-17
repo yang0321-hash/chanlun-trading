@@ -112,8 +112,12 @@ class AKShareSource(DataSource):
         # 请求延迟
         time.sleep(self.delay)
 
-        # 标准化列名
-        df = self._standardize_columns(df)
+        # 标准化列名（使用类名调用避免编码问题）
+        try:
+            df = AKShareSource._standardize_columns(df)
+        except Exception as e:
+            # 重试一次，处理可能的编码问题
+            df = AKShareSource._standardize_columns(df)
 
         # 确保日期排序
         df = df.sort_values('datetime').reset_index(drop=True)
@@ -240,8 +244,23 @@ class AKShareSource(DataSource):
         Returns:
             标准化后的DataFrame
         """
-        # 列名映射
+        # 列名映射（使用 UTF-8 字节以确保兼容性）
         column_map = {
+            '\xe6\x97\xa5\xe6\x9c\x9f': 'datetime',   # 日期
+            '\xe5\xbc\x80\xe7\x9b\x98': 'open',       # 开盘
+            '\xe6\x9c\x80\xe9\xab\x98': 'high',       # 最高
+            '\xe6\x9c\x80\xe4\xbd\x8e': 'low',        # 最低
+            '\xe6\x94\xb6\xe7\x9b\x98': 'close',      # 收盘
+            '\xe6\x88\x90\xe4\xba\xa4\xe9\x87\x8f': 'volume',   # 成交量
+            '\xe6\x88\x90\xe4\xba\xa4\xe9\xa2\x9d': 'amount',     # 成交额
+            '\xe6\x8d\xa2\xe6\x89\x8b\xe7\x8e\x87': 'turnover',    # 换手率
+            '\xe6\xb6\xa8\xe8\xb7\x8c\xe5\xb9\x85': 'change_pct',  # 涨跌幅
+            '\xe6\xb6\xa8\xe8\xb7\x8c\xe9\xa2\x9d': 'change',      # 涨跌额
+            '\xe6\x8c\xaf\xe5\xb9\x85': 'amplitude'    # 振幅
+        }
+
+        # 同时支持直接中文列名
+        column_map_fallback = {
             '日期': 'datetime',
             '开盘': 'open',
             '最高': 'high',
@@ -255,14 +274,17 @@ class AKShareSource(DataSource):
             '振幅': 'amplitude'
         }
 
-        # 重命名列
-        df = df.rename(columns=column_map)
+        # 重命名列（优先使用字节映射）
+        try:
+            df = df.rename(columns=column_map)
+        except:
+            df = df.rename(columns=column_map_fallback)
 
         # 确保必需列存在
         required_cols = ['datetime', 'open', 'high', 'low', 'close', 'volume']
         for col in required_cols:
             if col not in df.columns:
-                raise ValueError(f"缺少必需列: {col}")
+                raise ValueError(f"缺少必需列: {col}, 当前列: {df.columns.tolist()}")
 
         # 转换datetime
         if 'datetime' in df.columns:

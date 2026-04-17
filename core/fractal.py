@@ -120,14 +120,17 @@ class FractalDetector:
                 if self.confirm_required:
                     if self._check_fractal_confirmed(fractal):
                         self.fractals.append(fractal)
-                        # 分型已确认，跳过已使用的K线
+                        # 分型已确认，从中间K线下一根开始（不跳过，
+                        # 因为第3根K线可能是下一个分型的第1根）
                         i += 2
                     else:
                         # 未确认，继续下一根K线
                         i += 1
                 else:
                     self.fractals.append(fractal)
-                    i += 2
+                    # 不需要确认时也从中间K线下一根开始，
+                    # 但不跳过第3根（它可能参与下一个分型）
+                    i += 1
             else:
                 i += 1
 
@@ -200,12 +203,11 @@ class FractalDetector:
         # 严格模式：k2的高点必须严格高于k1和k3
         # 宽松模式：允许相等（根据包含关系处理后的K线通常严格）
 
-        # k2的高点最高
+        # 原文要求: 顶分型中间K线 high 最高 AND low 也最高（形成真正的峰）
         if k2.high < k1.high or k2.high < k3.high:
             return False
-
-        # k1和k3的高点都低于k2
-        # 低点没有要求，但顶分型通常是上升后的转折
+        if k2.low < k1.low or k2.low < k3.low:
+            return False
         return True
 
     def _is_bottom_fractal(self, k1: KLineData, k2: KLineData, k3: KLineData) -> bool:
@@ -223,10 +225,11 @@ class FractalDetector:
         Returns:
             是否底分型
         """
-        # k2的低点最低
+        # 原文要求: 底分型中间K线 low 最低 AND high 也最低（形成真正的谷）
         if k2.low > k1.low or k2.low > k3.low:
             return False
-
+        if k2.high > k1.high or k2.high > k3.high:
+            return False
         return True
 
     def _check_fractal_confirmed(self, fractal: Fractal) -> bool:

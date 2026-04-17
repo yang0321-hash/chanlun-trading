@@ -232,13 +232,20 @@ class KLine:
         elif k2.high < k1.high and k2.low < k1.low:
             return 'down'
         else:
-            # 震荡情况，参考更早的K线
+            # 震荡情况，参考更早的K线，同时比较high和low
             for i in range(len(processed) - 2, -1, -1):
-                if processed[i].high != k1.high or processed[i].low != k1.low:
-                    if k1.high > processed[i].high:
+                prev = processed[i]
+                if prev.high != k1.high or prev.low != k1.low:
+                    # 高低点必须同时比较，不能只看high
+                    high_up = k1.high > prev.high
+                    low_up = k1.low > prev.low
+                    if high_up and low_up:
                         return 'up'
-                    else:
+                    elif not high_up and not low_up:
                         return 'down'
+                    else:
+                        # 高低矛盾时，以close方向为准
+                        return 'up' if k1.close > prev.close else 'down'
             return 'up'
 
     @property

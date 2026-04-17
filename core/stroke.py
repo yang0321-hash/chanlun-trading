@@ -76,6 +76,32 @@ class Stroke:
         return (self.end_value - self.start_value) / self.start_value * 100
 
     @property
+    def strength_score(self) -> float:
+        """
+        笔强度评分 (0-1)
+
+        衡量笔的力度：振幅越大、长度越长 = 越有力量
+        """
+        if self.length == 0 or self.start_value == 0:
+            return 0.0
+        amplitude_pct = abs(self.price_change_pct)
+        # 10%振幅 = 满分，线性归一化
+        return min(amplitude_pct / 10.0, 1.0)
+
+    @property
+    def amplitude(self) -> float:
+        """笔的振幅（最高-最低）"""
+        return self.high - self.low
+
+    @property
+    def amplitude_pct(self) -> float:
+        """笔的振幅百分比"""
+        mid = (self.high + self.low) / 2
+        if mid == 0:
+            return 0.0
+        return (self.high - self.low) / mid * 100
+
+    @property
     def start_datetime(self) -> datetime:
         """起始时间"""
         return self.start_fractal.datetime
@@ -143,53 +169,167 @@ class StrokeGenerator:
         self._generate()
 
     def _generate(self) -> None:
-        """生成所有笔"""
+        """生成所有笔
+
+        两阶段算法 (对齐TDX缠论笔划分):
+        1. Swing检测: 在包含处理后的K线上找摆动高低点 (HHV/LLV确认)
+        2. 最小间距过滤: 确保相邻端点之间有足够间距
+
+        对应TDX指标 GSKZ30~GSKZ49 的核心逻辑:
+        - 不急于确认分型, 等到真正的极值出现且不被超越
+        - 用 HHV(最高价) / LLV(最低价) 做确认
+        """
         if len(self.fractals) < 2:
             return
 
-        # 按位置排序分型
-        sorted_fractals = sorted(self.fractals, key=lambda f: f.index)
+        kline_data = self.kline.data
+        n = len(kline_data)
+        if n < self.min_bars:
+            return
 
-        i = 0
-        while i < len(sorted_fractals) - 1:
-            f1 = sorted_fractals[i]
-            f2 = sorted_fractals[i + 1]
+        # ---- 阶段1: Swing High/Low 检测 ----
+        # 找到所有局部极值点: 左右各lookback根K线内, 当前K线是最高/最低
+        # lookback越大, 笔越少越长 (类似TDX的 SUMBARS N层展开)
+        lookback = max(3, self.min_bars)
 
-            # 必须是一顶一底
-            if f1.type == f2.type:
-                # 同类型分型，跳过中间的分型
-                # 保留更强的那个
-                if self._compare_fractal_strength(f1, f2) > 0:
-                    i += 1
-                else:
-                    sorted_fractals.pop(i)
-                continue
+        swing_points = []  # (index, 'high'|'low')
 
-            # 确定笔的方向
-            if f1.is_bottom and f2.is_top:
-                stroke_type = StrokeType.UP
+        for i in range(n):
+            is_high = True
+            is_low = True
+
+            lo = max(0, i - lookback)
+            hi = min(n - 1, i + lookback)
+
+            for j in range(lo, hi + 1):
+                if j == i:
+                    continue
+                if kline_data[j].high > kline_data[i].high:
+                    is_high = False
+                if kline_data[j].low < kline_data[i].low:
+                    is_low = False
+                if not is_high and not is_low:
+                    break
+
+            if is_high:
+                swing_points.append((i, 'high', kline_data[i].high))
+            elif is_low:
+                swing_points.append((i, 'low', kline_data[i].low))
+
+        if len(swing_points) < 2:
+            return
+
+        # ---- 阶段2: 合并相邻同类型极值 ----
+        # TDX逻辑: GSKZ44/GSKZ45 — COUNT=1 确保首次出现, 同类只保留最极端
+        merged = [swing_points[0]]
+        for pt in swing_points[1:]:
+            last = merged[-1]
+            if pt[1] != last[1]:
+                # 不同类型 (高→低 或 低→高), 直接添加
+                merged.append(pt)
             else:
-                stroke_type = StrokeType.DOWN
+                # 同类型: 保留更极端的
+                if pt[1] == 'high' and pt[2] > last[2]:
+                    merged[-1] = pt
+                elif pt[1] == 'low' and pt[2] < last[2]:
+                    merged[-1] = pt
 
-            # 检查是否满足最小K线数
-            bars_between = f2.index - f1.index + 1
-            if bars_between < self.min_bars:
-                # 不满足最小K线数，跳过
-                i += 1
+        # ---- 阶段3: 最小间距过滤 ----
+        # 确保相邻端点之间至少有 min_bars 根K线
+        filtered = [merged[0]]
+        for pt in merged[1:]:
+            if pt[0] - filtered[-1][0] >= self.min_bars:
+                filtered.append(pt)
+            else:
+                # 太近了, 保留更极端的
+                last = filtered[-1]
+                if pt[1] == 'high' and last[1] == 'high':
+                    if pt[2] > last[2]:
+                        filtered[-1] = pt
+                elif pt[1] == 'low' and last[1] == 'low':
+                    if pt[2] < last[2]:
+                        filtered[-1] = pt
+                # 不同类型但太近: 丢弃较弱的一个
+                elif pt[1] != last[1]:
+                    # 看哪个更极端 (距离前一个端点更远)
+                    prev = filtered[-2] if len(filtered) >= 2 else None
+                    if prev is not None:
+                        # 保留与前一个端点类型不同的、且距离更远的
+                        if (pt[0] - prev[0]) > (last[0] - prev[0]):
+                            filtered[-1] = pt
+
+        # ---- 阶段4: 确保顶底交替 ----
+        # 最终清理: 如果还有连续同类型, 只保留最极端的
+        final = [filtered[0]]
+        for pt in filtered[1:]:
+            last = final[-1]
+            if pt[1] != last[1]:
+                final.append(pt)
+            else:
+                if pt[1] == 'high' and pt[2] > last[2]:
+                    final[-1] = pt
+                elif pt[1] == 'low' and pt[2] < last[2]:
+                    final[-1] = pt
+
+        # ---- 阶段5: 构建笔 ----
+        for i in range(len(final) - 1):
+            start_pt = final[i]
+            end_pt = final[i + 1]
+            si, ei = start_pt[0], end_pt[0]
+
+            if start_pt[1] == 'low' and end_pt[1] == 'high':
+                stype = StrokeType.UP
+            elif start_pt[1] == 'high' and end_pt[1] == 'low':
+                stype = StrokeType.DOWN
+            else:
+                continue  # 不应该出现, 跳过
+
+            lo_idx, hi_idx = min(si, ei), max(si, ei)
+            bars = kline_data[lo_idx:hi_idx + 1]
+            if not bars:
                 continue
 
-            # 检查是否被破坏
-            # 顶底之间不能有更极端的价格
-            if self._is_fractal_broken(f1, f2, sorted_fractals):
-                i += 1
-                continue
+            stroke_high = max(k.high for k in bars)
+            stroke_low = min(k.low for k in bars)
 
-            # 创建笔
-            stroke = self._create_stroke(f1, f2, stroke_type)
-            self.strokes.append(stroke)
+            # 构建Fractal
+            start_f = Fractal(
+                type=FractalType.BOTTOM if stype == StrokeType.UP else FractalType.TOP,
+                index=si,
+                kline1=kline_data[max(0, si - 1)],
+                kline2=kline_data[si],
+                kline3=kline_data[min(n - 1, si + 1)],
+                datetime=kline_data[si].datetime,
+                high=kline_data[si].high,
+                low=kline_data[si].low,
+            )
+            end_f = Fractal(
+                type=FractalType.TOP if stype == StrokeType.UP else FractalType.BOTTOM,
+                index=ei,
+                kline1=kline_data[max(0, ei - 1)],
+                kline2=kline_data[ei],
+                kline3=kline_data[min(n - 1, ei + 1)],
+                datetime=kline_data[ei].datetime,
+                high=kline_data[ei].high,
+                low=kline_data[ei].low,
+            )
 
-            # 移动到下一个分型
-            i += 1
+            start_val = start_pt[2]
+            end_val = end_pt[2]
+
+            self.strokes.append(Stroke(
+                type=stype,
+                start_index=si,
+                end_index=ei,
+                start_fractal=start_f,
+                end_fractal=end_f,
+                start_value=start_val,
+                end_value=end_val,
+                high=stroke_high,
+                low=stroke_low,
+                length=len(bars),
+                bars=bars,
+            ))
 
     def _compare_fractal_strength(self, f1: Fractal, f2: Fractal) -> int:
         """
