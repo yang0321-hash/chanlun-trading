@@ -678,13 +678,30 @@ def _find_3buy_standalone(engine, code, df):
                             'golden_pass': golden_pass,   # 条件6
                             'vol_pattern': vol_ok,        # 条件7
                         }
+
+                        # === 基于回测验证的加权评分 ===
+                        # 回测发现: top_micro最强正贡献(+3.52%), above_gg最反向(-4.29%)
+                        # 好的3买需要"有意义的回调+支撑确认", 而非"不回调"
+                        WEIGHTS = {
+                            'top_micro': 3,          # 最强正贡献 (+3.52%)
+                            'support': 1,            # 微正贡献 (+0.30%)
+                            'pullback_div': 1,       # 中性, 概念上有效
+                            'vol_pattern': 1,        # 微负但概念上有效
+                            'breakout_strong': 0,    # 负贡献, 不计入
+                            'above_gg': -2,          # 最反向 (-4.29%), 追高信号
+                            'golden_pass': -1,       # 反向 (-1.72%), 回调太浅
+                        }
+                        weighted_score = sum(
+                            WEIGHTS[k] * (1 if v else 0)
+                            for k, v in three_buy_checks.items()
+                        )
                         passed_count = sum(1 for v in three_buy_checks.values() if v)
 
-                        # 强三买: 通过5+/7个条件
-                        if passed_count >= 5:
-                            strength = 'strong'
-                        elif passed_count >= 3:
-                            strength = 'standard'
+                        # 加权评分分类
+                        if weighted_score >= 4:
+                            strength = 'strong'      # top_micro + 多条件确认
+                        elif weighted_score >= 2:
+                            strength = 'standard'    # 有关键条件确认
                         else:
                             strength = 'normal'
 
@@ -702,6 +719,7 @@ def _find_3buy_standalone(engine, code, df):
                             'pullback_low': pullback_low,
                             'three_buy_checks': three_buy_checks,
                             'three_buy_passed': passed_count,
+                            'three_buy_weighted': weighted_score,
                             'breakout_ratio': round(breakout_ratio, 2),
                             'vol_ratio': round(vol_ratio, 2),
                         })
@@ -941,21 +959,18 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
         elif buy_strength == 'weak':
             strength_bonus += 0   # 弱三买(ZD~ZG) / 中枢下2买
 
-        # === 强三买7条件评分 ===
+        # === 强三买加权评分 (基于回测验证) ===
         if signal_type == '3buy':
             three_checks = item.get('three_buy_checks', {})
-            three_passed = item.get('three_buy_passed', 0)
-            if three_passed >= 6:
-                strength_bonus += 15  # 6+/7条件: 极强三买
-            elif three_passed >= 5:
-                strength_bonus += 12  # 5/7条件: 强三买
-            elif three_passed >= 3:
-                strength_bonus += 6   # 3-4/7条件: 标准三买
-            # 额外单项加分
-            if three_checks.get('breakout_strong'):
-                strength_bonus += 3   # 突破力度强
-            if three_checks.get('vol_pattern'):
-                strength_bonus += 3   # 放量突破缩量回踩
+            weighted = item.get('three_buy_weighted', 0)
+            if weighted >= 5:
+                strength_bonus += 15  # top_micro + 多确认: 极强
+            elif weighted >= 4:
+                strength_bonus += 12  # top_micro + 支撑: 强三买
+            elif weighted >= 2:
+                strength_bonus += 6   # 有关键条件确认
+            elif weighted < 0:
+                strength_bonus -= 5   # above_gg追高惩罚
 
         # 黄金分割0.618加分 (仅3买)
         if golden_pass:
