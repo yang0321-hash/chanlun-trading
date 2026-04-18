@@ -346,6 +346,214 @@ def _classify_2buy_strength(df, pair, engine):
     return results
 
 
+# ============================================================
+# 强三买7条件辅助检测函数
+# ============================================================
+
+def _check_support_structure(df, pullback_idx, pullback_low, pivot_zg):
+    """条件2: 回踩位置是否有支撑结构
+
+    支撑来源:
+    - 前高/中枢ZG转化为支撑 (回踩在前ZG上方)
+    - MA20/MA60在回踩位置附近 (距离<3%)
+    """
+    try:
+        n = len(df)
+        if pullback_idx < 30 or pullback_idx >= n:
+            return False
+
+        close = df['close']
+        low = df['low']
+
+        # 1. 前高支撑: 回踩位置之前的20日内高点作为支撑
+        lookback = max(0, pullback_idx - 30)
+        prev_highs = df['high'].iloc[lookback:pullback_idx]
+        if len(prev_highs) > 0:
+            recent_high = prev_highs.max()
+            # 回踩低点在前高附近(下方3%以内) = 前高支撑
+            if pullback_low >= recent_high * 0.97:
+                return True
+
+        # 2. MA支撑: MA20/MA60在回踩位置附近
+        if pullback_idx >= 60:
+            ma20 = close.iloc[pullback_idx - 20:pullback_idx].mean()
+            ma60 = close.iloc[pullback_idx - 60:pullback_idx].mean()
+            for ma in [ma20, ma60]:
+                if ma > 0 and abs(pullback_low - ma) / ma < 0.03:
+                    return True
+
+        # 3. 中枢上沿支撑: 回踩在ZG附近
+        if pivot_zg > 0 and abs(pullback_low - pivot_zg) / pivot_zg < 0.02:
+            return True
+
+        return False
+    except Exception:
+        return False
+
+
+def _check_pullback_divergence(df, breakout_idx, pullback_idx):
+    """条件3: 回撤时有背驰结构
+
+    回撤段MACD柱面积递减 = 抛压衰竭 = 回撤背驰
+    """
+    try:
+        if pullback_idx - breakout_idx < 5:
+            return False
+
+        close = df['close'].iloc[breakout_idx:pullback_idx + 1]
+        if len(close) < 8:
+            return False
+
+        # 计算MACD
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        dif = ema12 - ema26
+        dea = dif.ewm(span=9, adjust=False).mean()
+        hist = 2 * (dif - dea)
+
+        # 回撤段的负柱面积 (取绝对值)
+        neg_hist = hist[hist < 0]
+        if len(neg_hist) < 4:
+            return False
+
+        # 将负柱面积分为前后两半，比较面积
+        mid = len(neg_hist) // 2
+        first_half = abs(neg_hist.iloc[:mid].sum())
+        second_half = abs(neg_hist.iloc[mid:].sum())
+
+        # 后半段面积 < 前半段的80% = 衰竭
+        if first_half > 0 and second_half < first_half * 0.8:
+            return True
+
+        return False
+    except Exception:
+        return False
+
+
+def _check_top_micro_pivot(df, breakout_high_idx, breakout_high, pivot_zg, n_bars=5):
+    """条件4: 出中枢那笔顶部区域有小级别中枢
+
+    在突破高点前后n_bars根K线内，检查是否存在窄幅横盘区间:
+    - 至少3根K线的高低点在突破高点的2%范围内
+    - 形成小级别中枢 = 上方有引力结构
+    """
+    try:
+        n = len(df)
+        if breakout_high <= 0:
+            return False
+
+        # 在突破高点附近找窄幅横盘区间
+        start = max(0, breakout_high_idx - n_bars)
+        end = min(n, breakout_high_idx + n_bars + 1)
+
+        if end - start < 5:
+            return False
+
+        segment = df.iloc[start:end]
+
+        # 计算每根K线距离突破高点的偏差
+        threshold = breakout_high * 0.02  # 2%范围内
+        near_top_count = 0
+        for _, bar in segment.iterrows():
+            # K线整体在突破高点附近 (高点在高点的2%以内)
+            if bar['high'] >= breakout_high - threshold and bar['low'] >= breakout_high - threshold * 2:
+                near_top_count += 1
+
+        # 至少3根K线在顶部区域横盘 = 小级别中枢
+        if near_top_count >= 3:
+            return True
+
+        # 备选: 检测是否有局部双顶/三重顶 (高点接近)
+        highs = segment['high'].values
+        local_maxes = []
+        for i in range(1, len(highs) - 1):
+            if highs[i] >= highs[i-1] and highs[i] >= highs[i+1]:
+                local_maxes.append(highs[i])
+
+        if len(local_maxes) >= 2:
+            max_range = max(local_maxes) - min(local_maxes)
+            if max_range < breakout_high * 0.015:  # 多个高点差距<1.5%
+                return True
+
+        return False
+    except Exception:
+        return False
+
+
+def _check_breakout_strength(df, pivot_end_idx, breakout_idx):
+    """条件5: 出中枢的那笔不背驰
+
+    突破笔MACD面积 > 前一笔面积 = 力度增强 = 不背驰
+    Returns: (bool, strength_ratio)
+    """
+    try:
+        if breakout_idx - pivot_end_idx < 5:
+            return False, 0.0
+
+        close = df['close']
+        n = len(close)
+
+        # 计算MACD
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        dif = ema12 - ema26
+        dea = dif.ewm(span=9, adjust=False).mean()
+        hist = 2 * (dif - dea)
+
+        # 突破段: 中枢结束 → 突破高点
+        breakout_area = abs(hist.iloc[pivot_end_idx:breakout_idx + 1].sum())
+
+        # 前一笔参考: 中枢内最近一个上涨段的MACD面积
+        # 取中枢内正柱面积作为参考
+        pivot_area = abs(hist.iloc[max(0, pivot_end_idx - 20):pivot_end_idx + 1]
+                         [hist.iloc[max(0, pivot_end_idx - 20):pivot_end_idx + 1] > 0].sum())
+
+        if pivot_area <= 0:
+            # 无参考数据，用突破段自身是否为正来判断
+            return breakout_area > 0, 1.0
+
+        ratio = breakout_area / pivot_area
+        # 突破面积 > 参考 = 力度增强 = 不背驰
+        return ratio > 1.0, ratio
+
+    except Exception:
+        return False, 0.0
+
+
+def _check_volume_pattern(df, pivot_end_idx, breakout_idx, pullback_idx):
+    """条件7: 出中枢放量，回踩缩量
+
+    突破段均量 > 回撤段均量 × 1.3 = 放量突破 + 缩量回踩
+    Returns: (bool, vol_ratio)
+    """
+    try:
+        if 'volume' not in df.columns:
+            return False, 0.0
+
+        vol = df['volume'].astype(float)
+        n = len(vol)
+
+        if pivot_end_idx >= n or breakout_idx >= n or pullback_idx >= n:
+            return False, 0.0
+
+        # 突破段均量: 中枢结束 → 突破高点
+        breakout_vol = vol.iloc[pivot_end_idx:breakout_idx + 1].mean()
+
+        # 回撤段均量: 突破高点 → 回踩低点
+        pullback_vol = vol.iloc[breakout_idx:pullback_idx + 1].mean()
+
+        if breakout_vol <= 0:
+            return False, 0.0
+
+        ratio = breakout_vol / pullback_vol if pullback_vol > 0 else 999
+
+        # 突破量 > 回撤量 × 1.3 = 放量突破缩量回踩
+        return ratio > 1.3, ratio
+
+    except Exception:
+        return False, 0.0
+
+
 def _find_3buy_standalone(engine, code, df):
     """找日线3买信号 (突破中枢后回踩不进中枢)
 
@@ -399,16 +607,30 @@ def _find_3buy_standalone(engine, code, df):
         zg = pv['zg']
         zd = pv['zd']
         pv_end = pv['end_idx']
+        pv_start = pv['start_idx']
 
-        # 计算GG (中枢波动高点): 取组成中枢的所有笔的最高点
-        gg = zg  # 默认GG=ZG
-        dd = zd  # 默认DD=ZD
+        # === 条件1修正: 正确计算GG/DD ===
+        # GG = 中枢所有笔的最高点 (波动高点)
+        # DD = 中枢所有笔的最低点 (波动低点)
+        pivot_strokes = [s for s in strokes
+                         if s['end_idx'] >= pv_start and s['start_idx'] <= pv_end]
+        if not pivot_strokes:
+            pivot_strokes = strokes[max(0, pivots.index(pv)):min(len(strokes), pivots.index(pv)+5)]
+
+        gg = zg  # 默认值
+        dd = zd
+        if pivot_strokes:
+            gg = max(max(s.get('high', max(s['start_val'], s['end_val'])),
+                         max(s['start_val'], s['end_val'])) for s in pivot_strokes)
+            dd = min(min(s.get('low', min(s['start_val'], s['end_val'])),
+                         min(s['start_val'], s['end_val'])) for s in pivot_strokes)
 
         # 从中枢结束后开始找突破
         for j in range(pv_end + 1, n - 5):
             if high.iloc[j] > zg:  # 突破中枢上沿
                 # 记录突破高点 (用于0.618计算)
                 breakout_high = high.iloc[j]
+                breakout_idx = j
                 # 找突破后的回调低点
                 for k in range(j + 1, min(j + 20, n)):
                     pullback_low = low.iloc[k]
@@ -416,23 +638,55 @@ def _find_3buy_standalone(engine, code, df):
                         entry_price = close.iloc[k]
                         stop_price = zd  # 止损=中枢下沿
 
-                        # === 3买三档强度分类 ===
-                        if pullback_low > gg:
-                            strength = 'strong'     # 强三买: 回踩>GG
-                        elif pullback_low > zg:
-                            strength = 'standard'   # 标准三买: ZG~GG
-                        else:
-                            strength = 'weak'       # 弱三买: ZD~ZG
-
-                        # === 黄金分割0.618检查 ===
-                        # 突破段: 中枢结束 → 突破高点
-                        # 回撤: 突破高点 → 回踩低点
-                        # 回撤比例 = (breakout_high - pullback_low) / (breakout_high - zg)
+                        # === 黄金分割0.618检查 (条件6) ===
                         golden_pass = False
                         if breakout_high > zg:
                             retrace = (breakout_high - pullback_low) / (breakout_high - zg)
-                            if retrace <= 0.618:  # 未跌破0.618 = 多头强
+                            if retrace <= 0.618:
                                 golden_pass = True
+
+                        # === 强三买7条件检测 ===
+                        # 条件1: 回撤不触碰下方中枢最高点(GG)
+                        above_gg = pullback_low > gg
+
+                        # 条件2: 有支撑结构
+                        has_support = _check_support_structure(
+                            df, k, pullback_low, zg)
+
+                        # 条件3: 回撤时有背驰结构
+                        pullback_div = _check_pullback_divergence(
+                            df, breakout_idx, k)
+
+                        # 条件4: 突破顶部有小级别中枢
+                        top_micro = _check_top_micro_pivot(
+                            df, breakout_idx, breakout_high, zg)
+
+                        # 条件5: 出中枢那笔不背驰
+                        breakout_strong, breakout_ratio = _check_breakout_strength(
+                            df, pv_end, breakout_idx)
+
+                        # 条件7: 出中枢放量，回踩缩量
+                        vol_ok, vol_ratio = _check_volume_pattern(
+                            df, pv_end, breakout_idx, k)
+
+                        three_buy_checks = {
+                            'above_gg': above_gg,         # 条件1
+                            'support': has_support,       # 条件2
+                            'pullback_div': pullback_div, # 条件3
+                            'top_micro': top_micro,       # 条件4
+                            'breakout_strong': breakout_strong,  # 条件5
+                            'golden_pass': golden_pass,   # 条件6
+                            'vol_pattern': vol_ok,        # 条件7
+                        }
+                        passed_count = sum(1 for v in three_buy_checks.values() if v)
+
+                        # 强三买: 通过5+/7个条件
+                        if passed_count >= 5:
+                            strength = 'strong'
+                        elif passed_count >= 3:
+                            strength = 'standard'
+                        else:
+                            strength = 'normal'
 
                         results.append({
                             'signal_type': '3buy',
@@ -446,6 +700,10 @@ def _find_3buy_standalone(engine, code, df):
                             'pivot_gg': gg,
                             'breakout_high': breakout_high,
                             'pullback_low': pullback_low,
+                            'three_buy_checks': three_buy_checks,
+                            'three_buy_passed': passed_count,
+                            'breakout_ratio': round(breakout_ratio, 2),
+                            'vol_ratio': round(vol_ratio, 2),
                         })
                         break  # 每个中枢只取第一个3买
                 break  # 每个中枢只看一次突破
@@ -683,6 +941,22 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
         elif buy_strength == 'weak':
             strength_bonus += 0   # 弱三买(ZD~ZG) / 中枢下2买
 
+        # === 强三买7条件评分 ===
+        if signal_type == '3buy':
+            three_checks = item.get('three_buy_checks', {})
+            three_passed = item.get('three_buy_passed', 0)
+            if three_passed >= 6:
+                strength_bonus += 15  # 6+/7条件: 极强三买
+            elif three_passed >= 5:
+                strength_bonus += 12  # 5/7条件: 强三买
+            elif three_passed >= 3:
+                strength_bonus += 6   # 3-4/7条件: 标准三买
+            # 额外单项加分
+            if three_checks.get('breakout_strong'):
+                strength_bonus += 3   # 突破力度强
+            if three_checks.get('vol_pattern'):
+                strength_bonus += 3   # 放量突破缩量回踩
+
         # 黄金分割0.618加分 (仅3买)
         if golden_pass:
             strength_bonus += 8   # 3买回撤未破0.618
@@ -724,6 +998,8 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
             'weekly_trend': weekly_trend_str,
             'weekly_score': round(weekly_score, 2),
             'weekly_rise_pct': item.get('weekly_rise_pct', 0),
+            'three_buy_checks': item.get('three_buy_checks', {}),
+            'three_buy_passed': item.get('three_buy_passed', 0),
         })
 
         time.sleep(0.1)
