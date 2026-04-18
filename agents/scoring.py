@@ -12,11 +12,11 @@ from dataclasses import dataclass, field
 
 DEFAULT_WEIGHTS = {
     'technical_bull': 0.30,
-    'technical_bear': 0.20,
-    'sentiment': 0.15,
-    'sector_rotation': 0.15,
-    'scanner_base': 0.10,
-    'risk_adjustment': 0.10,
+    'technical_bear': 0.15,
+    'sentiment': 0.10,
+    'sector_rotation': 0.20,
+    'scanner_base': 0.125,
+    'risk_adjustment': 0.125,
 }
 
 
@@ -36,6 +36,18 @@ VETO_RULES = {
     'extreme_risk': 0.75,           # risk_score >= 0.75 → 一票否决
     'max_sector_positions': 3,      # 同行业已有3+持仓 → 否决
 }
+
+
+# ============================================================
+# 30分钟策略参数 (网格搜索最优)
+# ============================================================
+
+MIN30_TRAIL_START = 0.04    # 跟踪止盈启动 4%
+MIN30_TRAIL_DIST = 0.03    # 跟踪止盈回撤 3%
+MIN30_TIME_STOP = 200       # 时间止损 200根K线
+MIN30_WEEKLY_RISE = 0.20   # 周线最低涨幅 20%
+MIN30_COOLDOWN = 40        # 信号冷却期 40根K线 (~5天)
+MIN30_SIGNAL_TYPES = ['2buy_strong', '2buy_standard', '2buy_normal', '3buy_strong', '3buy_standard']
 
 
 # ============================================================
