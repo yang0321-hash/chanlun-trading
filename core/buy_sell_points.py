@@ -419,7 +419,8 @@ class BuySellPointDetector:
 
         # ===== 三强度分类 =====
         strength_label = '标准三买'
-        if last_pullback.end_value > gg:
+        gg_margin = (gg - zg) / zg if zg > 0 else 0
+        if last_pullback.end_value > gg and gg_margin > 0.01:
             strength_label = '强三买'
             confidence += 0.10
         elif last_pullback.end_value <= zg:
@@ -432,7 +433,7 @@ class BuySellPointDetector:
         if breakout_range > 0:
             pullback_range = last_breakout.high - last_pullback.end_value
             fib_ratio = pullback_range / breakout_range
-            if fib_ratio < 0.618:
+            if 0 < fib_ratio < 0.618:
                 confidence += 0.08
                 fib_info = f', 黄金分割({fib_ratio:.2f}<0.618)'
 
@@ -1626,7 +1627,9 @@ class BuySellPointDetector:
 
                     # ===== 三强度分类 =====
                     strength_label = '标准三买'
-                    if pb.end_value > gg:
+                    gg_margin = (gg - zg) / zg if zg > 0 else 0
+                    if pb.end_value > gg and gg_margin > 0.01:
+                        # 强三买: 回踩>GG 且中枢本身有区分度(GG>ZG 1%以上)
                         strength_label = '强三买'
                         confidence += 0.10
                     elif pb.end_value <= zg:
@@ -1639,7 +1642,7 @@ class BuySellPointDetector:
                     if breakout_range > 0:
                         pullback_range = bo.high - pb.end_value
                         fib_ratio = pullback_range / breakout_range
-                        if fib_ratio < 0.618:
+                        if 0 < fib_ratio < 0.618:
                             confidence += 0.08
                             fib_info = f', 黄金分割({fib_ratio:.2f}<0.618)'
 
