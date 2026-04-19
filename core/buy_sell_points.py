@@ -1485,15 +1485,15 @@ class BuySellPointDetector:
                     pullback_depth = (pb.end_value - bp.price) / bp.price
                     confidence += min(pullback_depth * 5, 0.15)
 
-                    # 缩量确认
+                    # 缩量确认 (归因: 单独负贡献, 降权)
                     vol_ratio = self._stroke_volume_ratio(pb)
                     vol_info = ''
                     if vol_ratio > 0:
                         if vol_ratio < 0.7:
-                            confidence += 0.08
+                            confidence += 0.03
                             vol_info = f', 缩量回调(量比{vol_ratio:.1f})'
                         elif vol_ratio < 0.9:
-                            confidence += 0.03
+                            confidence += 0.01
                             vol_info = f', 温和缩量(量比{vol_ratio:.1f})'
                         elif vol_ratio > 1.5:
                             confidence -= 0.08
@@ -1525,7 +1525,7 @@ class BuySellPointDetector:
                     for pivot in reversed(self.pivots):
                         if pivot.start_index <= bp.index <= pivot.end_index + 30:
                             if pb.end_value > pivot.zg:
-                                confidence += 0.15
+                                confidence += 0.05
                                 overlap_info = f', 2买3买重叠(回踩>ZG={pivot.zg:.2f})'
                             break
 
@@ -1657,12 +1657,12 @@ class BuySellPointDetector:
                     if macd_confirmed:
                         confidence += 0.05
 
-                    # 缩量回调确认
+                    # 缩量回调确认 (归因: 单独弱, 降权)
                     vol_info = ''
                     pb_vol = self._stroke_volume_ratio(pb)
                     if pb_vol > 0:
                         if pb_vol < 0.7:
-                            confidence += 0.06
+                            confidence += 0.02
                             vol_info = f', 缩量回踩(量比{pb_vol:.1f})'
                         elif pb_vol > 1.5:
                             confidence -= 0.05
