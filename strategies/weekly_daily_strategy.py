@@ -18,7 +18,9 @@ from backtest.strategy import Strategy, Signal, SignalType
 from core.kline import KLine
 from core.fractal import FractalDetector, Fractal
 from core.stroke import StrokeGenerator, Stroke
+from core.segment import SegmentGenerator, Segment
 from core.pivot import PivotDetector, Pivot
+from core.buy_sell_points import BuySellPointDetector, BuySellPoint
 from indicator.macd import MACD
 
 
@@ -166,20 +168,41 @@ class WeeklyDailyChanLunStrategy(Strategy):
         self._last_daily_count = len(df)
 
     def _find_weekly_buy_points(self) -> None:
-        """找出周线买卖点"""
+        """找出周线买卖点（使用统一的买卖点检测器）"""
         if not self._weekly_strokes:
             return
 
-        # 第一类买点：最后一个向下笔的低点
-        down_strokes = [s for s in self._weekly_strokes if s.is_down]
-        if down_strokes:
-            self._weekly_first_buy_price = down_strokes[-1].low
+        # 使用买卖点检测器精确识别
+        weekly_macd = None
+        if hasattr(self, '_weekly_kline_df') and self._weekly_kline_df is not None:
+            weekly_macd = MACD(self._weekly_kline_df['close'])
 
-        # 第二类买点：第一类买点后的向上笔
-        if len(self._weekly_strokes) >= 2:
+        detector = BuySellPointDetector(
+            fractals=[],  # 周线买卖点主要基于笔结构
+            strokes=self._weekly_strokes,
+            segments=[],
+            pivots=self._weekly_pivots,
+            macd=weekly_macd,
+        )
+
+        # 检测1买
+        first_buy = detector._check_first_buy()
+        if first_buy:
+            self._weekly_first_buy_price = first_buy.price
+
+        # 兼容旧逻辑：如果没有检测到1买，用最后一个向下笔的低点
+        if self._weekly_first_buy_price is None:
+            down_strokes = [s for s in self._weekly_strokes if s.is_down]
+            if down_strokes:
+                self._weekly_first_buy_price = down_strokes[-1].low
+
+        # 检测2买
+        second_buy = detector._check_second_buy()
+        if second_buy:
+            self._weekly_second_buy_price = second_buy.price
+        elif len(self._weekly_strokes) >= 2:
             last = self._weekly_strokes[-1]
             if last.is_up:
-                # 向上笔的起点是潜在2买位置
                 self._weekly_second_buy_price = last.start_value
 
     def _detect_daily_second_sell(self) -> bool:

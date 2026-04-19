@@ -12,11 +12,10 @@ import sys
 import os
 import json
 import time
-import traceback
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
 sys.path.insert(0, '.')
 for k in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy',
@@ -33,24 +32,19 @@ from trading_agents.position_manager import PositionManager
 # ==================== 工具函数 ====================
 
 def code_to_prefix(code: str) -> str:
-    if code.startswith(('sz', 'sh')):
-        return code.lower()
+    code = code.upper()
+    # 处理 000001.SZ 格式
+    if '.' in code:
+        code = code.split('.')[0]
+    # 处理纯数字 000001 格式
     if code.startswith(('0', '3')):
         return f'sz{code}'
-    return f'sh{code}'
-
-
-def code_to_ak(code: str) -> str:
-    """代码转AKShare格式: SZ000001 → 000001"""
-    return code.upper().replace('SZ', '').replace('SH', '')
-
-
-def load_positions() -> dict:
-    path = 'signals/positions.json'
-    if os.path.exists(path):
-        with open(path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {'positions': [], 'capital': 1000000}
+    if code.startswith('6'):
+        return f'sh{code}'
+    # 已有前缀
+    if code.startswith(('SZ', 'SH')):
+        return code.lower()
+    return code.lower()
 
 
 def load_agent_log() -> dict:
@@ -117,6 +111,12 @@ def send_card(title: str, elements: list):
 
 class IntradayAgent:
     """盘中Agent — 实时监控者"""
+
+    SIGNAL_TYPE_MAP = {
+        'bi_buy': '笔买', '2buy': '2买', 'quasi2buy': '类2买',
+        '3buy': '3买', 'quasi3buy': '类3买', 'zg_breakout': 'ZG突破',
+        '2plus3buy': '2+3买',
+    }
 
     SCAN_INTERVAL = 300   # 扫描间隔（秒）
     MIDDAY_HOUR = 11
@@ -205,6 +205,12 @@ class IntradayAgent:
             c = pos.code
             if c:
                 codes.add(c)
+                if pos.name:
+                    self.watchlist_names[c] = pos.name
+                    if '.' in c:
+                        pure = c.split('.')[0]
+                        self.watchlist_names[f'sz{pure}'] = pos.name
+                        self.watchlist_names[f'sh{pure}'] = pos.name
 
         # 最新委员会BUY/_HOLD
         committee_files = sorted(glob.glob('signals/investment_committee_*.json'),
@@ -218,7 +224,13 @@ class IntradayAgent:
                         c = d.get('symbol', '')
                         if c:
                             codes.add(c)
-                            self.watchlist_names[c] = d.get('name', '')
+                            # 同时存两种格式的映射
+                            name = d.get('name', '')
+                            self.watchlist_names[c] = name
+                            if '.' in c:
+                                pure = c.split('.')[0]
+                                self.watchlist_names[f'sz{pure}'] = name
+                                self.watchlist_names[f'sh{pure}'] = name
             except Exception:
                 pass
 
@@ -239,10 +251,28 @@ class IntradayAgent:
                         name = s.get('name', '')
                         if name:
                             self.watchlist_names[c] = name
+                            if '.' in c:
+                                pure = c.split('.')[0]
+                                self.watchlist_names[f'sz{pure}'] = name
+                                self.watchlist_names[f'sh{pure}'] = name
             except Exception:
                 pass
 
-        self.watchlist = list(codes)
+        # 统一代码格式 (去掉.SZ/.SH后缀，统一为纯数字或sz/sh前缀)
+        normalized = set()
+        for c in codes:
+            if '.' in c:
+                # 000001.SZ → sz000001
+                pure, exchange = c.split('.')
+                if exchange.upper() == 'SZ':
+                    normalized.add(f'sz{pure}')
+                elif exchange.upper() == 'SH':
+                    normalized.add(f'sh{pure}')
+                else:
+                    normalized.add(pure)
+            else:
+                normalized.add(c)
+        self.watchlist = list(normalized)
         print(f'  监控列表: {len(self.watchlist)}只')
 
     def _monitoring_loop(self):
@@ -483,10 +513,9 @@ class IntradayAgent:
             signal = self.v3a_strategy.scan_entry(code)
             if not signal:
                 return None
-            type_map = {'2buy': '2买', 'quasi2buy': '类2买', 'zg_breakout': 'ZG突破'}
             return {
                 'code': code,
-                'type': type_map.get(signal.signal_type, signal.signal_type),
+                'type': self.SIGNAL_TYPE_MAP.get(signal.signal_type, signal.signal_type),
                 'price': signal.price,
                 'stop': signal.stop_loss,
                 'confidence': signal.confidence,

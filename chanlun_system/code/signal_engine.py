@@ -69,11 +69,11 @@ class SignalEngine:
         self.big_loss_threshold = -0.03 # 大亏定义: 亏损>3%
         self.time_stop_bars = 60         # 时间止损
         self.min_hold_before_sell = 7    # 最短持仓后才允许2卖出局
-        self.max_stop_pct = 0.15         # 最大止损距离(收紧防单笔灾难,曾出现-19%)
+        self.max_stop_pct = 0.10         # 最大止损距离(回测验证: 10%最优Sharpe 1.33)
 
         # 仓位参数
         self.min_position = 0.10        # C级轻仓最低10%
-        self.max_position = 0.30
+        self.max_position = 0.20        # 单票上限(回测验证: 20%回撤11.8%/Sharpe 1.98)
         self.base_position = 0.15
 
         # 移动止损 [v9] 分阶段: 盈利越多,回撤容忍越大,让利润奔跑

@@ -133,3 +133,24 @@ Thumbs.db
 *.day
 *.day.json
 .env
+
+# Temp & cache
+_temp_*
+*.pkl
+data/adj_cache/
+data/signal_flux.db
+
+# Exam/practice files
+exam_*.json
+practice*.json
+retake_*.json
+
+# Generated results
+results/
+kronos_repo/
+hermes/
+hermes-weixin/
+signal_engine_v15_backup.py
+
+# MCP config (local)
+.mcp.json

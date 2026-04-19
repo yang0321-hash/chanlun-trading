@@ -11,12 +11,12 @@ from dataclasses import dataclass, field
 # ============================================================
 
 DEFAULT_WEIGHTS = {
-    'technical_bull': 0.30,
+    'technical_bull': 0.20,
     'technical_bear': 0.15,
-    'sentiment': 0.10,
-    'sector_rotation': 0.20,
-    'scanner_base': 0.125,
-    'risk_adjustment': 0.125,
+    'sentiment': 0.20,
+    'sector_rotation': 0.15,
+    'scanner_base': 0.15,
+    'risk_adjustment': 0.15,
 }
 
 

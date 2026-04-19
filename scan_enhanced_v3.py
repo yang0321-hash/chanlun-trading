@@ -819,14 +819,23 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
                 all_signals.append(p)
 
         # --- 1买信号 (底背驰) ---
-        ones = _find_1buy_standalone(engine, code, df, market_regime=market_regime)
-        for s in ones:
-            if s['sig_idx'] < len(df):
-                sig_date = df.index[s['sig_idx']]
+        # 仅在弱势行情检测1买，强势行情1买不可靠
+        if market_regime != 'strong':
+            for p in pairs:
+                idx = p.get('1buy_idx', -1)
+                if idx < 0 or idx >= len(df):
+                    continue
+                sig_date = df.index[idx]
                 if sig_date >= pd.Timestamp(cutoff):
-                    s['code'] = code
-                    s['sig_date'] = sig_date
-                    all_signals.append(s)
+                    all_signals.append({
+                        'code': code,
+                        'signal_type': '1buy',
+                        'entry_price': p.get('1buy_price', df['close'].iloc[idx]),
+                        'stop_price': p.get('1buy_low', df['low'].iloc[idx]),
+                        'sig_idx': idx,
+                        'sig_date': sig_date,
+                        'confidence': p.get('confidence', 0.5),
+                    })
 
         # --- 3买信号 (突破中枢回踩不进) ---
         threes = _find_3buy_standalone(engine, code, df)

@@ -2,7 +2,7 @@
 拉取/生成30分钟K线数据
 
 策略：
-1. 优先使用mootdx拉取（如可用）
+1. 优先使用mootdx get_security_bars拉取（bars()在Docker有TCP复用bug）
 2. 备选：从日线数据模拟生成30分钟K线（使用日内价格波动模型）
 
 保存到 artifacts/min30_{code}.csv
@@ -17,29 +17,38 @@ OUTPUT_DIR = "/workspace/chanlun_system/artifacts"
 CODES = ["000001.SZ", "000333.SZ", "000858.SZ", "002415.SZ",
          "002600.SZ", "600036.SH", "600519.SH", "601318.SH"]
 
-# 尝试mootdx拉取
+
 def try_mootdx_fetch(ts_code: str, mootdx_code: str) -> pd.DataFrame:
-    """尝试通过mootdx拉取30分钟数据"""
+    """通过mootdx get_security_bars拉取30分钟数据（不用bars()，有TCP复用bug）"""
     try:
         from mootdx.quotes import Quotes
         import time
+        market = 1 if mootdx_code.startswith('6') else 0
         client = Quotes.factory(market='std')
         all_dfs = []
-        for batch in range(5):
-            offset = batch * 800
-            df = client.bars(symbol=mootdx_code, frequency=2, offset=offset)
-            if df is None or len(df) == 0:
-                break
-            all_dfs.append(df)
-            if len(df) < 800:
-                break
+        for batch in range(3):
             time.sleep(0.3)
+            try:
+                d = client.client.get_security_bars(
+                    category=3, market=market, code=mootdx_code,
+                    start=batch * 800, count=800
+                )
+            except Exception:
+                break
+            if d is None or len(d) == 0:
+                break
+            all_dfs.append(pd.DataFrame(d))
+            if len(d) < 800:
+                break
         if not all_dfs:
             return pd.DataFrame()
-        result = pd.concat(all_dfs, ignore_index=False)
-        result = result[~result.index.duplicated(keep='first')]
-        result = result.sort_index()
-        return result
+        df = pd.concat(all_dfs, ignore_index=True)
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        df = df.drop_duplicates('datetime').sort_values('datetime').reset_index(drop=True)
+        df = df.rename(columns={'vol': 'volume'})
+        df = df[['datetime', 'open', 'high', 'low', 'close', 'volume']]
+        df = df.dropna(subset=['close'])
+        return df.set_index('datetime')
     except Exception:
         return pd.DataFrame()
 
@@ -178,12 +187,8 @@ def main():
         print(f"[处理] {code}")
         df = try_mootdx_fetch(code, mootdx_map.get(code, code.replace('.SZ','').replace('.SH','')))
         
-        if len(df) >= 3000:
-            # 标准化列名
-            if 'vol' in df.columns and 'volume' not in df.columns:
-                df = df.rename(columns={'vol': 'volume'})
+        if len(df) >= 100:
             df.index.name = 'datetime'
-            df = df[['open', 'high', 'low', 'close', 'volume']]
             df.to_csv(output_path)
             print(f"  [mootdx] 保存 {len(df)} 根30分钟K线")
             continue
@@ -191,7 +196,7 @@ def main():
         # 2. 检查已有文件
         if os.path.exists(output_path):
             existing = pd.read_csv(output_path, index_col=0, parse_dates=True)
-            if len(existing) >= 3000:
+            if len(existing) >= 100:
                 print(f"  [已有] {len(existing)} 根30分钟K线，跳过")
                 continue
         

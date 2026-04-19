@@ -46,26 +46,8 @@ def run_backtest_with_signals(symbol: str, data: pd.DataFrame,
                               exit_ratio: float = 0.7):
     """运行回测并记录买卖信号"""
 
-    # 修改策略以记录信号
-    class SignalTrackingStrategy(WeeklyDailyChanLunStrategy):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.signals = []
-
-        def on_bar(self, bar, symbol, index, context):
-            signal = super().on_bar(bar, symbol, index, context)
-            if signal:
-                self.signals.append({
-                    'date': bar['date'],
-                    'price': signal.price,
-                    'type': signal.signal_type,
-                    'quantity': signal.quantity,
-                    'reason': signal.reason
-                })
-            return signal
-
     # 创建策略
-    strategy = SignalTrackingStrategy(
+    strategy = WeeklyDailyChanLunStrategy(
         name='周日线缠论策略',
         weekly_min_strokes=weekly_strokes,
         daily_min_strokes=daily_strokes,
@@ -88,7 +70,21 @@ def run_backtest_with_signals(symbol: str, data: pd.DataFrame,
     # 运行回测
     results = engine.run()
 
-    return results, strategy.signals
+    # 从回测引擎获取信号（已自动记录）
+    signals = engine.get_signals()
+
+    # 转换信号格式以便绘图
+    signal_list = []
+    for sig in signals:
+        signal_list.append({
+            'date': sig.datetime,
+            'price': sig.price,
+            'type': sig.signal_type.value.upper(),  # 'BUY' or 'SELL'
+            'quantity': sig.quantity,
+            'reason': sig.reason
+        })
+
+    return results, signal_list
 
 
 def plot_trading_signals(df: pd.DataFrame, signals: list,
@@ -134,8 +130,10 @@ def plot_trading_signals(df: pd.DataFrame, signals: list,
 
     for sig in buy_signals:
         # 找到对应的x位置
-        sig_date = pd.to_datetime(sig['date'])
-        idx = df[df['date'] == sig_date].index
+        sig_date = sig['date'] if isinstance(sig['date'], pd.Timestamp) else pd.to_datetime(sig['date'])
+        # 确保date只比较日期部分
+        sig_date_only = sig_date.date() if hasattr(sig_date, 'date') else sig_date
+        idx = df[df['date'].dt.date == sig_date_only].index
 
         if len(idx) > 0:
             x = idx[0]
@@ -149,8 +147,9 @@ def plot_trading_signals(df: pd.DataFrame, signals: list,
                     fontweight='bold')
 
     for sig in sell_signals:
-        sig_date = pd.to_datetime(sig['date'])
-        idx = df[df['date'] == sig_date].index
+        sig_date = sig['date'] if isinstance(sig['date'], pd.Timestamp) else pd.to_datetime(sig['date'])
+        sig_date_only = sig_date.date() if hasattr(sig_date, 'date') else sig_date
+        idx = df[df['date'].dt.date == sig_date_only].index
 
         if len(idx) > 0:
             x = idx[0]
@@ -168,12 +167,15 @@ def plot_trading_signals(df: pd.DataFrame, signals: list,
     for i, row in df.iterrows():
         # 检查当天是否有信号
         row_date = row['date']
+        row_date_only = row_date.date() if hasattr(row_date, 'date') else row_date
         for sig in signals:
-            if pd.to_datetime(sig['date']) == row_date:
+            sig_date = sig['date'] if isinstance(sig['date'], pd.Timestamp) else pd.to_datetime(sig['date'])
+            sig_date_only = sig_date.date() if hasattr(sig_date, 'date') else sig_date
+            if sig_date_only == row_date_only:
                 if sig['type'] == 'BUY':
-                    position += sig['quantity']
+                    position += sig['quantity'] if sig['quantity'] else 100
                 elif sig['type'] == 'SELL':
-                    position -= sig['quantity']
+                    position -= sig['quantity'] if sig['quantity'] else 100
 
         # 绘制持仓线
         if position > 0:
@@ -271,16 +273,31 @@ def create_backtest_chart(symbol: str = 'sz000001',
     # 绘制完整图表
     print("\n生成图表...")
     save_path = f"{output_dir}/{symbol}_backtest_signals.png"
-    plot_trading_signals(data, signals, symbol=symbol, save_path=save_path)
+    # 重置索引以便绘图函数访问date列
+    data_for_plot = data.reset_index(drop=False)
+    plot_trading_signals(data_for_plot, signals, symbol=symbol, save_path=save_path)
 
     # 绘制最近200根K线
     if len(data) > 200:
         print(f"\n生成最近200根K线图...")
-        recent_data = data.tail(200)
+        recent_data = data.tail(200).reset_index(drop=False)
         # 过滤最近的信号
-        recent_start = recent_data.index.min()
+        recent_start = recent_data['date'].min()
         recent_signals = [s for s in signals
-                          if pd.to_datetime(s['date']) >= recent_start]
+                          if (s['date'] if isinstance(s['date'], pd.Timestamp) else pd.to_datetime(s['date'])) >= recent_start]
+
+        save_path_recent = f"{output_dir}/{symbol}_recent_200_signals.png"
+        plot_trading_signals(recent_data, recent_signals, symbol=symbol,
+                              save_path=save_path_recent)
+    else:
+        recent_data = data.reset_index(drop=False)
+        recent_start = recent_data['date'].min()
+        recent_signals = [s for s in signals
+                          if (s['date'] if isinstance(s['date'], pd.Timestamp) else pd.to_datetime(s['date'])) >= recent_start]
+
+        save_path_recent = f"{output_dir}/{symbol}_recent_200_signals.png"
+        plot_trading_signals(recent_data, recent_signals, symbol=symbol,
+                              save_path=save_path_recent)
 
         save_path_recent = f"{output_dir}/{symbol}_recent_200_signals.png"
         plot_trading_signals(recent_data, recent_signals, symbol=symbol,

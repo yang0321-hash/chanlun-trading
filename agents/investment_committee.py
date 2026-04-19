@@ -138,12 +138,18 @@ class InvestmentCommittee:
                     pass
 
             buy_date = candidate.get('2buy_date', '')
+            signal_type = candidate.get('signal_type', '')
             chanlun = ChanlunInfo(
                 pivot_zg=zg,
                 pivot_zd=zd,
-                buy_type='2buy' if buy_date else '',
+                buy_type=signal_type if signal_type in ('1buy', '2buy', '3buy') else ('2buy' if buy_date else ''),
                 buy_price=candidate.get('entry_price', 0),
                 buy_date=buy_date,
+                buy_strength=candidate.get('buy_strength', ''),
+                golden_ratio_pass=candidate.get('golden_ratio_pass', False),
+                weekly_trend='bear' if candidate.get('weekly_trend', '').startswith('空头') else
+                             ('bull' if candidate.get('weekly_trend', '').startswith('多头') else
+                              ('range' if candidate.get('weekly_trend', '').startswith('盘整') else '')),
             )
             # 判断价格位置
             if len(df_daily) > 0:
@@ -156,6 +162,19 @@ class InvestmentCommittee:
                     else:
                         chanlun.price_vs_pivot = 'inside'
                     chanlun.stop_by_structure = zd
+        elif chanlun and candidate:
+            # 缠论分析成功, 但扫描器有额外信息(强度/黄金分割/周线)需要补充
+            chanlun.buy_strength = candidate.get('buy_strength', '') or chanlun.buy_strength
+            chanlun.golden_ratio_pass = candidate.get('golden_ratio_pass', False) or chanlun.golden_ratio_pass
+            wt = candidate.get('weekly_trend', '')
+            if wt and not chanlun.weekly_trend:
+                chanlun.weekly_trend = ('bear' if '空头' in wt else
+                                        ('bull' if '多头' in wt else
+                                         ('range' if '盘整' in wt else '')))
+            # 也补充signal_type
+            signal_type = candidate.get('signal_type', '')
+            if signal_type and not chanlun.buy_type:
+                chanlun.buy_type = signal_type
 
         return CommitteeContext(
             symbol=code,

@@ -1,12 +1,26 @@
 """
 多级别缠论策略 - 日线+30分钟
 
+.. deprecated::
+    本策略使用日线数据冒充30分钟数据（_get_m30_data直接返回日线），
+    30分钟级别分析结果不可靠。请使用 IntegratedChanLunStrategy 或
+    WeeklyDailyChanLunStrategy 替代。
+
 交易规则：
 1. 日线级别2买买入
 2. 跌破1买低点止损
 3. 30分钟级别MACD顶背离减仓50%
 4. 30分钟级别2卖卖出剩余部分
 """
+
+import warnings
+
+warnings.warn(
+    "MultiLevelChanLunStrategy 使用日线冒充30分钟数据，结果不可靠。"
+    "请使用 IntegratedChanLunStrategy 或 WeeklyDailyChanLunStrategy 替代。",
+    DeprecationWarning,
+    stacklevel=2
+)
 
 from typing import List, Optional, Dict, Any, Tuple
 import pandas as pd

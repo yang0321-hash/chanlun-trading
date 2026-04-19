@@ -57,6 +57,9 @@ class ChanlunInfo:
     price_vs_pivot: str = ''     # 'above'(中枢上方), 'inside'(中枢内), 'below'(中枢下方)
     divergence_detected: bool = False  # 是否有背驰信号
     stop_by_structure: float = 0.0     # 缠论结构止损位
+    buy_strength: str = ''              # 买点强度: strong/standard/weak/''
+    golden_ratio_pass: bool = False     # 3买黄金分割0.618是否通过
+    weekly_trend: str = ''              # 周线趋势: bull/bear/range
 
 
 @dataclass
@@ -281,7 +284,17 @@ class BullAnalyst:
         # === 缠论结构分析（核心优先） ===
         cl = ctx.chanlun
         if cl:
-            # 1. 买点类型评估
+            # 0. 周线方向检查 (周线定方向)
+            if cl.weekly_trend == 'bull':
+                key_points.append('周线多头(方向一致)')
+                confidence += 0.05
+                reasoning_parts.append('周线多头')
+            elif cl.weekly_trend == 'bear':
+                key_points.append('周线空头(逆势)')
+                confidence -= 0.15
+                reasoning_parts.append('周线空头逆势')
+
+            # 1. 买点类型评估 + 强度分类
             if cl.buy_type == '1buy':
                 key_points.append('1买信号(趋势底背驰)')
                 confidence += 0.35
@@ -290,10 +303,40 @@ class BullAnalyst:
                 key_points.append('2买信号(回调不破前低)')
                 confidence += 0.30
                 reasoning_parts.append('2买确认')
+                # 2买三档强度加分
+                if cl.buy_strength == 'strong':
+                    key_points.append('强2买(2买3买重叠)')
+                    confidence += 0.10
+                    reasoning_parts.append('2买3买重叠')
+                elif cl.buy_strength == 'medium':
+                    key_points.append('类2买(中枢内)')
+                    reasoning_parts.append('类2买')
+                elif cl.buy_strength == 'weak':
+                    key_points.append('弱2买(中枢下)')
+                    confidence -= 0.05
+                    reasoning_parts.append('中枢下2买')
             elif cl.buy_type == '3buy':
                 key_points.append('3买信号(突破回踩不进中枢)')
                 confidence += 0.25
                 reasoning_parts.append('3买突破确认')
+                # 3买三档强度加分
+                if cl.buy_strength == 'strong':
+                    key_points.append('强3买(回踩>GG)')
+                    confidence += 0.15
+                    reasoning_parts.append('强3买回踩>GG')
+                elif cl.buy_strength == 'standard':
+                    key_points.append('标准3买(ZG~GG)')
+                    confidence += 0.05
+                    reasoning_parts.append('标准3买')
+                elif cl.buy_strength == 'weak':
+                    key_points.append('弱3买(ZD~ZG)')
+                    confidence -= 0.05
+                    reasoning_parts.append('弱3买')
+                # 黄金分割0.618加分
+                if cl.golden_ratio_pass:
+                    key_points.append('0.618回撤未破(多头强)')
+                    confidence += 0.08
+                    reasoning_parts.append('黄金分割0.618通过')
             elif cl.buy_type in ('quasi2buy', 'quasi3buy'):
                 key_points.append(f'类{cl.buy_type}信号')
                 confidence += 0.15
@@ -531,6 +574,18 @@ class BearAnalyst:
         # === 缠论结构风险 ===
         cl = ctx.chanlun
         if cl:
+            # 0. 周线空头 (逆势风险)
+            if cl.weekly_trend == 'bear':
+                key_points.append('周线空头(逆势操作)')
+                confidence += 0.20
+                reasoning_parts.append('周线空头')
+
+            # 0.5 买点强度弱
+            if cl.buy_strength == 'weak':
+                key_points.append(f'{cl.buy_type}强度弱')
+                confidence += 0.10
+                reasoning_parts.append('买点强度弱')
+
             # 1. 远离中枢（追高风险）
             if cl.price_vs_pivot == 'above' and cl.pivot_zg > 0:
                 pct_above = (last_close - cl.pivot_zg) / cl.pivot_zg
@@ -1057,7 +1112,8 @@ class RiskManager:
         positions = ctx.portfolio_state.get('positions', [])
         if not positions:
             return 0.0
-        sector_count = sum(1 for p in positions if p.get('sector') == ctx.sector)
+        sector_count = sum(1 for p in positions
+                          if p.get('sector', p.get('sector_name', '')) == ctx.sector)
         return sector_count / max(len(positions), 1)
 
     def _position_risk(self, portfolio: Dict) -> float:
