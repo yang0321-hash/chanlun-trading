@@ -338,11 +338,12 @@ class V3a30MinStrategy:
         if latest_macd:
             if latest_macd.macd > latest_macd.signal:
                 conf += 0.05  # DIF>DEA
-            hist = latest_macd.histogram if hasattr(latest_macd, 'histogram') else (latest_macd.macd - latest_macd.signal) * 2
+            hist = latest_macd.histogram
             if hist > 0:
                 conf += 0.05  # 红柱
-            if hist > 0 and len(macd.histogram) >= 2:
-                if macd.histogram.iloc[-1] > macd.histogram.iloc[-2]:
+            hist_series = macd.get_histogram_series()
+            if hist > 0 and len(hist_series) >= 2:
+                if hist_series.iloc[-1] > hist_series.iloc[-2]:
                     conf += 0.05  # 红柱扩大
 
         # 2. 量价配合 (+0.15)

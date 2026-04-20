@@ -663,6 +663,75 @@ def main():
     else:
         print('  无候选股，跳过委员会评估')
 
+    # ---- Phase 2.5: v3a 30min二次确认 ----
+    print()
+    print('[2.5] v3a 30分钟二次确认...')
+    v3a_confirmed = []
+    if committee_results:
+        buy_results = [r for r in committee_results if r.get('decision') == 'buy']
+        if buy_results:
+            try:
+                from strategies.v3a_30min_strategy import V3a30MinStrategy, V3aConfig
+                v3a = V3a30MinStrategy(V3aConfig(mode='trend'), hs)
+                for r in buy_results:
+                    code = r.get('symbol', '') or r.get('code', '')
+                    name = r.get('name', '')
+                    score = r.get('composite_score', 0)
+
+                    sig = v3a.scan_entry(code)
+                    if sig and sig.confidence >= 0.60:
+                        r['v3a_confirmed'] = True
+                        r['v3a_confidence'] = sig.confidence
+                        r['v3a_signal_type'] = sig.signal_type
+                        r['v3a_stop'] = sig.stop_loss
+                        # 取委员会止损和v3a止损中较高的
+                        committee_stop = r.get('stop_loss', 0)
+                        final_stop = max(committee_stop, sig.stop_loss) if committee_stop > 0 else sig.stop_loss
+                        r['final_stop'] = final_stop
+                        v3a_confirmed.append(r)
+                        print(f'  ✓ {code_to_prefix(code)} ({name}) '
+                              f'v3a确认 conf={sig.confidence:.2f} '
+                              f'类型={sig.signal_type} 止损={final_stop:.2f}')
+                    else:
+                        r['decision'] = 'hold'
+                        r['v3a_confirmed'] = False
+                        conf_str = f'{sig.confidence:.2f}' if sig else '无信号'
+                        print(f'  ✗ {code_to_prefix(code)} ({name}) '
+                              f'v3a未确认 ({conf_str}) → 降为HOLD')
+
+                if v3a_confirmed:
+                    print(f'\n  v3a确认: {len(v3a_confirmed)}/{len(buy_results)}只')
+
+                    # 推送确认结果通知
+                    chanlun_webhook = os.getenv('CHANLUN_FEISHU_WEBHOOK_URL')
+                    if chanlun_webhook and args.notify:
+                        try:
+                            from utils.notification import FeishuConfig, FeishuNotifier
+                            notifier = FeishuNotifier(FeishuConfig(webhook_url=chanlun_webhook))
+                            lines = []
+                            for r in v3a_confirmed:
+                                code = r.get('symbol', '') or r.get('code', '')
+                                lines.append(
+                                    f"{code_to_prefix(code)} ({r.get('name', '')}) "
+                                    f"评分:{r.get('composite_score', 0):.0f} "
+                                    f"v3a={r.get('v3a_confidence', 0):.2f} "
+                                    f"止损:{r.get('final_stop', 0):.2f}")
+                            notifier.send_text(
+                                f'v3a确认买入 ({len(v3a_confirmed)}只)\n' +
+                                '\n'.join(lines) +
+                                '\n\n⚠ 请人工确认后操作')
+                            print('  飞书通知已推送')
+                        except Exception as e:
+                            print(f'  通知推送失败: {e}')
+                else:
+                    print('  无v3a确认通过')
+            except Exception as e:
+                print(f'  v3a加载失败: {e}')
+        else:
+            print('  无BUY推荐，跳过')
+    else:
+        print('  无委员会结果，跳过')
+
     # ---- Phase 3: 更新持仓 ----
     print()
     print('[3] 更新持仓...')
