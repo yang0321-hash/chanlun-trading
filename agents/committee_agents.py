@@ -145,8 +145,8 @@ def analyze_chanlun_structure(df: pd.DataFrame, candidate: Dict = None) -> Optio
         if not pivots:
             return None
 
-        # MACD
-        macd = MACD(df['close'])
+        # MACD — 用包含关系合并后的K线收盘价，索引与Stroke对齐
+        macd = MACD(pd.Series([k.close for k in kline]))
 
         # === 买卖点检测（包含1买/2买/3买/类2买/类3买） ===
         buy_points = []
@@ -229,14 +229,16 @@ def analyze_chanlun_structure(df: pd.DataFrame, candidate: Dict = None) -> Optio
             divergence = True
         elif len(strokes) >= 4:
             # 手动计算MACD用于背驰检测
-            hist_series = pd.Series([v.histogram for v in macd.values],
-                                     index=range(len(macd.values)))
+            hist_series = macd.get_histogram_series()
+            offset = macd._kline_offset
             down_strokes = [s for s in strokes if s.is_down]
             if len(down_strokes) >= 2:
                 s1, s2 = down_strokes[-2], down_strokes[-1]
-                if s1.end_index < len(hist_series) and s2.end_index < len(hist_series):
-                    area1 = abs(hist_series.iloc[s1.start_index:s1.end_index+1].sum())
-                    area2 = abs(hist_series.iloc[s2.start_index:s2.end_index+1].sum())
+                s1s, s1e = s1.start_index - offset, s1.end_index - offset
+                s2s, s2e = s2.start_index - offset, s2.end_index - offset
+                if 0 <= s1s <= s1e < len(hist_series) and 0 <= s2s <= s2e < len(hist_series):
+                    area1 = abs(hist_series.iloc[s1s:s1e+1].sum())
+                    area2 = abs(hist_series.iloc[s2s:s2e+1].sum())
                     if area1 > 0 and area2 < area1 * 0.7 and s2.end_value < s1.end_value:
                         divergence = True
 
@@ -295,42 +297,49 @@ class BullAnalyst:
                 reasoning_parts.append('周线空头逆势')
 
             # 1. 买点类型评估 + 强度分类
+            # 基础分降低，质量分加大 — 区分度来自质量而非类型
             if cl.buy_type == '1buy':
                 key_points.append('1买信号(趋势底背驰)')
-                confidence += 0.35
+                confidence += 0.15
                 reasoning_parts.append('1买底背驰')
+                # 1买需要背驰确认才有价值
+                if cl.divergence_detected:
+                    key_points.append('MACD背驰确认')
+                    confidence += 0.15
+                    reasoning_parts.append('背驰确认')
             elif cl.buy_type == '2buy':
                 key_points.append('2买信号(回调不破前低)')
-                confidence += 0.30
+                confidence += 0.10
                 reasoning_parts.append('2买确认')
-                # 2买三档强度加分
+                # 2买核心区分: 强度三档 (差异拉大)
                 if cl.buy_strength == 'strong':
                     key_points.append('强2买(2买3买重叠)')
-                    confidence += 0.10
+                    confidence += 0.25
                     reasoning_parts.append('2买3买重叠')
                 elif cl.buy_strength == 'medium':
                     key_points.append('类2买(中枢内)')
+                    confidence += 0.10
                     reasoning_parts.append('类2买')
                 elif cl.buy_strength == 'weak':
                     key_points.append('弱2买(中枢下)')
-                    confidence -= 0.05
+                    confidence -= 0.10
                     reasoning_parts.append('中枢下2买')
             elif cl.buy_type == '3buy':
                 key_points.append('3买信号(突破回踩不进中枢)')
-                confidence += 0.25
+                confidence += 0.10
                 reasoning_parts.append('3买突破确认')
-                # 3买三档强度加分
+                # 3买核心区分: 强度三档 (差异拉大)
                 if cl.buy_strength == 'strong':
                     key_points.append('强3买(回踩>GG)')
-                    confidence += 0.15
+                    confidence += 0.25
                     reasoning_parts.append('强3买回踩>GG')
                 elif cl.buy_strength == 'standard':
                     key_points.append('标准3买(ZG~GG)')
-                    confidence += 0.05
+                    confidence += 0.10
                     reasoning_parts.append('标准3买')
                 elif cl.buy_strength == 'weak':
                     key_points.append('弱3买(ZD~ZG)')
-                    confidence -= 0.05
+                    confidence -= 0.10
                     reasoning_parts.append('弱3买')
                 # 黄金分割0.618加分
                 if cl.golden_ratio_pass:
@@ -339,7 +348,7 @@ class BullAnalyst:
                     reasoning_parts.append('黄金分割0.618通过')
             elif cl.buy_type in ('quasi2buy', 'quasi3buy'):
                 key_points.append(f'类{cl.buy_type}信号')
-                confidence += 0.15
+                confidence += 0.05
                 reasoning_parts.append(f'类{cl.buy_type}')
 
             # 2. 价格相对中枢位置
@@ -371,7 +380,7 @@ class BullAnalyst:
                 reasoning_parts.append('底背驰')
 
             # 4. 当前价vs买点价的偏离（关键！）
-            if cl.buy_price > 0 and last_close > 0:
+            if cl.buy_price > last_close * 0.1 and last_close > 0:
                 pct_drift = (last_close - cl.buy_price) / cl.buy_price
                 if pct_drift > 0.20:
                     # 远离买点20%以上，大幅降低置信度
@@ -464,9 +473,9 @@ class BullAnalyst:
         ma20 = df['close'].rolling(20).mean().iloc[-1]
         ma60 = df['close'].rolling(60).mean().iloc[-1]
         if ma5 > ma20 > ma60:
-            return {'bullish': True, 'reason': '多头排列(MA5>MA20>MA60)', 'bonus': 0.25}
+            return {'bullish': True, 'reason': '多头排列(MA5>MA20>MA60)', 'bonus': 0.10}
         elif ma5 > ma20:
-            return {'bullish': True, 'reason': '短期多头(MA5>MA20)', 'bonus': 0.15}
+            return {'bullish': True, 'reason': '短期多头(MA5>MA20)', 'bonus': 0.05}
         return {'bullish': False, 'reason': '均线无多头排列', 'bonus': 0}
 
     def _analyze_macd(self, df: pd.DataFrame) -> Dict:
@@ -605,7 +614,8 @@ class BearAnalyst:
                 reasoning_parts.append('无买点')
 
             # 3. 偏离买点过远
-            if cl.buy_price > 0 and last_close > 0:
+            if cl.buy_price > last_close * 0.1 and last_close > 0:
+                # buy_price < 10% of current price means likely stale/invalid
                 pct_drift = (last_close - cl.buy_price) / cl.buy_price
                 if pct_drift > 0.25:
                     key_points.append(f'偏离买点{pct_drift:.0%}(严重追高)')
@@ -1153,9 +1163,9 @@ class RiskManager:
         # 取所有止损中最高者（最保守）
         best_stop = max(stops)
 
-        # 确保止损不超过入场价
-        if best_stop >= ctx.entry_price:
-            return ctx.entry_price * 0.97
+        # 确保止损不超过入场价，且不为负数
+        if best_stop >= ctx.entry_price or best_stop <= 0:
+            return ctx.entry_price * 0.95
 
         return best_stop
 

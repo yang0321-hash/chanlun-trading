@@ -134,6 +134,7 @@ class IntradayAgent:
         self.watchlist_names = {}
         self.events = []          # 盘中事件
         self.new_signals = []     # 新信号
+        self._signal_dedup = {}   # {(code, type): last_push_time} 1h去重
         self.scan_count = 0
         self.midday_done = False
         self.late_done = False
@@ -258,6 +259,35 @@ class IntradayAgent:
             except Exception:
                 pass
 
+        # 额外监控列表 (手动添加的候选股)
+        extra_file = 'signals/extra_watchlist.json'
+        if os.path.exists(extra_file):
+            try:
+                with open(extra_file, 'r', encoding='utf-8') as f:
+                    extra = json.load(f)
+                for item in extra:
+                    c = item if isinstance(item, str) else item.get('code', '')
+                    if c:
+                        codes.add(c)
+                        if isinstance(item, dict) and item.get('name'):
+                            self.watchlist_names[c] = item['name']
+            except Exception:
+                pass
+
+        # 热点板块: 加载启动/加速/高潮阶段的板块成分股(每板块最多20只)
+        hot_file = 'signals/hot_sectors_latest.json'
+        if os.path.exists(hot_file):
+            try:
+                with open(hot_file, 'r', encoding='utf-8') as f:
+                    hot = json.load(f)
+                for sector in hot.get('sectors', []):
+                    if sector.get('phase', '') in ('启动', '加速', '高潮'):
+                        for code in sector.get('stocks', [])[:20]:
+                            codes.add(code)
+                            self.watchlist_names[code] = sector.get('name', '')
+            except Exception:
+                pass
+
         # 统一代码格式 (去掉.SZ/.SH后缀，统一为纯数字或sz/sh前缀)
         normalized = set()
         for c in codes:
@@ -284,6 +314,14 @@ class IntradayAgent:
             if now.hour >= self.MARKET_CLOSE_HOUR:
                 print('  收盘，结束监控')
                 break
+
+            # 午休 11:30-13:00 跳过扫描
+            if now.hour == 12 or (now.hour == 11 and now.minute >= 30):
+                if now.hour == 11 and now.minute >= 30 and not self.midday_done:
+                    self.midday_summary()
+                    self.midday_done = True
+                time.sleep(60)
+                continue
 
             # 检查午盘总结时间
             if (now.hour == self.MIDDAY_HOUR and now.minute >= self.MIDDAY_MIN
@@ -317,12 +355,19 @@ class IntradayAgent:
         # 实时报价 (Sina)
         self._check_realtime_quotes()
 
+        # 更新持仓最高价
+        self._update_position_prices()
+
         # 止损检查
         self._check_stop_losses()
 
         # 买点检测 (每3轮一次，减少API压力)
         if self.scan_count % 3 == 1:
             self._detect_buy_signals()
+
+        # 减仓点检测 (每5轮一次)
+        if self.scan_count % 5 == 2:
+            self._detect_sell_signals()
 
     def _check_realtime_quotes(self):
         """获取实时报价，记录涨跌"""
@@ -343,20 +388,53 @@ class IntradayAgent:
                     if name:
                         self.watchlist_names[code] = name
 
-                    # 记录异动
+                    # 记录异动 (去重: 同code同type只保留最新)
                     if abs(pct) >= 5:
-                        self.events.append({
-                            'time': datetime.now().strftime('%H:%M'),
-                            'type': 'surge' if pct > 0 else 'drop',
-                            'code': code,
-                            'name': name,
-                            'pct': pct,
-                            'price': price,
-                        })
+                        etype = 'surge' if pct > 0 else 'drop'
+                        # 更新已有事件而非追加
+                        found = False
+                        for ev in self.events:
+                            if ev['code'] == code and ev['type'] == etype:
+                                ev['time'] = datetime.now().strftime('%H:%M')
+                                ev['pct'] = pct
+                                ev['price'] = price
+                                found = True
+                                break
+                        if not found:
+                            self.events.append({
+                                'time': datetime.now().strftime('%H:%M'),
+                                'type': etype,
+                                'code': code,
+                                'name': name,
+                                'pct': pct,
+                                'price': price,
+                            })
 
                 time.sleep(0.1)
         except Exception as e:
             print(f'  实时行情获取异常: {e}')
+
+    def _update_position_prices(self):
+        """更新持仓最高价 — 用events中的实时价格"""
+        positions = self.pm.get_all_positions()
+        if not positions:
+            return
+        # 从events收集最新价格
+        price_map = {}
+        for ev in self.events:
+            if ev.get('price', 0) > 0:
+                price_map[ev['code']] = ev['price']
+        # 对没有event价格的持仓，单独获取
+        for pos in positions:
+            if pos.code not in price_map:
+                try:
+                    p = self.hs.get_realtime_price(pos.code)
+                    if p and p > 0:
+                        price_map[pos.code] = p
+                except Exception:
+                    pass
+        if price_map:
+            self.pm.update_prices(price_map)
 
     def _check_stop_losses(self):
         """检查持仓止损 — 使用 UnifiedExitManager 7层退出"""
@@ -446,6 +524,11 @@ class IntradayAgent:
         })
         print(f'  [EXIT] {code_to_prefix(code)} ({name}) {signal.action}: {signal.reason}')
 
+        # 实际卖出
+        self.pm.sell(code)
+        if self.exit_mgr:
+            self.exit_mgr.on_sell(code)
+
         send_notification(
             f'{"紧急清仓" if signal.action == "force_exit" else "卖出信号"} {name}',
             f'{code_to_prefix(code)} ({name})\n'
@@ -467,6 +550,9 @@ class IntradayAgent:
         })
         print(f'  [STOP] {code_to_prefix(code)} 触发止损 {price:.2f} <= {stop:.2f}')
 
+        # 实际卖出
+        self.pm.sell(code)
+
         send_notification('止损告警',
                          f'{code_to_prefix(code)} ({name}) '
                          f'触发止损! 现价:{price:.2f} 止损:{stop:.2f}')
@@ -481,6 +567,23 @@ class IntradayAgent:
             try:
                 signal = self._analyze_30min(code)
                 if signal:
+                    # 去重: 同code+type 1小时内不重复推送
+                    dedup_key = (code, signal['type'])
+                    now = datetime.now()
+                    last_time = self._signal_dedup.get(dedup_key)
+                    if last_time and (now - last_time).total_seconds() < 3600:
+                        continue
+
+                    # 用实时价格替换K线收盘价
+                    try:
+                        rt_price = self.hs.get_realtime_price(code)
+                        if rt_price and rt_price > 0:
+                            signal['kline_price'] = signal['price']
+                            signal['price'] = rt_price
+                    except Exception:
+                        pass
+
+                    self._signal_dedup[dedup_key] = now
                     self.new_signals.append(signal)
                     name = self.watchlist_names.get(code, '')
                     print(f'  [SIGNAL] {code_to_prefix(code)} ({name}) '
@@ -508,10 +611,13 @@ class IntradayAgent:
         return self._analyze_30min_original(code)
 
     def _analyze_30min_v3a(self, code: str) -> Optional[dict]:
-        """v3a策略: 日线过滤 + 30分钟2买 + MACD确认"""
+        """v3a策略: 日线过滤 + 30分钟笔买 + MACD确认 + 动态置信度"""
         try:
             signal = self.v3a_strategy.scan_entry(code)
             if not signal:
+                return None
+            # 过滤低置信度信号
+            if signal.confidence < 0.55:
                 return None
             return {
                 'code': code,
@@ -799,6 +905,92 @@ class IntradayAgent:
         # 推送
         report = '\n'.join(lines)
         send_notification(f'尾盘分析 {datetime.now().strftime("%m-%d")}', report)
+
+    def _detect_sell_signals(self):
+        """检测30min减仓点 — 监控列表中所有股票"""
+        for code in self.watchlist:
+            try:
+                sell_info = self._check_30min_sell(code)
+                if sell_info:
+                    name = self.watchlist_names.get(code, '')
+                    dedup_key = (code, 'sell')
+                    now = datetime.now()
+                    last_time = self._signal_dedup.get(dedup_key)
+                    if last_time and (now - last_time).total_seconds() < 3600:
+                        continue
+
+                    self._signal_dedup[dedup_key] = now
+                    print(f'  [SELL] {code_to_prefix(code)} ({name}) '
+                          f'{sell_info["type"]} @ {sell_info["price"]:.2f}')
+
+                    send_notification(
+                        f'减仓提醒 {code_to_prefix(code)} ({name})',
+                        f'{sell_info["type"]} 价格:{sell_info["price"]:.2f}\n'
+                        f'{sell_info["reason"]}'
+                    )
+            except Exception:
+                pass
+            time.sleep(0.2)
+
+    def _check_30min_sell(self, code: str) -> Optional[dict]:
+        """检测单只股票30min卖点"""
+        try:
+            from core.kline import KLine
+            from core.fractal import FractalDetector
+            from core.stroke import StrokeGenerator
+            from core.segment import SegmentGenerator
+            from core.pivot import PivotDetector
+            from core.buy_sell_points import BuySellPointDetector
+            from indicator.macd import MACD
+
+            df = self.hs.get_kline(code, period='30min')
+            if df is None or len(df) < 120:
+                return None
+
+            kline = KLine.from_dataframe(df, strict_mode=False)
+            close_s = pd.Series([k.close for k in kline])
+            fractals = FractalDetector(kline, confirm_required=False).get_fractals()
+            if len(fractals) < 6:
+                return None
+            strokes = StrokeGenerator(kline, fractals, min_bars=3).get_strokes()
+            if len(strokes) < 4:
+                return None
+            segments = SegmentGenerator(kline, strokes).get_segments()
+            pivots = PivotDetector(kline, strokes).get_pivots()
+            if not pivots:
+                return None
+            macd = MACD(close_s)
+            det = BuySellPointDetector(fractals, strokes, segments, pivots, macd)
+            _, sells = det.detect_all()
+
+            if not sells:
+                return None
+
+            current_price = close_s.iloc[-1]
+            klen = len(kline)
+
+            # 最近10根K线内的高置信度卖点
+            recent_sells = [
+                s for s in sells
+                if s.index >= klen - 10
+                and s.confidence >= 0.6
+            ]
+            if not recent_sells:
+                return None
+
+            best = max(recent_sells, key=lambda s: s.confidence)
+            type_cn = {
+                '1sell': '1卖(趋势终点)', '2sell': '2卖(反弹高点)',
+                '3sell': '3卖(跌破中枢)', 'quasi2sell': '类2卖',
+            }
+            return {
+                'type': type_cn.get(best.point_type, best.point_type),
+                'price': current_price,
+                'confidence': best.confidence,
+                'reason': f'{best.point_type} 置信度:{best.confidence:.2f} | {best.reason[:60]}',
+            }
+        except Exception:
+            return None
 
     # ---------- 辅助方法 ----------
 

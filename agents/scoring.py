@@ -25,11 +25,11 @@ DEFAULT_WEIGHTS = {
 # ============================================================
 
 DECISION_THRESHOLDS = {
-    'buy_strong': 70,       # composite >= 70 AND risk <= 0.6 → buy
-    'buy_cautious': 55,     # composite >= 55 AND risk <= 0.4 → buy
-    'reject_score': 30,     # composite < 30 → reject
+    'buy_strong': 72,       # composite >= 72 AND risk <= 0.6 → buy (原70, 略提高)
+    'buy_cautious': 60,     # composite >= 60 AND risk <= 0.4 → buy (原55, 更谨慎)
+    'reject_score': 40,     # composite < 40 → reject (原30, 更严格)
     'reject_risk': 0.80,    # risk >= 0.8 → reject
-    'veto_bear_gap': 0.30,  # bear_conf > bull_conf + 0.3 → reject
+    'veto_bear_gap': 0.20,  # bear_conf > bull_conf + 0.2 → reject (原0.30, 更敏感)
 }
 
 VETO_RULES = {
