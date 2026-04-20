@@ -671,7 +671,13 @@ def main():
         buy_results = [r for r in committee_results if r.get('decision') == 'buy']
         if buy_results:
             try:
-                from strategies.v3a_30min_strategy import V3a30MinStrategy, V3aConfig
+                import importlib.util
+                _v3a_path = os.path.join(os.path.dirname(__file__), 'strategies', 'v3a_30min_strategy.py')
+                _v3a_spec = importlib.util.spec_from_file_location('v3a_30min_strategy', _v3a_path)
+                _v3a_mod = importlib.util.module_from_spec(_v3a_spec)
+                _v3a_spec.loader.exec_module(_v3a_mod)
+                V3a30MinStrategy = _v3a_mod.V3a30MinStrategy
+                V3aConfig = _v3a_mod.V3aConfig
                 v3a = V3a30MinStrategy(V3aConfig(mode='trend'), hs)
                 for r in buy_results:
                     code = r.get('symbol', '') or r.get('code', '')
