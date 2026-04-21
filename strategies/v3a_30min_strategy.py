@@ -51,7 +51,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.kline import KLine
 from core.fractal import FractalDetector
 from core.stroke import StrokeGenerator
+from core.segment import SegmentGenerator
 from core.pivot import PivotDetector
+from core.buy_sell_points import BuySellPointDetector
 from indicator.macd import MACD
 
 # czsc桥接 — 优先使用czsc bi (原始回测引擎)
@@ -80,6 +82,9 @@ class V3aConfig:
     recent_bars: int = 30           # 信号回看K线数
     min_confidence: float = 0.5     # 最低置信度
     stroke_min_bars: int = 5        # 笔最小K线数 (匹配czsc bi)
+    enable_5min_filter: bool = True  # 启用5分钟级别过滤
+    min_5min_bars: int = 100        # 5分钟最少K线数
+    stroke_5min_min_bars: int = 3   # 5分钟笔最小K线数
 
 
 @dataclass
@@ -266,6 +271,73 @@ class V3a30MinStrategy:
 
         return False
 
+    def _check_5min_filter(self, code: str) -> Optional[dict]:
+        """5分钟级别过滤 — 检测卖点否决入场
+
+        返回:
+            {'pass': bool, 'has_sell': bool, 'sell_types': [...],
+             'has_buy': bool, 'stop_5min': float}
+            None: 数据不足或未启用
+        """
+        if not self.config.enable_5min_filter or not self.hs:
+            return None
+
+        try:
+            df = self.hs.get_kline(code, period='5min')
+            if df is None or len(df) < self.config.min_5min_bars:
+                return None
+
+            kline = KLine.from_dataframe(df, strict_mode=False)
+            fractals = FractalDetector(kline, confirm_required=False).get_fractals()
+            if len(fractals) < 6:
+                return None
+
+            strokes = StrokeGenerator(
+                kline, fractals, min_bars=self.config.stroke_5min_min_bars
+            ).get_strokes()
+            if len(strokes) < 4:
+                return None
+
+            segments = SegmentGenerator(kline, strokes).get_segments()
+            pivots = PivotDetector(kline, strokes).get_pivots()
+
+            if not pivots:
+                return None
+
+            detector = BuySellPointDetector(fractals, strokes, segments, pivots)
+            buys, sells = detector.detect_all()
+
+            klen = len(df)
+            lookback = 10  # 最近10根5分钟K线(50分钟)
+
+            recent_sells = [s for s in sells if s.index >= klen - lookback]
+            recent_buys = [b for b in buys if b.index >= klen - lookback]
+
+            sell_types = [s.point_type for s in recent_sells]
+
+            # 只统计强卖点 (2sell/3sell/quasi2sell/quasi3sell), 1sell太噪
+            strong_sells = [s for s in recent_sells
+                            if '2sell' in s.point_type or '3sell' in s.point_type]
+            strong_sell_types = [s.point_type for s in strong_sells]
+
+            # 5分钟最近笔低点作为参考止损
+            stop_5min = 0.0
+            for s in reversed(strokes):
+                if s.end_value < s.start_value:  # 向下笔
+                    stop_5min = float(df['low'].iloc[s.end_index])
+                    break
+
+            return {
+                'pass': len(strong_sells) == 0,
+                'has_sell': len(strong_sells) > 0,
+                'sell_types': strong_sell_types,
+                'has_buy': len(recent_buys) > 0,
+                'stop_5min': stop_5min,
+            }
+
+        except Exception:
+            return None
+
     def scan_entry(self, code: str) -> Optional[V3aSignal]:
         """入场扫描 — 与回测引擎一致
 
@@ -312,6 +384,11 @@ class V3a30MinStrategy:
         if cfg.macd_confirm and not self._check_macd_confirm(macd, klen):
             return None
 
+        # 4.5 5分钟级别过滤
+        filter_5min = self._check_5min_filter(code)
+        if filter_5min is not None and filter_5min['has_sell']:
+            return None
+
         # 5. 计算止损
         close_s = analysis['close_series']
         low_s = analysis['low_series']
@@ -329,6 +406,12 @@ class V3a30MinStrategy:
                     pivot_zg = p.zg
                     pivot_zd = p.zd
                     break
+
+        # 6.5 止损修正: 类2买不低于中枢ZD, 参考分钟止损
+        if pivot_zd > 0:
+            stop_loss = max(stop_loss, pivot_zd)
+        if filter_5min and filter_5min['stop_5min'] > 0:
+            stop_loss = max(stop_loss, filter_5min['stop_5min'])
 
         # === 动态置信度计算 ===
         conf = 0.5  # 基础分
@@ -378,6 +461,10 @@ class V3a30MinStrategy:
         stop_pct = (current_price - stop_loss) / current_price
         if 0.02 <= stop_pct <= 0.08:
             conf += 0.05  # 止损空间合理(2-8%)
+
+        # 5. 5分钟级别确认 (+0.10)
+        if filter_5min and filter_5min['has_buy']:
+            conf += 0.10
 
         conf = min(0.95, max(0.3, conf))
 

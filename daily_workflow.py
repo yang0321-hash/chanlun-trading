@@ -468,7 +468,7 @@ def build_feishu_card(committee_results: List[dict],
     if positions:
         pos_lines = []
         for p in positions:
-            mark = '🔴' if '触发' in p.get('status', '') else '🟢'
+            mark = '[!]' if '触发' in p.get('status', '') else '[OK]'
             pnl = p.get('pnl_pct', 0)
             pos_lines.append(
                 f'{mark} {code_to_prefix(p.get("code", ""))} '
@@ -695,15 +695,15 @@ def main():
                         final_stop = max(committee_stop, sig.stop_loss) if committee_stop > 0 else sig.stop_loss
                         r['final_stop'] = final_stop
                         v3a_confirmed.append(r)
-                        print(f'  ✓ {code_to_prefix(code)} ({name}) '
+                        print(f'  [OK] {code_to_prefix(code)} ({name}) '
                               f'v3a确认 conf={sig.confidence:.2f} '
                               f'类型={sig.signal_type} 止损={final_stop:.2f}')
                     else:
                         r['decision'] = 'hold'
                         r['v3a_confirmed'] = False
                         conf_str = f'{sig.confidence:.2f}' if sig else '无信号'
-                        print(f'  ✗ {code_to_prefix(code)} ({name}) '
-                              f'v3a未确认 ({conf_str}) → 降为HOLD')
+                        print(f'  [X] {code_to_prefix(code)} ({name}) '
+                              f'v3a未确认 ({conf_str}) -> 降为HOLD')
 
                 if v3a_confirmed:
                     print(f'\n  v3a确认: {len(v3a_confirmed)}/{len(buy_results)}只')
@@ -725,7 +725,7 @@ def main():
                             notifier.send_text(
                                 f'v3a确认买入 ({len(v3a_confirmed)}只)\n' +
                                 '\n'.join(lines) +
-                                '\n\n⚠ 请人工确认后操作')
+                                '\n\n[!] 请人工确认后操作')
                             print('  飞书通知已推送')
                         except Exception as e:
                             print(f'  通知推送失败: {e}')
