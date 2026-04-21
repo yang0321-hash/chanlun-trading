@@ -224,6 +224,7 @@ class V3a30MinStrategy:
                 'kline': kline,
                 'pivots': pivots,
                 'macd': macd,
+                'strokes': strokes,
                 'bi_buy_indices': bi_buy_indices,
                 'bi_sell_indices': bi_sell_indices,
                 'current_price': float(close_s.iloc[-1]),
@@ -240,36 +241,41 @@ class V3a30MinStrategy:
             return None
 
     def _check_macd_confirm(self, macd: MACD, klen: int) -> bool:
-        """v3a MACD确认: 与回测引擎一致
+        """MACD确认: 至少满足2项, 或仅绿柱缩短(最强单独条件)
 
-        条件 (满足任一):
-          1. DIF > DEA
-          2. HIST在零轴下但递增
-          3. DIF递增
+        3个条件:
+          1. DIF > DEA (金叉)
+          2. 绿柱缩短 (HIST<0且递增, 最佳提前量)
+          3. DIF递增 (动能向上)
         """
         latest = macd.get_latest()
         if not latest:
             return False
 
+        score = 0
+        has_green_shrink = False
+
         # 条件1: DIF > DEA
         if latest.macd > latest.signal:
-            return True
+            score += 1
 
-        # 条件2: HIST在零轴下但递增
+        # 条件2: 绿柱缩短
         hist_series = macd.get_histogram_series()
         if len(hist_series) >= 2:
             hist_now = float(hist_series.iloc[-1])
             hist_prev = float(hist_series.iloc[-2])
             if hist_now <= 0 and hist_now > hist_prev:
-                return True
+                score += 1
+                has_green_shrink = True
 
         # 条件3: DIF递增
         dif_series = macd.get_dif_series()
         if len(dif_series) >= 2:
             if float(dif_series.iloc[-1]) > float(dif_series.iloc[-2]):
-                return True
+                score += 1
 
-        return False
+        # 至少2项, 或仅绿柱缩短
+        return score >= 2 or (score == 1 and has_green_shrink)
 
     def _check_5min_filter(self, code: str,
                            cutoff_time=None) -> Optional[dict]:
@@ -474,7 +480,7 @@ class V3a30MinStrategy:
         if recent_buy_idx is None:
             return None
 
-        # 4. MACD确认
+        # 4. MACD确认 (收紧: ≥2项 或 绿柱缩短)
         if cfg.macd_confirm and not self._check_macd_confirm(macd, klen):
             return None
 
@@ -483,25 +489,50 @@ class V3a30MinStrategy:
         if filter_5min is not None and filter_5min['has_sell']:
             return None
 
-        # 5. 计算止损
+        # 4.6 回调缩量过滤
+        vol_s = analysis.get('volume_series')
+        if vol_s is not None and recent_buy_idx >= 5:
+            pullback_vol = float(vol_s.iloc[max(0, recent_buy_idx - 10):recent_buy_idx + 1].mean())
+            pre_vol_start = max(0, recent_buy_idx - 30)
+            pre_vol_end = max(0, recent_buy_idx - 10)
+            if pre_vol_end > pre_vol_start:
+                pre_vol = float(vol_s.iloc[pre_vol_start:pre_vol_end].mean())
+                if pre_vol > 0 and pullback_vol > pre_vol * 0.85:
+                    return None  # 回调未缩量, 抛压未竭
+
+        # 4.7 结构支撑过滤: 入场位置需靠近支撑
         close_s = analysis['close_series']
         low_s = analysis['low_series']
+
+        # 计算止损先确定pivot
         lookback = min(30, recent_buy_idx)
         recent_low = float(low_s.iloc[recent_buy_idx - lookback:recent_buy_idx + 1].min())
         stop_loss = max(recent_low, current_price * (1 - cfg.stop_loss_pct))
 
-        # 6. 关联中枢
         pivot_zg = 0.0
         pivot_zd = 0.0
         if pivots:
-            # 找包含买入位置的中枢
             for p in reversed(pivots):
                 if p.zg > 0:
                     pivot_zg = p.zg
                     pivot_zd = p.zd
                     break
 
-        # 6.5 止损修正: 类2买不低于中枢ZD, 参考分钟止损
+        near_support = False
+        if pivot_zd > 0 and current_price <= pivot_zd * 1.03:
+            near_support = True
+        if not near_support:
+            strokes_list = analysis.get('strokes')
+            if strokes_list:
+                for s in reversed(strokes_list):
+                    if s.end_value > s.start_value:
+                        if current_price <= s.start_value * 1.03:
+                            near_support = True
+                        break
+        if not near_support:
+            return None  # 悬空入场, 无结构支撑
+
+        # 5. 止损修正: 类2买不低于中枢ZD, 参考分钟止损
         if pivot_zd > 0:
             stop_loss = max(stop_loss, pivot_zd)
         if filter_5min and filter_5min['stop_5min'] > 0:

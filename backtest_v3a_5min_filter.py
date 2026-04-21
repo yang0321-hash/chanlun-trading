@@ -1,8 +1,11 @@
 """v3a回测: 对比有无5分钟过滤的效果
 
-用法: python backtest_v3a_5min_filter.py [--codes 20]
+用法: python backtest_v3a_5min_filter.py [--codes 20] [--random 50] [--seed 42]
+  --codes N   : 使用内置的15只股票中取前N只
+  --random N  : 从TDX全市场随机抽取N只A股
+  --seed N    : 随机种子 (默认42)
 """
-import os, sys
+import os, sys, glob, random
 for k in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy']:
     os.environ.pop(k, None)
 sys.path.insert(0, '.')
@@ -16,6 +19,7 @@ from data.hybrid_source import HybridSource
 from core.kline import KLine
 from core.fractal import FractalDetector
 from core.stroke import StrokeGenerator
+from core.pivot import PivotDetector
 from indicator.macd import MACD
 
 import importlib.util
@@ -27,11 +31,28 @@ V3a30MinStrategy = _v3a_mod.V3a30MinStrategy
 V3aConfig = _v3a_mod.V3aConfig
 
 # ============================================================================
-TEST_CODES = [
+BUILTIN_CODES = [
     'sh600869', 'sz300870', 'sz002600', 'sz000559', 'sh600519',
     'sz300750', 'sz002230', 'sh603906', 'sz300953', 'sz002692',
     'sh603985', 'sz300626', 'sh688719', 'sz301222', 'sz002580',
 ]
+
+
+def sample_a_shares(n, seed=42):
+    """从TDX数据中随机抽取A股 (排除指数/ETF/债券/北证)"""
+    all_files = glob.glob('tdx_data/sh/lday/*.day') + glob.glob('tdx_data/sz/lday/*.day')
+    codes = []
+    for f in all_files:
+        base = os.path.basename(f).replace('.day', '')
+        # 只保留A股: sh600xxx/sh601xxx/sh603xxx/sh605xxx, sz000xxx/sz001xxx/sz002xxx/sz300xxx/sz301xxx
+        prefix = base[:2]
+        num = base[2:]
+        if prefix == 'sh' and num[:1] in ('6',) and len(num) == 6:
+            codes.append(base)
+        elif prefix == 'sz' and num[:1] in ('0', '3') and len(num) == 6:
+            codes.append(base)
+    random.seed(seed)
+    return random.sample(codes, min(n, len(codes)))
 INITIAL_CAPITAL = 1_000_000
 COMMISSION = 0.001
 SLIPPAGE = 0.001
@@ -52,20 +73,30 @@ def get_chanlun_bi(df, min_bars=5):
     return [s.end_index for s in strokes if s.end_value < s.start_value]
 
 
-def check_macd(macd, kline_idx):
-    """检查MACD确认 (kline_idx是K线索引)"""
+def check_macd_strict(macd, kline_idx):
+    """MACD确认 (收紧版): 至少满足2项, 或仅绿柱缩短"""
     v = macd.get_value_at(kline_idx)
     if v is None:
         return False
     v_prev = macd.get_value_at(kline_idx - 1)
 
+    score = 0
+    has_green_shrink = False
+
+    # 条件1: DIF > DEA
     if v.macd > v.signal:
-        return True
+        score += 1
+
+    # 条件2: 绿柱缩短
     if v.histogram <= 0 and v_prev is not None and v.histogram > v_prev.histogram:
-        return True
+        score += 1
+        has_green_shrink = True
+
+    # 条件3: DIF递增
     if v_prev is not None and v.macd > v_prev.macd:
-        return True
-    return False
+        score += 1
+
+    return score >= 2 or (score == 1 and has_green_shrink)
 
 
 def daily_bullish_at(df_daily, target_date):
@@ -100,13 +131,37 @@ def run_backtest(hs, codes, enable_5min=True):
                 continue
             df_daily = hs.get_kline(code, period='daily')
 
-            bi_buy = get_chanlun_bi(df)
+            # 获取bi和中枢
+            kline = KLine.from_dataframe(df, strict_mode=False)
+            fractals = FractalDetector(kline, confirm_required=False).get_fractals()
+            if len(fractals) < 6:
+                continue
+            strokes = StrokeGenerator(kline, fractals, min_bars=5).get_strokes()
+            if len(strokes) < 4:
+                continue
+            bi_buy = [s.end_index for s in strokes if s.end_value < s.start_value]
+            bi_sell_up = [s for s in strokes if s.end_value > s.start_value]
             if not bi_buy:
                 continue
+
+            pivots = []
+            try:
+                from core.pivot import PivotDetector
+                pivots = PivotDetector(kline, strokes).get_pivots()
+            except:
+                pass
+
+            # 最近中枢ZD
+            pivot_zd = 0.0
+            for p in reversed(pivots):
+                if p.zg > 0:
+                    pivot_zd = p.zd
+                    break
 
             close_s = pd.Series(df['close'].values)
             low_s = pd.Series(df['low'].values)
             high_s = pd.Series(df['high'].values)
+            vol_s = pd.Series(df['volume'].values) if 'volume' in df.columns else None
             macd = MACD(close_s)
             klen = len(close_s)
 
@@ -169,7 +224,8 @@ def run_backtest(hs, codes, enable_5min=True):
                 if buy_idx is None:
                     continue
 
-                if not check_macd(macd, i):
+                # MACD确认 (收紧版)
+                if not check_macd_strict(macd, i):
                     continue
 
                 # 5分钟过滤 (每10根bar检测一次, 避免太慢)
@@ -183,6 +239,29 @@ def run_backtest(hs, codes, enable_5min=True):
                             continue
                     except:
                         pass
+
+                # 回调缩量过滤
+                if vol_s is not None and buy_idx >= 5:
+                    pullback_vol = float(vol_s.iloc[max(0, buy_idx - 10):buy_idx + 1].mean())
+                    pre_vol_start = max(0, buy_idx - 30)
+                    pre_vol_end = max(0, buy_idx - 10)
+                    if pre_vol_end > pre_vol_start:
+                        pre_vol = float(vol_s.iloc[pre_vol_start:pre_vol_end].mean())
+                        if pre_vol > 0 and pullback_vol > pre_vol * 0.85:
+                            continue  # 回调未缩量
+
+                # 结构支撑过滤
+                near_support = False
+                if pivot_zd > 0 and bar_close <= pivot_zd * 1.03:
+                    near_support = True
+                if not near_support:
+                    for s in reversed(bi_sell_up):
+                        if s.end_index <= buy_idx:
+                            if bar_close <= s.start_value * 1.03:
+                                near_support = True
+                            break
+                if not near_support:
+                    continue
 
                 # 止损
                 lookback = min(30, buy_idx)
@@ -244,11 +323,18 @@ def run_backtest(hs, codes, enable_5min=True):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--codes', type=int, default=15, help='Number of stocks')
+    parser.add_argument('--codes', type=int, default=15, help='Number of builtin stocks')
+    parser.add_argument('--random', type=int, default=0, help='Random sample N stocks from TDX')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
     args = parser.parse_args()
 
     hs = HybridSource()
-    codes = TEST_CODES[:args.codes]
+
+    if args.random > 0:
+        codes = sample_a_shares(args.random, args.seed)
+        print(f"Random sampled {len(codes)} A-shares (seed={args.seed})")
+    else:
+        codes = BUILTIN_CODES[:args.codes]
 
     print("=" * 60, flush=True)
     print("v3a 5min filter backtest", flush=True)
