@@ -698,22 +698,24 @@ class V3a30MinStrategy:
         )
 
     def check_exit(self, code: str, entry_price: float,
-                   highest_price: float, bars_held: int = 0) -> Optional[str]:
-        """出场检查 — 与回测引擎一致
+                   highest_price: float, bars_held: int = 0,
+                   current_stop: float = 0.0,
+                   last_trail_bi: int = -1) -> Optional[str]:
+        """出场检查 — 缠论结构出场
 
         优先级:
           1. 固定止损 (-12%)
-          2. MACD背驰止盈半仓 (盈利>3% + HIST缩小 + 向上笔结束)
-          3. 追踪止损 (盈利>5%后从最高点回撤3%)
-          4. 向上笔结束 (stroke_sell)
-          5. 时间止损 (>80根K线)
-          6. T+0强制清仓 (14:50)
+          2. 结构追踪止损 (向上笔起点跟随)
+          3. 时间止损 (>120根K线)
+          4. T+0强制清仓 (14:50)
 
         Args:
             code: 股票代码
             entry_price: 入场价
             highest_price: 持仓期间最高价
             bars_held: 已持有K线数
+            current_stop: 当前止损价
+            last_trail_bi: 上次追踪的向上笔结束索引
 
         Returns:
             出场原因字符串, None表示继续持有
@@ -725,53 +727,94 @@ class V3a30MinStrategy:
             return None
 
         current_price = analysis['current_price']
-        profit = (current_price - entry_price) / entry_price
-        bi_sell_indices = analysis['bi_sell_indices']
-        klen = analysis['klen']
 
         # 1. 固定止损
         if current_price <= entry_price * (1 - cfg.stop_loss_pct):
             return f'固定止损 -{cfg.stop_loss_pct*100:.0f}%'
 
-        # 2. MACD背驰止盈 (盈利>3% + HIST连续缩小 + 价格新高)
-        if profit > 0.03 and bars_held >= cfg.min_hold_bars:
-            macd = analysis['macd']
-            hist_series = macd.get_histogram_series()
-            close_s = analysis['close_series']
-            if len(hist_series) >= 3 and len(close_s) >= 2:
-                hist_shrinking = (float(hist_series.iloc[-1]) < float(hist_series.iloc[-2])
-                                  < float(hist_series.iloc[-3]))
-                price_near_high = float(close_s.iloc[-1]) >= highest_price * 0.995
-                # 还需要向上笔结束确认
-                has_sell_bi = any(
-                    idx >= klen - 5 for idx in bi_sell_indices
-                )
-                if hist_shrinking and price_near_high and has_sell_bi:
-                    return 'MACD背驰 (新高+HIST缩小+笔结束)'
+        # 2. 结构追踪止损 (由调用方根据向上笔起点维护 current_stop)
+        if current_stop > 0 and current_price <= current_stop:
+            return f'结构止损 (跌破{current_stop:.2f})'
 
-        # 3. 追踪止损
-        if profit > cfg.trailing_start:
-            trail_stop = highest_price * (1 - cfg.trailing_dist)
-            if current_price <= trail_stop:
-                return f'追踪止损 (从最高{highest_price:.2f}回撤{cfg.trailing_dist*100:.0f}%)'
-
-        # 4. 向上笔结束 = 卖出信号 (与回测引擎一致)
-        if bi_sell_indices and bars_held >= cfg.min_hold_bars:
-            recent_sell = any(idx >= klen - cfg.recent_bars for idx in bi_sell_indices)
-            if recent_sell and profit > 0.01:
-                return '向上笔结束 (卖出信号)'
-
-        # 5. 时间止损
-        if bars_held >= cfg.max_hold_bars:
+        # 3. 时间止损
+        if bars_held >= 120:
             return f'时间止损 (持仓{bars_held}根K线)'
 
-        # 6. T+0模式: 强制清仓
+        # 4. T+0模式: 强制清仓
         if cfg.mode == 't0':
             now = datetime.now()
             if now.hour == 14 and now.minute >= 50:
                 return 'T+0强制清仓 (14:50)'
 
         return None
+
+    def get_structural_stop(self, code: str, last_trail_bi: int = -1) -> Tuple[float, int]:
+        """获取最新的结构追踪止损位
+
+        检查是否有新的向上笔完成, 返回更新后的止损价和笔索引。
+        调用方应: new_stop = max(old_stop, returned_stop)
+
+        Args:
+            code: 股票代码
+            last_trail_bi: 上次追踪的向上笔结束索引
+
+        Returns:
+            (structural_stop, new_last_trail_bi)
+            structural_stop = 0 表示无新向上笔
+        """
+        analysis = self._run_chanlun_pipeline(code)
+        if not analysis:
+            return 0.0, last_trail_bi
+
+        strokes_list = analysis.get('strokes')
+        if not strokes_list:
+            return 0.0, last_trail_bi
+
+        best_stop = 0.0
+        best_bi = last_trail_bi
+        for s in strokes_list:
+            if s.end_value > s.start_value:  # 向上笔
+                if s.end_index > last_trail_bi:
+                    struct_stop = s.start_value
+                    if struct_stop > best_stop:
+                        best_stop = struct_stop
+                        best_bi = s.end_index
+
+        return best_stop, best_bi
+
+    def check_macd_divergence_exit(self, code: str, entry_idx: int) -> bool:
+        """检查MACD面积背驰 — 是否应该减仓
+
+        比较持仓期间最近两个向上笔的MACD面积,
+        如果后者 < 前者的50%, 说明动能衰竭。
+
+        Args:
+            code: 股票代码
+            entry_idx: 入场时的K线索引
+
+        Returns:
+            True: 应该减仓
+        """
+        analysis = self._run_chanlun_pipeline(code)
+        if not analysis:
+            return False
+
+        strokes_list = analysis.get('strokes')
+        macd = analysis['macd']
+        if not strokes_list:
+            return False
+
+        held_up_bis = []
+        for s in strokes_list:
+            if s.end_value > s.start_value and s.end_index > entry_idx:
+                area = macd.compute_area(s.start_index, s.end_index, 'up')
+                if area > 0:
+                    held_up_bis.append(area)
+
+        if len(held_up_bis) >= 2:
+            return held_up_bis[-1] < held_up_bis[-2] * 0.5
+
+        return False
 
     def get_exit_config_dict(self) -> dict:
         """返回适配 UnifiedExitManager 的配置字典"""
