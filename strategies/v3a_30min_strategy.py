@@ -273,13 +273,22 @@ class V3a30MinStrategy:
 
     def _check_5min_filter(self, code: str,
                            cutoff_time=None) -> Optional[dict]:
-        """5分钟级别过滤 — 基于笔结构+MACD背驰
+        """5分钟级别过滤 — 检测超涨 (短期上涨趋势是否已经耗尽)
 
-        核心逻辑:
-          1. 找最近两个向上笔, 比较MACD面积
-          2. 后一个向上笔面积 < 前一个 = 顶背驰 → 看跌
-          3. 最近3笔的方向判断趋势状态
-          4. 价格相对最后中枢的位置
+        核心逻辑: 5分钟走势类型判断
+          判断5分钟是否已经走了"多中枢上涨趋势", 若趋势已耗尽,
+          在30分钟出现买点时不应入场, 因为短期可能面临深度回调.
+
+        超涨 = 上涨趋势成熟 + 动能衰竭:
+          1. 从最近显著低点至今涨幅 > 10%
+          2. 上涨过程中形成2+个中枢 (趋势成熟)
+          3. 最后一个主要上冲笔的MACD面积 < 峰值上冲笔的40% (动能衰竭)
+          4. 当前价格接近上涨趋势高点 (不是已经回调后的入场)
+
+        600869案例:
+          5min从13.94涨到15.79, 二中枢上涨完成
+          最后主要上冲(14.86→15.83)MACD面积=0.81, 峰值=2.83
+          ratio=28.6% → 超涨否决
 
         Args:
             code: 股票代码
@@ -287,8 +296,8 @@ class V3a30MinStrategy:
                          None = 用全量数据 (实盘)
 
         Returns:
-            {'pass': bool, 'reason': str, 'stop_5min': float,
-             'has_bullish': bool}
+            {'pass': bool, 'has_sell': bool, 'reason': str,
+             'stop_5min': float, 'has_buy': bool}
             None: 数据不足或未启用
         """
         if not self.config.enable_5min_filter or not self.hs:
@@ -317,68 +326,107 @@ class V3a30MinStrategy:
 
             close_s = pd.Series(df['close'].values)
             macd = MACD(close_s)
+            current_price = float(close_s.iloc[-1])
 
-            # === 1. 找最近的向上笔 (用于背驰检测) ===
+            # === 1. 找最近显著低点 (最近300笔范围内的最低点) ===
+            recent_n = min(300, len(strokes))
+            recent_strokes = strokes[-recent_n:]
+            low_val = float('inf')
+            low_idx = 0
+            for s in recent_strokes:
+                s_low = min(s.start_value, s.end_value)
+                if s_low < low_val:
+                    low_val = s_low
+                    low_idx = min(s.start_index, s.end_index)
+
+            # 从低点至今的总涨幅
+            rise_pct = (current_price - low_val) / low_val if low_val > 0 else 0
+
+            # === 2. 中枢数量 (趋势成熟度) ===
+            pivots_5m = PivotDetector(kline, strokes).get_pivots()
+            # 统计低点之后形成的中枢数
+            num_pivots = 0
+            if pivots_5m:
+                for p in pivots_5m:
+                    # 中枢的笔在低点之后形成
+                    if hasattr(p, 'start_index') and p.start_index >= low_idx:
+                        num_pivots += 1
+                    elif not hasattr(p, 'start_index'):
+                        num_pivots += 1
+                if not hasattr(pivots_5m[0], 'start_index'):
+                    num_pivots = len(pivots_5m[-5:])
+
+            # === 3. 动能衰竭: 最后主要上冲 vs 峰值上冲 ===
             up_strokes = [s for s in strokes if s.end_value > s.start_value]
-            if len(up_strokes) < 2:
-                return {'pass': True, 'reason': 'insufficient_up_strokes',
-                        'stop_5min': 0.0, 'has_bullish': False}
+            # 主要上冲笔: 涨幅 > 3%
+            major_ups = []
+            for s in up_strokes:
+                pct = (s.end_value - s.start_value) / s.start_value
+                if pct > 0.03 and s.start_index >= low_idx:
+                    area = macd.compute_area(s.start_index, s.end_index, 'up')
+                    major_ups.append((s, area))
 
-            last_up = up_strokes[-1]
-            prev_up = up_strokes[-2]
+            momentum_ratio = 1.0
+            peak_area = 0.0
+            last_major_area = 0.0
+            if len(major_ups) >= 2:
+                peak_area = max(a for _, a in major_ups)
+                last_major_area = major_ups[-1][1]
+                if peak_area > 0:
+                    momentum_ratio = last_major_area / peak_area
 
-            # === 2. MACD面积背驰检测 ===
-            area_prev = macd.compute_area(prev_up.start_index, prev_up.end_index, 'up')
-            area_last = macd.compute_area(last_up.start_index, last_up.end_index, 'up')
-            has_divergence = area_last < area_prev * 0.8  # 面积缩小20%以上
+            # === 4. 价格位置: 是否接近上涨趋势高点 ===
+            high_val = max(s.end_value if s.end_value > s.start_value
+                          else s.start_value for s in recent_strokes)
+            near_high = current_price >= high_val * 0.97
 
-            # === 3. 最近3笔方向判断 ===
-            last_3 = strokes[-3:]
-            dn_count = sum(1 for s in last_3 if s.end_value < s.start_value)
-            # 3笔中2+笔向下 = 下跌趋势中
-            # 最后1笔向下 = 刚完成一个向上笔, 回调中
-            last_is_down = strokes[-1].end_value < strokes[-1].start_value
-
-            # === 4. 综合判断 ===
-            bearish = False
+            # === 5. 综合判断: 超涨检测 ===
+            overextended = False
             reason = ''
 
-            # 条件A: 顶背驰 + 最后笔向下 = 趋势结束
-            if has_divergence and last_is_down:
-                bearish = True
-                reason = f'top_divergence(area:{area_prev:.2f}->{area_last:.2f})+pullback'
+            # 标准超涨: 多中枢上涨 + 动能衰竭 + 近高点
+            if (rise_pct > 0.10 and num_pivots >= 2
+                    and momentum_ratio < 0.40 and near_high):
+                overextended = True
+                reason = (f'超涨: {num_pivots}中枢+{rise_pct:.0%}涨幅'
+                          f'+动能{momentum_ratio:.0%}+近高点')
 
-            # 条件B: 连续2根向下笔 + 第二根更大 = 加速下跌
-            if len(strokes) >= 4:
-                last4 = strokes[-4:]
-                dn = [s for s in last4 if s.end_value < s.start_value]
-                if len(dn) >= 2:
-                    last_dn = dn[-1]
-                    prev_dn = dn[-2]
-                    # 向下笔幅度扩大
-                    last_dn_pct = abs(last_dn.end_value - last_dn.start_value) / last_dn.start_value
-                    prev_dn_pct = abs(prev_dn.end_value - prev_dn.start_value) / prev_dn.start_value
-                    if last_dn_pct > prev_dn_pct * 1.5 and last_is_down:
-                        bearish = True
-                        reason = f'accelerating_downtrend({prev_dn_pct:.1f}%->{last_dn_pct:.1f}%)'
+            # 极端超涨: 即使中枢少, 极端动能衰竭也算
+            elif (rise_pct > 0.15 and momentum_ratio < 0.20
+                    and near_high and len(major_ups) >= 3):
+                overextended = True
+                reason = (f'超涨: 极端动能衰竭({momentum_ratio:.0%})'
+                          f'+{rise_pct:.0%}涨幅')
 
-            # 5分钟最后笔低点作为参考止损
+            # 5分钟最后向下笔低点作为参考止损
             stop_5min = 0.0
             for s in reversed(strokes):
                 if s.end_value < s.start_value:
                     stop_5min = float(df['low'].iloc[s.end_index])
                     break
 
-            # 看涨信号: 最近有向上笔突破 + 无背驰
-            has_bullish = not has_divergence and not last_is_down
+            # 看涨信号: 最近有向上突破 + 动能充沛
+            has_bullish = (momentum_ratio > 0.8 and not overextended
+                           and not (strokes[-1].end_value < strokes[-1].start_value))
 
             return {
-                'pass': not bearish,
-                'has_sell': bearish,
+                'pass': not overextended,
+                'has_sell': overextended,
                 'reason': reason,
-                'sell_types': [reason] if bearish else [],
+                'sell_types': [reason] if overextended else [],
                 'has_buy': has_bullish,
                 'stop_5min': stop_5min,
+                'debug': {
+                    'rise_pct': rise_pct,
+                    'num_pivots': num_pivots,
+                    'momentum_ratio': momentum_ratio,
+                    'peak_area': peak_area,
+                    'last_major_area': last_major_area,
+                    'near_high': near_high,
+                    'current_price': current_price,
+                    'high_val': high_val,
+                    'low_val': low_val,
+                },
             }
 
         except Exception:
