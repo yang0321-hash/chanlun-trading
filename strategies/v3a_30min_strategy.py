@@ -480,6 +480,20 @@ class V3a30MinStrategy:
         if recent_buy_idx is None:
             return None
 
+        # 3.5 2买结构确认: 当前笔低点 > 前一个笔低点 (higher low)
+        if len(bi_buy_indices) >= 2:
+            prev_buy_idx = None
+            for idx in reversed(bi_buy_indices):
+                if idx < recent_buy_idx:
+                    prev_buy_idx = idx
+                    break
+            if prev_buy_idx is not None:
+                low_s = analysis['low_series']
+                current_low = float(low_s.iloc[recent_buy_idx])
+                prev_low = float(low_s.iloc[prev_buy_idx])
+                if current_low <= prev_low:
+                    return None  # 创新低, 不是2买结构
+
         # 4. MACD确认 (收紧: ≥2项 或 绿柱缩短)
         if cfg.macd_confirm and not self._check_macd_confirm(macd, klen):
             return None

@@ -140,6 +140,8 @@ def run_backtest(hs, codes, enable_5min=True):
             if len(strokes) < 4:
                 continue
             bi_buy = [s.end_index for s in strokes if s.end_value < s.start_value]
+            bi_buy_low = {s.end_index: min(s.start_value, s.end_value)
+                          for s in strokes if s.end_value < s.start_value}
             bi_sell_up = [s for s in strokes if s.end_value > s.start_value]
             if not bi_buy:
                 continue
@@ -223,6 +225,16 @@ def run_backtest(hs, codes, enable_5min=True):
                         break
                 if buy_idx is None:
                     continue
+
+                # 2买结构确认: 当前笔低点 > 前一个笔低点 (higher low)
+                prev_buy_idx = None
+                for bi in reversed(bi_buy):
+                    if bi < buy_idx:
+                        prev_buy_idx = bi
+                        break
+                if prev_buy_idx is not None:
+                    if bi_buy_low.get(buy_idx, 0) <= bi_buy_low.get(prev_buy_idx, 0):
+                        continue  # 创新低, 不是2买
 
                 # MACD确认 (收紧版)
                 if not check_macd_strict(macd, i):
