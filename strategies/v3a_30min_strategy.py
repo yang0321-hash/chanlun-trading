@@ -271,12 +271,24 @@ class V3a30MinStrategy:
 
         return False
 
-    def _check_5min_filter(self, code: str) -> Optional[dict]:
-        """5分钟级别过滤 — 检测卖点否决入场
+    def _check_5min_filter(self, code: str,
+                           cutoff_time=None) -> Optional[dict]:
+        """5分钟级别过滤 — 基于笔结构+MACD背驰
 
-        返回:
-            {'pass': bool, 'has_sell': bool, 'sell_types': [...],
-             'has_buy': bool, 'stop_5min': float}
+        核心逻辑:
+          1. 找最近两个向上笔, 比较MACD面积
+          2. 后一个向上笔面积 < 前一个 = 顶背驰 → 看跌
+          3. 最近3笔的方向判断趋势状态
+          4. 价格相对最后中枢的位置
+
+        Args:
+            code: 股票代码
+            cutoff_time: 截止时间 (回测用, 只看此时间之前的5min数据)
+                         None = 用全量数据 (实盘)
+
+        Returns:
+            {'pass': bool, 'reason': str, 'stop_5min': float,
+             'has_bullish': bool}
             None: 数据不足或未启用
         """
         if not self.config.enable_5min_filter or not self.hs:
@@ -287,6 +299,11 @@ class V3a30MinStrategy:
             if df is None or len(df) < self.config.min_5min_bars:
                 return None
 
+            if cutoff_time is not None:
+                df = df[df.index <= cutoff_time]
+                if len(df) < self.config.min_5min_bars:
+                    return None
+
             kline = KLine.from_dataframe(df, strict_mode=False)
             fractals = FractalDetector(kline, confirm_required=False).get_fractals()
             if len(fractals) < 6:
@@ -295,43 +312,72 @@ class V3a30MinStrategy:
             strokes = StrokeGenerator(
                 kline, fractals, min_bars=self.config.stroke_5min_min_bars
             ).get_strokes()
-            if len(strokes) < 4:
+            if len(strokes) < 6:
                 return None
 
-            segments = SegmentGenerator(kline, strokes).get_segments()
-            pivots = PivotDetector(kline, strokes).get_pivots()
+            close_s = pd.Series(df['close'].values)
+            macd = MACD(close_s)
 
-            if not pivots:
-                return None
+            # === 1. 找最近的向上笔 (用于背驰检测) ===
+            up_strokes = [s for s in strokes if s.end_value > s.start_value]
+            if len(up_strokes) < 2:
+                return {'pass': True, 'reason': 'insufficient_up_strokes',
+                        'stop_5min': 0.0, 'has_bullish': False}
 
-            detector = BuySellPointDetector(fractals, strokes, segments, pivots)
-            buys, sells = detector.detect_all()
+            last_up = up_strokes[-1]
+            prev_up = up_strokes[-2]
 
-            klen = len(df)
-            lookback = 10  # 最近10根5分钟K线(50分钟)
+            # === 2. MACD面积背驰检测 ===
+            area_prev = macd.compute_area(prev_up.start_index, prev_up.end_index, 'up')
+            area_last = macd.compute_area(last_up.start_index, last_up.end_index, 'up')
+            has_divergence = area_last < area_prev * 0.8  # 面积缩小20%以上
 
-            recent_sells = [s for s in sells if s.index >= klen - lookback]
-            recent_buys = [b for b in buys if b.index >= klen - lookback]
+            # === 3. 最近3笔方向判断 ===
+            last_3 = strokes[-3:]
+            dn_count = sum(1 for s in last_3 if s.end_value < s.start_value)
+            # 3笔中2+笔向下 = 下跌趋势中
+            # 最后1笔向下 = 刚完成一个向上笔, 回调中
+            last_is_down = strokes[-1].end_value < strokes[-1].start_value
 
-            sell_types = [s.point_type for s in recent_sells]
+            # === 4. 综合判断 ===
+            bearish = False
+            reason = ''
 
-            # 只统计强卖点 (2sell/3sell/quasi2sell/quasi3sell), 1sell太噪
-            strong_sells = [s for s in recent_sells
-                            if '2sell' in s.point_type or '3sell' in s.point_type]
-            strong_sell_types = [s.point_type for s in strong_sells]
+            # 条件A: 顶背驰 + 最后笔向下 = 趋势结束
+            if has_divergence and last_is_down:
+                bearish = True
+                reason = f'top_divergence(area:{area_prev:.2f}->{area_last:.2f})+pullback'
 
-            # 5分钟最近笔低点作为参考止损
+            # 条件B: 连续2根向下笔 + 第二根更大 = 加速下跌
+            if len(strokes) >= 4:
+                last4 = strokes[-4:]
+                dn = [s for s in last4 if s.end_value < s.start_value]
+                if len(dn) >= 2:
+                    last_dn = dn[-1]
+                    prev_dn = dn[-2]
+                    # 向下笔幅度扩大
+                    last_dn_pct = abs(last_dn.end_value - last_dn.start_value) / last_dn.start_value
+                    prev_dn_pct = abs(prev_dn.end_value - prev_dn.start_value) / prev_dn.start_value
+                    if last_dn_pct > prev_dn_pct * 1.5 and last_is_down:
+                        bearish = True
+                        reason = f'accelerating_downtrend({prev_dn_pct:.1f}%->{last_dn_pct:.1f}%)'
+
+            # 5分钟最后笔低点作为参考止损
             stop_5min = 0.0
             for s in reversed(strokes):
-                if s.end_value < s.start_value:  # 向下笔
+                if s.end_value < s.start_value:
                     stop_5min = float(df['low'].iloc[s.end_index])
                     break
 
+            # 看涨信号: 最近有向上笔突破 + 无背驰
+            has_bullish = not has_divergence and not last_is_down
+
             return {
-                'pass': len(strong_sells) == 0,
-                'has_sell': len(strong_sells) > 0,
-                'sell_types': strong_sell_types,
-                'has_buy': len(recent_buys) > 0,
+                'pass': not bearish,
+                'has_sell': bearish,
+                'reason': reason,
+                'sell_types': [reason] if bearish else [],
+                'has_buy': has_bullish,
                 'stop_5min': stop_5min,
             }
 
@@ -416,18 +462,28 @@ class V3a30MinStrategy:
         # === 动态置信度计算 ===
         conf = 0.5  # 基础分
 
-        # 1. MACD强度 (+0.15)
+        # 1. MACD状态 (+0.20) — 奖励提前量(绿柱缩短), 不奖励追涨(红柱扩大)
         latest_macd = macd.get_latest()
         if latest_macd:
-            if latest_macd.macd > latest_macd.signal:
-                conf += 0.05  # DIF>DEA
             hist = latest_macd.histogram
-            if hist > 0:
-                conf += 0.05  # 红柱
             hist_series = macd.get_histogram_series()
-            if hist > 0 and len(hist_series) >= 2:
-                if hist_series.iloc[-1] > hist_series.iloc[-2]:
-                    conf += 0.05  # 红柱扩大
+            dif_val = latest_macd.macd  # DIF
+
+            # DIF上穿零轴 = 趋势由空转多, 强确认 (+0.10)
+            dif_series = macd.get_dif_series()
+            if len(dif_series) >= 2:
+                dif_now = float(dif_series.iloc[-1])
+                dif_prev = float(dif_series.iloc[-2])
+                if dif_prev <= 0 and dif_now > 0:
+                    conf += 0.10  # DIF刚上零轴
+
+            # 绿柱缩短 = 下行动能衰竭, 最佳提前入场信号 (+0.10)
+            if hist < 0 and len(hist_series) >= 2:
+                if float(hist_series.iloc[-1]) > float(hist_series.iloc[-2]):
+                    conf += 0.10  # 绿柱缩短
+            elif hist >= 0:
+                # 已转红柱(金叉已发生), 信号确认但偏追涨 (+0.05)
+                conf += 0.05
 
         # 2. 量价配合 (+0.15)
         vol_s = analysis.get('volume_series')
