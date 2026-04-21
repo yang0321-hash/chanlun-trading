@@ -78,6 +78,7 @@ class CommitteeContext:
     sector_map: Dict[str, str] = field(default_factory=dict)
     portfolio_state: Dict[str, Any] = field(default_factory=dict)
     chanlun: Optional[ChanlunInfo] = None  # 缠论结构信息
+    market: Optional[Any] = None  # MarketContext — 大盘环境
 
 
 @dataclass
@@ -448,6 +449,15 @@ class BullAnalyst:
                 confidence = confidence * 0.7 + advanced_score * 0.3
 
         confidence = max(0.1, min(0.95, confidence))
+
+        # 大盘环境调整
+        if ctx.market:
+            if ctx.market.regime == 'weak':
+                confidence *= 0.85
+                key_points.append('大盘弱势降权')
+            elif ctx.market.regime == 'strong' and ctx.market.index_phase == '上涨趋势':
+                confidence = min(0.95, confidence * 1.05)
+
         reasoning = ' | '.join(reasoning_parts) if reasoning_parts else '无明显看多信号'
 
         return AgentArgument(
@@ -676,6 +686,13 @@ class BearAnalyst:
             confidence += 0.1
 
         confidence = max(0.1, min(0.95, confidence))
+
+        # 大盘高位时额外加风险分
+        if ctx.market and ctx.market.risk_premium > 0:
+            extra = 0.1 * ctx.market.risk_premium
+            confidence = min(0.95, confidence + extra)
+            key_points.append(f'大盘风险溢价{ctx.market.risk_premium:+.2f}')
+
         reasoning = ' | '.join(reasoning_parts) if reasoning_parts else '无明显风险信号'
 
         return AgentArgument(
@@ -1070,8 +1087,8 @@ class RiskManager:
         stop_loss = self._calc_stop_loss(df, ctx)
         take_profit = self._calc_take_profit(df, ctx, stop_loss)
 
-        # 计算仓位
-        capital = portfolio.get('capital', 1000000)
+        # 计算仓位 — 用可用现金而非初始资金
+        capital = portfolio.get('available_cash', portfolio.get('capital', 1000000))
         max_positions = portfolio.get('max_positions', 10)
         shares, position_pct = calc_position_size(
             capital, ctx.entry_price, stop_loss,
@@ -1203,12 +1220,25 @@ class FundManager:
         sector_arg: AgentArgument,
         risk: RiskAssessment,
         weights: Dict[str, float] = None,
+        news_arg: 'AgentArgument' = None,
+        debate_adjustment: 'DebateAdjustment' = None,
     ) -> Dict:
         """做出最终投资决策"""
         from agents.scoring import calc_composite_score, make_decision
 
         # 获取情绪评分
         sentiment_raw = sentiment_arg.data_references.get('sentiment_raw', 0)
+
+        # 提取新闻和辩论评分
+        news_score = 0.0
+        if news_arg:
+            news_score = news_arg.data_references.get('news_sentiment_raw', 0.0)
+
+        debate_adj = 0.0
+        debate_summary = ''
+        if debate_adjustment:
+            debate_adj = debate_adjustment.score_adjustment
+            debate_summary = debate_adjustment.debate_summary
 
         # 计算综合评分
         composite = calc_composite_score(
@@ -1219,7 +1249,19 @@ class FundManager:
             scanner_score=ctx.scanner_score,
             risk_score=risk.risk_score,
             weights=weights,
+            news_score=news_score,
+            debate_adjustment=debate_adj,
         )
+
+        # 大盘环境调整
+        if ctx.market:
+            from agents.scoring import apply_market_adjustment
+            composite, adjusted_risk = apply_market_adjustment(
+                composite, risk.risk_score,
+                ctx.market.risk_premium, ctx.market.position_adjust,
+            )
+            risk.risk_score = adjusted_risk
+            risk.position_pct *= ctx.market.position_adjust
 
         # 统计同行业持仓
         positions = ctx.portfolio_state.get('positions', [])
@@ -1247,18 +1289,22 @@ class FundManager:
             key_factors.extend(sector_arg.key_points[:1])
         if sentiment_arg.key_points:
             key_factors.extend(sentiment_arg.key_points[:1])
+        if news_arg and news_arg.key_points:
+            key_factors.extend(news_arg.key_points[:1])
         key_factors = key_factors[:5]
 
         # 生成摘要
         decision_cn = {'buy': '买入', 'hold': '观望', 'reject': '否决'}
+        news_str = f' | 新闻{news_score:+.2f}' if news_arg and news_arg.confidence > 0 else ''
+        debate_str = f' | 辩论{debate_adj:+.3f}' if debate_adjustment else ''
         summary = (
             f"[{decision_cn.get(decision, decision)}] {ctx.symbol} {ctx.name} "
             f"| 综合{composite:.0f}分 | 多{bull_arg.confidence:.0%} vs 空{bear_arg.confidence:.0%} "
             f"| 情绪{sentiment_raw:+.2f} | 行业{sector_arg.confidence:.0%} "
-            f"| 风险{risk.risk_level}"
+            f"| 风险{risk.risk_level}{news_str}{debate_str}"
         )
 
-        return {
+        result = {
             'symbol': ctx.symbol,
             'name': ctx.name,
             'sector': ctx.sector,
@@ -1280,6 +1326,15 @@ class FundManager:
             'debate_summary': summary,
             'warnings': risk.warnings,
         }
+
+        if news_arg:
+            result['news_sentiment'] = float(news_score)
+            result['news_source'] = news_arg.data_references.get('source', 'none')
+        if debate_adjustment:
+            result['debate_adjustment'] = float(debate_adj)
+            result['debate_detail'] = debate_summary
+
+        return result
 
     def _run_filter_chain(self, ctx: CommitteeContext, risk: RiskAssessment) -> Dict:
         """运行过滤器链作为最终把关"""

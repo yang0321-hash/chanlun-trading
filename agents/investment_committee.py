@@ -26,17 +26,40 @@ from agents.committee_agents import (
     analyze_chanlun_structure,
 )
 
+try:
+    from utils.minimax_client import analyze_with_minimax
+    MINIMAX_AVAILABLE = True
+except ImportError:
+    MINIMAX_AVAILABLE = False
+
+try:
+    from agents.market_analyzer import MarketAnalyzer, MarketContext
+    MARKET_AVAILABLE = True
+except ImportError:
+    MARKET_AVAILABLE = False
+
+try:
+    from agents.debate_mechanism import CommitteeDebateRound, DebateAdjustment
+    DEBATE_AVAILABLE = True
+except ImportError:
+    DEBATE_AVAILABLE = False
+
+try:
+    from agents.news_analyst import NewsAnalyst
+    NEWS_ANALYST_AVAILABLE = True
+except ImportError:
+    NEWS_ANALYST_AVAILABLE = False
+
 
 class InvestmentCommittee:
     """
     投资委员会 — 多Agent协作决策
 
     数据流:
-      scan_enhanced_v3 (Top N候选股)
-          ↓
+      Phase 0: MarketAnalyzer (大盘环境)
       Phase A: Bull + Bear + Sentiment + Sector (并行)
       Phase B: RiskManager (综合Phase A)
-      Phase C: FundManager (最终决策)
+      Phase C: FundManager (最终决策 + 大盘调整)
           ↓
       InvestmentCommitteeResult (JSON)
     """
@@ -54,6 +77,7 @@ class InvestmentCommittee:
         self.portfolio_state = portfolio_state
         self.sector_momentum = sector_momentum or {}
         self.config = config or {}
+        self.market_ctx: Optional['MarketContext'] = None
 
         # 初始化Agent
         self.bull = BullAnalyst()
@@ -63,10 +87,30 @@ class InvestmentCommittee:
         self.risk_mgr = RiskManager()
         self.fund_mgr = FundManager()
 
+        # 新增Agent (优雅降级)
+        self.debate = CommitteeDebateRound() if DEBATE_AVAILABLE else None
+        self.news_analyst = NewsAnalyst() if NEWS_ANALYST_AVAILABLE else None
+
+    def _init_market(self):
+        """Phase 0: 大盘多周期缠论分析"""
+        if not MARKET_AVAILABLE:
+            return
+        try:
+            ma = MarketAnalyzer()
+            self.market_ctx = ma.analyze()
+            print(f'[Market] regime={self.market_ctx.regime} '
+                  f'phase={self.market_ctx.index_phase} '
+                  f'risk={self.market_ctx.risk_premium:+.2f} '
+                  f'pos={self.market_ctx.position_adjust:.1f}')
+        except Exception as e:
+            print(f'[Market] analysis failed: {e}')
+
     def evaluate_batch(self, candidates: List[Dict]) -> List[Dict]:
         """批量评估候选股"""
-        results = []
+        # Phase 0: 大盘环境分析
+        self._init_market()
 
+        results = []
         n = len(candidates)
         for i, candidate in enumerate(candidates):
             print(f'  [{i+1}/{n}] 评估 {candidate.get("code", "?")} {candidate.get("name", "")}...', end='')
@@ -79,18 +123,57 @@ class InvestmentCommittee:
                 print(f' 评估失败: {e}')
                 results.append(self._error_result(candidate, str(e)))
 
+        # 同行业去重: 每行业最多保留2只buy(按评分降序)
+        results = self._sector_dedup(results, max_per_sector=2)
+        return results
+
+    def _sector_dedup(self, results: List[Dict], max_per_sector: int = 2) -> List[Dict]:
+        """同行业去重 — 每行业最多保留max_per_sector只buy(按评分降序)"""
+        sector_buy_count = {}
+        # 按评分降序遍历，确保高分优先保留
+        for r in sorted(results, key=lambda x: -x.get('composite_score', 0)):
+            if r.get('decision') == 'buy':
+                sector = r.get('sector', '未知')
+                sector_buy_count[sector] = sector_buy_count.get(sector, 0) + 1
+                if sector_buy_count[sector] > max_per_sector:
+                    r['decision'] = 'hold'
+                    r['position_pct'] = 0
+                    r['shares'] = 0
+                    r['warnings'].append(f'行业去重: {sector}已有{max_per_sector}只buy, 降为hold')
+
         return results
 
     def evaluate_one(self, candidate: Dict) -> Dict:
         """评估单只股票"""
+        # 如果还没做大盘分析，做一次
+        if self.market_ctx is None and MARKET_AVAILABLE:
+            self._init_market()
+
         # Step 1: 构建上下文
         ctx = self._build_context(candidate)
+        ctx.market = self.market_ctx  # 注入大盘环境
 
-        # Step 2: Phase A — 4个分析Agent (并行逻辑，顺序执行)
+        # Step 2: Phase A — 分析Agent
         bull_arg = self.bull.analyze(ctx)
         bear_arg = self.bear.analyze(ctx)
         sentiment_arg = self.sentiment.analyze(ctx)
         sector_arg = self.sector_rotation.analyze(ctx)
+
+        # Phase A+: 新闻分析 (新)
+        news_arg = None
+        if self.news_analyst:
+            try:
+                news_arg = self.news_analyst.analyze(ctx)
+            except Exception as e:
+                print(f' [新闻分析失败: {e}]')
+
+        # Phase A+: 牛熊辩论 (新)
+        debate_result = None
+        if self.debate:
+            try:
+                debate_result = self.debate.run(ctx, bull_arg, bear_arg)
+            except Exception as e:
+                print(f' [辩论失败: {e}]')
 
         # Step 3: Phase B — 风控
         risk = self.risk_mgr.evaluate(ctx, bull_arg, bear_arg, sentiment_arg, sector_arg)
@@ -99,6 +182,8 @@ class InvestmentCommittee:
         result = self.fund_mgr.decide(
             ctx, bull_arg, bear_arg, sentiment_arg, sector_arg, risk,
             weights=self.config.get('weights'),
+            news_arg=news_arg,
+            debate_adjustment=debate_result,
         )
 
         return result
@@ -217,6 +302,14 @@ class InvestmentCommittee:
 
         output = {
             'scan_time': datetime.now().strftime('%Y-%m-%d %H:%M'),
+            'market': {
+                'regime': self.market_ctx.regime if self.market_ctx else 'unknown',
+                'phase': self.market_ctx.index_phase if self.market_ctx else 'unknown',
+                'risk_premium': self.market_ctx.risk_premium if self.market_ctx else 0,
+                'position_adjust': self.market_ctx.position_adjust if self.market_ctx else 1.0,
+                'warnings': self.market_ctx.warnings if self.market_ctx else [],
+                'summary': self.market_ctx.stroke_summary if self.market_ctx else '',
+            } if self.market_ctx else {},
             'total_evaluated': len(results),
             'buy_count': buy_count,
             'hold_count': hold_count,
@@ -240,6 +333,16 @@ class InvestmentCommittee:
         print(f'\n{"="*80}')
         print(f'投资委员会评估报告 — {datetime.now().strftime("%Y-%m-%d %H:%M")}')
         print(f'{"="*80}')
+
+        # 大盘环境概览
+        if self.market_ctx:
+            mc = self.market_ctx
+            print(f'\n[大盘环境] {mc.index_phase} | regime={mc.regime} | '
+                  f'风险溢价={mc.risk_premium:+.2f} | 仓位系数={mc.position_adjust:.1f}')
+            if mc.stroke_summary:
+                print(f'  {mc.stroke_summary}')
+            for w in mc.warnings:
+                print(f'  ! {w}')
 
         buy_list = [r for r in results if r['decision'] == 'buy']
         hold_list = [r for r in results if r['decision'] == 'hold']
@@ -268,6 +371,26 @@ class InvestmentCommittee:
                 warnings = ', '.join(r.get('warnings', []))
                 print(f'  {r["symbol"]} {r["name"]} — {r["composite_score"]:.0f}分 '
                       f'({warnings})')
+
+        # MiniMax AI总结
+        if MINIMAX_AVAILABLE and buy_list:
+            self._ai_summary(buy_list)
+
+    def _ai_summary(self, buy_list: List[Dict]):
+        """用MiniMax生成买入推荐的AI总结"""
+        data_lines = []
+        for r in buy_list[:5]:
+            factors = ', '.join(r.get('key_factors', [])[:3])
+            data_lines.append(
+                f"{r['symbol']}({r['name']}): 评分{r['composite_score']:.0f}, "
+                f"仓位{r['position_pct']:.0%}, 止损{r['stop_loss']:.2f}, "
+                f"风险{r['risk_level']}, {factors}"
+            )
+        prompt = '今日买入推荐:\n' + '\n'.join(data_lines)
+        ai_text = analyze_with_minimax(prompt, task='committee')
+        if ai_text:
+            print(f'\n>>> AI分析 (MiniMax):')
+            print(f'  {ai_text}')
 
     def _error_result(self, candidate: Dict, error: str) -> Dict:
         code = candidate.get('code', '')

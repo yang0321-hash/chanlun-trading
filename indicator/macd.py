@@ -67,6 +67,7 @@ class MACD:
         self.slow_period = slow_period
         self.signal_period = signal_period
         self.values: List[MACDValue] = []
+        self._kline_offset = 0  # values[0] 对应 K线第 _kline_offset 根
         self._calculate()
 
     def _calculate(self) -> None:
@@ -89,7 +90,14 @@ class MACD:
             signalperiod=self.signal_period
         )
 
-        # 构建结果
+        # 记录offset: values[0] 对应 K线第 first_valid 根
+        first_valid = 0
+        for i in range(len(self.prices)):
+            if not pd.isna(macd[i]) and not pd.isna(signal[i]):
+                first_valid = i
+                break
+        self._kline_offset = first_valid
+
         for i, price in enumerate(self.prices):
             if not pd.isna(macd[i]) and not pd.isna(signal[i]):
                 self.values.append(MACDValue(
@@ -119,7 +127,14 @@ class MACD:
         # MACD柱线
         macd_hist = (dif - dea) * 2
 
-        # 构建结果
+        # 记录offset: values[0] 对应 K线第 first_valid 根
+        first_valid = 0
+        for i in range(len(prices)):
+            if not pd.isna(dif.iloc[i]) and not pd.isna(dea.iloc[i]):
+                first_valid = i
+                break
+        self._kline_offset = first_valid
+
         for i, price in enumerate(prices):
             if not pd.isna(dif.iloc[i]) and not pd.isna(dea.iloc[i]):
                 self.values.append(MACDValue(
@@ -130,18 +145,23 @@ class MACD:
                     price=float(price)
                 ))
 
+    def kline_to_macd_idx(self, kline_idx: int) -> int:
+        """将K线索引转换为MACD values索引"""
+        return kline_idx - self._kline_offset
+
     def get_value_at(self, index: int) -> Optional[MACDValue]:
         """
         获取指定位置的MACD值
 
         Args:
-            index: 索引位置
+            index: K线索引位置
 
         Returns:
             MACD值对象
         """
-        if 0 <= index < len(self.values):
-            return self.values[index]
+        macd_idx = index - self._kline_offset
+        if 0 <= macd_idx < len(self.values):
+            return self.values[macd_idx]
         return None
 
     def get_latest(self) -> Optional[MACDValue]:
@@ -192,28 +212,39 @@ class MACD:
         Returns:
             (是否背驰, 背驰强度)
         """
-        if end_idx >= len(self.values) or start_idx < 0:
+        # 将K线索引转换为MACD values索引
+        s = start_idx - self._kline_offset
+        e = end_idx - self._kline_offset
+        if e >= len(self.values) or s < 0 or e < 0:
             return (False, 0)
 
         if direction == 'up':
             # 顶背驰：价格新高，DIF不新高 + 红柱面积减少
-            price_high = max(self.values[i].price for i in range(start_idx, end_idx + 1))
-            dif_high = max(self.values[i].macd for i in range(start_idx, end_idx + 1))
+            valid = self.values[s:e + 1]
+            if len(valid) < 2:
+                return (False, 0)
+            price_high = max(v.price for v in valid)
+            dif_high = max(v.macd for v in valid)
 
-            # 确定前一波区间
+            # 确定前一波区间（K线索引）
             if prev_start is not None and prev_end is not None:
                 p_start = max(0, prev_start)
-                p_end = min(len(self.values) - 1, prev_end)
+                p_end = min(len(self.values) - 1 + self._kline_offset, prev_end)
             else:
                 wave_length = end_idx - start_idx + 1
                 p_end = max(0, start_idx - 1)
                 p_start = max(0, p_end - wave_length + 1)
 
-            if p_start >= p_end or p_start < 0:
+            ps = p_start - self._kline_offset
+            pe = p_end - self._kline_offset
+            if ps >= pe or ps < 0 or pe >= len(self.values):
                 return (False, 0)
 
-            prev_price_high = max(self.values[i].price for i in range(p_start, p_end + 1))
-            prev_dif_high = max(self.values[i].macd for i in range(p_start, p_end + 1))
+            prev_valid = self.values[ps:pe + 1]
+            if len(prev_valid) < 2:
+                return (False, 0)
+            prev_price_high = max(v.price for v in prev_valid)
+            prev_dif_high = max(v.macd for v in prev_valid)
 
             # 条件1：价格创新高
             if price_high <= prev_price_high:
@@ -239,23 +270,31 @@ class MACD:
 
         else:
             # 底背驰：价格新低，DIF不新低 + 绿柱面积减少
-            price_low = min(self.values[i].price for i in range(start_idx, end_idx + 1))
-            dif_low = min(self.values[i].macd for i in range(start_idx, end_idx + 1))
+            valid = self.values[s:e + 1]
+            if len(valid) < 2:
+                return (False, 0)
+            price_low = min(v.price for v in valid)
+            dif_low = min(v.macd for v in valid)
 
-            # 确定前一波区间
+            # 确定前一波区间（K线索引）
             if prev_start is not None and prev_end is not None:
                 p_start = max(0, prev_start)
-                p_end = min(len(self.values) - 1, prev_end)
+                p_end = min(len(self.values) - 1 + self._kline_offset, prev_end)
             else:
                 wave_length = end_idx - start_idx + 1
                 p_end = max(0, start_idx - 1)
                 p_start = max(0, p_end - wave_length + 1)
 
-            if p_start >= p_end or p_start < 0:
+            ps = p_start - self._kline_offset
+            pe = p_end - self._kline_offset
+            if ps >= pe or ps < 0 or pe >= len(self.values):
                 return (False, 0)
 
-            prev_price_low = min(self.values[i].price for i in range(p_start, p_end + 1))
-            prev_dif_low = min(self.values[i].macd for i in range(p_start, p_end + 1))
+            prev_valid = self.values[ps:pe + 1]
+            if len(prev_valid) < 2:
+                return (False, 0)
+            prev_price_low = min(v.price for v in prev_valid)
+            prev_dif_low = min(v.macd for v in prev_valid)
 
             # 条件1：价格创新低
             if price_low >= prev_price_low:
@@ -293,20 +332,23 @@ class MACD:
         用于比较不同笔的MACD力度，是中枢背驰检测的基础。
 
         Args:
-            start_idx: 起始索引
-            end_idx: 结束索引
+            start_idx: K线起始索引
+            end_idx: K线结束索引
             direction: 'up'只计算红柱, 'down'只计算绿柱, 'auto'全部绝对值
 
         Returns:
             MACD柱线面积
         """
-        if start_idx < 0 or not self.values or start_idx > end_idx:
+        s = start_idx - self._kline_offset
+        e = end_idx - self._kline_offset
+        if s < 0 or not self.values or s > e:
             return 0.0
 
-        end_idx = min(end_idx, len(self.values) - 1)
+        e = min(e, len(self.values) - 1)
         area = 0.0
-        for i in range(start_idx, end_idx + 1):
-            h = self.values[i].histogram
+        for i in range(s, e + 1):
+            v = self.values[i]
+            h = v.histogram
             if direction == 'up':
                 area += max(0, h)
             elif direction == 'down':
@@ -314,6 +356,13 @@ class MACD:
             else:
                 area += abs(h)
         return area
+
+    def _find_latest_valid(self, from_end: int = 0) -> Optional[MACDValue]:
+        """从末尾往前找第N个值"""
+        idx = len(self.values) - 1 - from_end
+        if 0 <= idx < len(self.values):
+            return self.values[idx]
+        return None
 
     def check_golden_cross(self) -> bool:
         """
@@ -324,12 +373,9 @@ class MACD:
         """
         if len(self.values) < 2:
             return False
-
-        latest = self.values[-1]
         prev = self.values[-2]
-
-        return (prev.macd <= prev.signal and
-                latest.macd > latest.signal)
+        latest = self.values[-1]
+        return prev.macd <= prev.signal and latest.macd > latest.signal
 
     def check_death_cross(self) -> bool:
         """
@@ -340,12 +386,9 @@ class MACD:
         """
         if len(self.values) < 2:
             return False
-
-        latest = self.values[-1]
         prev = self.values[-2]
-
-        return (prev.macd >= prev.signal and
-                latest.macd < latest.signal)
+        latest = self.values[-1]
+        return prev.macd >= prev.signal and latest.macd < latest.signal
 
     def __len__(self) -> int:
         return len(self.values)

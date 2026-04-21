@@ -1505,7 +1505,7 @@ class BuySellPointDetector:
                     if self.macd:
                         try:
                             dif_s = self.macd.get_dif_series()
-                            idx = min(pb.end_index, len(dif_s) - 1)
+                            idx = min(pb.end_index - self.macd._kline_offset, len(dif_s) - 1)
                             if idx > 0 and dif_s.iloc[idx - 1] < 0 and dif_s.iloc[idx] >= 0:
                                 confidence += 0.05
                                 macd_info = ', MACD金叉'

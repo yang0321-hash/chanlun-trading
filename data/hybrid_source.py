@@ -42,12 +42,12 @@ class HybridSource(DataSource):
     自动根据数据类型和时间选择最优数据源。
     """
 
-    # 默认TDX路径 (优先项目内复制, Docker兼容)
+    # 默认TDX路径 (优先原始TDX vipdoc, 项目内tdx_data排后)
     DEFAULT_TDX_PATHS = [
-        r'D:\新建文件夹\claude\tdx_data',
-        r'D:\tdx_data',
         r'D:\大侠神器2.0\直接使用_大侠神器2.0.1.251231(ODM250901)\直接使用_大侠神器2.0.10B1206(260930)\new_tdx(V770)\vipdoc',
         r'D:\new_tdx\vipdoc',
+        r'D:\新建文件夹\claude\tdx_data',
+        r'D:\tdx_data',
     ]
 
     def __init__(self, tdx_path: Optional[str] = None):

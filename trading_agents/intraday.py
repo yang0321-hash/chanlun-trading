@@ -132,6 +132,7 @@ class IntradayAgent:
         self.once = once  # 单次扫描模式
         self.watchlist = []
         self.watchlist_names = {}
+        self.watchlist_sectors = {}  # code -> sector name
         self.events = []          # 盘中事件
         self.new_signals = []     # 新信号
         self._signal_dedup = {}   # {(code, type): last_push_time} 1h去重
@@ -284,7 +285,9 @@ class IntradayAgent:
                     if sector.get('phase', '') in ('启动', '加速', '高潮'):
                         for code in sector.get('stocks', [])[:20]:
                             codes.add(code)
-                            self.watchlist_names[code] = sector.get('name', '')
+                            sname = sector.get('name', '')
+                            self.watchlist_names[code] = sname
+                            self.watchlist_sectors[code] = sname
             except Exception:
                 pass
 
@@ -512,6 +515,9 @@ class IntradayAgent:
 
     def _handle_exit(self, code: str, name: str, price: float, signal):
         """处理 UnifiedExitManager 的退出信号"""
+        # 判断是否部分减仓
+        partial_ratio = getattr(signal, 'sell_ratio', None)
+
         self.events.append({
             'time': datetime.now().strftime('%H:%M'),
             'type': 'exit_signal',
@@ -520,17 +526,24 @@ class IntradayAgent:
             'price': price,
             'action': signal.action,
             'reason': signal.reason,
+            'partial': partial_ratio is not None,
             'msg': f'{code_to_prefix(code)} ({name}) {signal.action}: {signal.reason}',
         })
-        print(f'  [EXIT] {code_to_prefix(code)} ({name}) {signal.action}: {signal.reason}')
+        print(f'  [EXIT] {code_to_prefix(code)} ({name}) {signal.action}: {signal.reason}'
+              f'{" (partial " + f"{partial_ratio:.0%}" + ")" if partial_ratio else ""}')
 
         # 实际卖出
-        self.pm.sell(code)
-        if self.exit_mgr:
-            self.exit_mgr.on_sell(code)
+        if partial_ratio and partial_ratio < 1.0:
+            self.pm.partial_sell(code, ratio=partial_ratio)
+        else:
+            self.pm.sell(code)
+            if self.exit_mgr:
+                self.exit_mgr.on_sell(code)
 
+        action_cn = '部分减仓' if partial_ratio and partial_ratio < 1.0 else (
+            '紧急清仓' if signal.action == 'force_exit' else '卖出信号')
         send_notification(
-            f'{"紧急清仓" if signal.action == "force_exit" else "卖出信号"} {name}',
+            f'{action_cn} {name}',
             f'{code_to_prefix(code)} ({name})\n'
             f'价格:{price:.2f}\n'
             f'原因:{signal.reason}'
@@ -591,8 +604,10 @@ class IntradayAgent:
                           f'置信度:{signal["confidence"]:.2f}')
 
                     # 推送新信号
+                    sector_tag = self.watchlist_sectors.get(code, '')
+                    tag_str = f' [{sector_tag}]' if sector_tag else ''
                     send_notification(
-                        f'盘中信号 {code_to_prefix(code)} ({name})',
+                        f'盘中信号{tag_str} {code_to_prefix(code)} ({name})',
                         f'{signal["type"]} 价格:{signal["price"]:.2f} '
                         f'止损:{signal["stop"]:.2f} '
                         f'置信度:{signal["confidence"]:.2f}\n'

@@ -309,43 +309,6 @@ def _classify_2buy_strength(df, pair, engine):
         return 'medium'
 
 
-    # === 规则5: 强势行情不做1买抄底 ===
-    if market_regime == 'strong':
-        return []  # 强势行情中1买不可靠, 直接跳过
-
-    n = len(df)
-    if n < 120:
-        return []
-
-    close = df['close']
-    low = df['low']
-
-    bi_buy, bi_sell, filtered_fractals, strokes = engine._detect_bi_deterministic(df)
-
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    dif = ema12 - ema26
-    dea = dif.ewm(span=9, adjust=False).mean()
-    hist = 2 * (dif - dea)
-
-    buy_div_set, _, _, _ = engine._compute_area_divergence(strokes, hist, n)
-
-    results = []
-    for idx in buy_div_set:
-        if 0 <= idx < n:
-            entry_price = close.iloc[idx]
-            stop_price = low.iloc[idx] * 0.98  # 1买止损=最低点下2%
-            results.append({
-                'signal_type': '1buy',
-                'entry_price': entry_price,
-                'stop_price': stop_price,
-                'sig_idx': idx,
-                'buy_strength': 'normal',  # 1买不做三档分类
-            })
-
-    return results
-
-
 # ============================================================
 # 强三买7条件辅助检测函数
 # ============================================================
@@ -783,6 +746,26 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
         median_mom = 0
     print(f'   行业数: {len(sector_mom)}  强势行业(>中位数{median_mom:.1f}%): {len(hot_sectors)}')
 
+    # 4.5 热点板块识别 (本地TDX)
+    print('[4.5] 热点板块识别...')
+    try:
+        from data.hot_sector_analyzer import HotSectorAnalyzer
+        hsa = HotSectorAnalyzer()
+        hot_sector_list = hsa.identify_hot_sectors(top_n=10)
+        hsa.save_results(hot_sector_list)
+        hot_sector_names = {s.name for s in hot_sector_list[:5]}
+        hot_sector_stock_map = {}
+        for s in hot_sector_list[:5]:
+            for code in s.all_codes:
+                # 统一用纯数字key (000001, 600519)
+                num = code[2:] if code[:2] in ('sh', 'sz') else code
+                hot_sector_stock_map[num] = s.name
+        print(f'   TOP5热点: {", ".join(s.name + "(" + s.phase + ")" for s in hot_sector_list[:5])}')
+    except Exception as e:
+        print(f'   热点板块识别跳过: {e}')
+        hot_sector_names = set()
+        hot_sector_stock_map = {}
+
     # 5. CC15引擎 + 找所有买点(1买/2买/3买)
     print('[5] 运行CC15引擎 + 识别买点...')
     engine, daily_signals = run_daily_cc15(daily_map)
@@ -955,6 +938,13 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
         if sector in hot_sectors:
             sector_score += SECTOR_BONUS['hot']
 
+        # 热点板块加分 (TOP5热点板块的成分股)
+        is_hot_sector = False
+        code_num = code[2:] if code[:2] in ('sh', 'sz') else code
+        if code_num in hot_sector_stock_map:
+            is_hot_sector = True
+            sector_score += 8  # 热点板块成分股加分
+
         # === 买点强度加分 ===
         strength_bonus = 0
         buy_strength = item.get('buy_strength', '')
@@ -1012,6 +1002,7 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
             'name': name,
             'sector': sector,
             'sector_ret': round(sector_ret, 2),
+            'hot_sector': is_hot_sector,
             'price': price,
             'pct_chg': pct,
             'signal_type': signal_type,

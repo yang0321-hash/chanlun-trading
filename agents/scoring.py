@@ -10,13 +10,24 @@ from dataclasses import dataclass, field
 # 权重配置
 # ============================================================
 
-DEFAULT_WEIGHTS = {
+LEGACY_WEIGHTS = {
     'technical_bull': 0.20,
     'technical_bear': 0.15,
     'sentiment': 0.20,
     'sector_rotation': 0.15,
     'scanner_base': 0.15,
     'risk_adjustment': 0.15,
+}
+
+DEFAULT_WEIGHTS = {
+    'technical_bull': 0.18,
+    'technical_bear': 0.13,
+    'sentiment': 0.17,
+    'sector_rotation': 0.13,
+    'scanner_base': 0.13,
+    'risk_adjustment': 0.13,
+    'news_sentiment': 0.08,
+    'debate_adjustment': 0.05,
 }
 
 
@@ -70,6 +81,8 @@ def calc_composite_score(
     scanner_score: float,
     risk_score: float,
     weights: Optional[Dict[str, float]] = None,
+    news_score: float = 0.0,
+    debate_adjustment: float = 0.0,
 ) -> float:
     """
     计算综合评分 (0-100)
@@ -77,11 +90,12 @@ def calc_composite_score(
     公式:
         raw = W_bull * bull + W_sent * max(0,sent) + W_sector * sector
               + W_scanner * (scan/100) - W_bear * bear
+              + W_news * news - W_debate * debate_adj
         归一化到 [0, 1] 后乘 100，再乘风险调整
     """
     w = weights or DEFAULT_WEIGHTS
 
-    # 正向分 (最大约 0.30 + 0.15 + 0.15 + 0.10 = 0.70)
+    # 正向分 (最大约 0.18 + 0.17 + 0.13 + 0.13 = 0.61)
     positive = (
         w['technical_bull'] * bull_confidence
         + w['sentiment'] * max(0, sentiment_score)
@@ -89,15 +103,14 @@ def calc_composite_score(
         + w['scanner_base'] * (scanner_score / 100.0)
     )
 
-    # 负向分 (最大约 0.20)
+    # 负向分 (最大约 0.13)
     negative = w['technical_bear'] * bear_confidence
 
-    # 净得分归一化: positive 范围 [0, ~0.70], negative [0, ~0.20]
+    # 净得分归一化
     max_positive = (w['technical_bull'] + w['sentiment'] + w['sector_rotation']
                     + w['scanner_base'])
     max_negative = w['technical_bear']
 
-    # 归一化到 [0, 1]: (positive - negative) / max_possible
     raw = (positive - negative) / (max_positive - max_negative) if (max_positive - max_negative) > 0 else 0
     raw = max(0, min(1, raw))
 
@@ -105,7 +118,32 @@ def calc_composite_score(
     risk_penalty = w['risk_adjustment'] * risk_score
     composite = raw * (1.0 - risk_penalty) * 100
 
+    # 新闻情绪贡献 ([-1,+1] → [0,1])
+    news_w = w.get('news_sentiment', 0)
+    if news_w and news_score != 0:
+        news_normalized = (news_score + 1) / 2  # [0, 1]
+        composite = composite * (1 - news_w) + news_normalized * 100 * news_w
+
+    # 辩论调整 ([-0.10, +0.10] → ±5分)
+    debate_w = w.get('debate_adjustment', 0)
+    if debate_w and debate_adjustment != 0:
+        composite += debate_adjustment * 100
+
     return max(0, min(100, composite))
+
+
+def apply_market_adjustment(
+    composite_score: float,
+    risk_score: float,
+    market_risk_premium: float = 0.0,
+    position_adjust: float = 1.0,
+) -> tuple:
+    """根据大盘状态调整评分和风险"""
+    adjusted_risk = min(1.0, risk_score + market_risk_premium)
+    adjusted_composite = composite_score
+    if adjusted_risk > 0.6:
+        adjusted_composite *= (1.0 - 0.2 * (adjusted_risk - 0.6))
+    return max(0, min(100, adjusted_composite)), adjusted_risk
 
 
 def make_decision(
