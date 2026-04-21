@@ -167,6 +167,20 @@ def run_backtest(hs, codes, enable_5min=True):
             macd = MACD(close_s)
             klen = len(close_s)
 
+            # 向上笔索引映射 (用于结构追踪止损)
+            up_bi_map = {}  # {end_index: start_value}
+            for s in strokes:
+                if s.end_value > s.start_value:
+                    up_bi_map[s.end_index] = s.start_value
+
+            # 向上笔MACD面积 (用于背驰止盈)
+            up_bi_areas = {}
+            for s in strokes:
+                if s.end_value > s.start_value:
+                    area = macd.compute_area(s.start_index, s.end_index, 'up')
+                    if area > 0:
+                        up_bi_areas[s.end_index] = area
+
             v3a = None
             if enable_5min:
                 v3a = V3a30MinStrategy(V3aConfig(mode='trend', enable_5min_filter=True), hs)
@@ -184,7 +198,15 @@ def run_backtest(hs, codes, enable_5min=True):
                     held = i - position['entry_idx']
                     position['highest'] = max(position['highest'], bar_high)
 
-                    # 止损
+                    # 结构追踪止损: 向上笔完成时, 止损移到该笔起点
+                    last_trail = position.get('last_trail_bi', -1)
+                    for bi_end, bi_start_val in up_bi_map.items():
+                        if bi_end > last_trail and bi_end <= i:
+                            struct_stop = bi_start_val
+                            position['stop'] = max(position['stop'], struct_stop)
+                            position['last_trail_bi'] = bi_end
+
+                    # 固定止损
                     if bar_low <= position['stop']:
                         sell_price = max(position['stop'], bar_low)
                         pnl = (sell_price - position['entry_price']) / position['entry_price']
@@ -195,14 +217,30 @@ def run_backtest(hs, codes, enable_5min=True):
                         position = None
                         continue
 
-                    profit = (bar_close - position['entry_price']) / position['entry_price']
-                    # 追踪止损
-                    if profit > TRAIL_START:
-                        trail = position['highest'] * (1 - TRAIL_DIST)
-                        position['stop'] = max(position['stop'], trail)
+                    # MACD面积背驰止盈 (减仓50%)
+                    if position['shares'] > 0 and held >= 6:
+                        profit = (bar_close - position['entry_price']) / position['entry_price']
+                        if profit > 0.03:
+                            # 找持仓期间完成的向上笔
+                            held_bis = sorted([e for e in up_bi_areas
+                                               if position['entry_idx'] < e <= i])
+                            if len(held_bis) >= 2:
+                                last_area = up_bi_areas[held_bis[-1]]
+                                prev_area = up_bi_areas[held_bis[-2]]
+                                if prev_area > 0 and last_area < prev_area * 0.5:
+                                    # 动能衰竭, 减仓50%
+                                    half = position['shares'] // 2
+                                    if half >= 100:
+                                        sell_price = bar_close * (1 - SLIPPAGE)
+                                        pnl = (sell_price - position['entry_price']) / position['entry_price']
+                                        capital += half * sell_price * (1 - COMMISSION)
+                                        trades.append(pnl)
+                                        if pnl > 0: wins += 1
+                                        else: losses += 1
+                                        position['shares'] -= half
 
-                    # 时间止损
-                    if held >= MAX_HOLD:
+                    # 时间止损 (放宽到120根)
+                    if held >= 120:
                         sell_price = bar_close * (1 - SLIPPAGE)
                         pnl = (sell_price - position['entry_price']) / position['entry_price']
                         capital += position['shares'] * sell_price * (1 - COMMISSION)
