@@ -797,9 +797,32 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
         hot_sector_names = set()
         hot_sector_stock_map = {}
 
+    # 4.7 快速粗筛: 排除明显无买点的股票 (加速CC15)
+    print('[4.7] 快速粗筛...')
+    prefiltered_map = {}
+    for code, df in daily_map.items():
+        n = len(df)
+        if n < 120:
+            continue
+        close = df['close']
+        low = df['low']
+        high = df['high']
+        # 条件1: 最近20日不创新低 (排除持续下跌)
+        if close.iloc[-1] <= low.iloc[-20:].min():
+            continue
+        # 条件2: 最近5日至少1天收阳
+        if all(close.iloc[-i] <= df['open'].iloc[-i] for i in range(1, 6)):
+            continue
+        # 条件3: 价格在60日均线附近或上方 (排除远低于均线的)
+        ma60 = close.rolling(60).mean().iloc[-1]
+        if pd.notna(ma60) and close.iloc[-1] < ma60 * 0.85:
+            continue
+        prefiltered_map[code] = df
+    print(f'   粗筛后: {len(prefiltered_map)}/{len(daily_map)} 只')
+
     # 5. CC15引擎 + 找所有买点(1买/2买/3买)
     print('[5] 运行CC15引擎 + 识别买点...')
-    engine, daily_signals = run_daily_cc15(daily_map)
+    engine, daily_signals = run_daily_cc15(prefiltered_map)
 
     # === 规则5: 检测市场环境 ===
     market_regime = _detect_market_regime()
@@ -808,8 +831,8 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
     cutoff = datetime.now() - timedelta(days=lookback_days)
     all_signals = []  # 统一收集所有买点信号
 
-    for code in daily_map:
-        df = daily_map[code]
+    for code in prefiltered_map:
+        df = prefiltered_map[code]
 
         # --- 2买信号 ---
         pairs = find_daily_1buy_2buy(engine, code, df)
