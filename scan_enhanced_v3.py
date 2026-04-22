@@ -541,9 +541,10 @@ def _find_3buy_standalone(engine, code, df):
     if len(strokes) < 6:
         return []
 
-    # 从笔中识别中枢: 3笔重叠区间
-    pivots = []  # list of {zg, zd, start_idx, end_idx}
-    for i in range(len(strokes) - 2):
+    # 从笔中识别中枢: 3笔重叠区间 + 扩展检测
+    pivots = []  # list of {zg, zd, start_idx, end_idx, bi_count, is_expanded}
+    i = 0
+    while i <= len(strokes) - 3:
         s1, s2, s3 = strokes[i], strokes[i+1], strokes[i+2]
         # 取3笔的价格区间
         highs = []
@@ -554,12 +555,29 @@ def _find_3buy_standalone(engine, code, df):
         zg = min(highs)  # 中枢上沿 = 重叠区间的最小高点
         zd = max(lows)   # 中枢下沿 = 重叠区间的最大低点
         if zg > zd:  # 有效中枢
-            end_idx = max(s1['end_idx'], s2['end_idx'], s3['end_idx'])
+            # 扩展检测: 后续笔是否仍与[ZD,ZG]重叠
+            end_i = i + 2
+            for j in range(i + 3, len(strokes)):
+                sj_high = max(strokes[j]['start_val'], strokes[j]['end_val'])
+                sj_low = min(strokes[j]['start_val'], strokes[j]['end_val'])
+                if min(sj_high, zg) > max(sj_low, zd):  # 仍有重叠
+                    end_i = j
+                else:
+                    break
+            bi_count = end_i - i + 1
+            is_expanded = bi_count >= 6
+            end_idx = max(*[strokes[k]['end_idx'] for k in range(i, end_i + 1)])
+            start_idx = min(*[strokes[k]['start_idx'] for k in range(i, end_i + 1)])
             pivots.append({
                 'zg': zg, 'zd': zd,
-                'start_idx': min(s1['start_idx'], s2['start_idx'], s3['start_idx']),
+                'start_idx': start_idx,
                 'end_idx': end_idx,
+                'bi_count': bi_count,
+                'is_expanded': is_expanded,
             })
+            i = end_i + 1  # 跳过已处理的中枢笔
+        else:
+            i += 1
 
     if not pivots:
         return []
@@ -632,6 +650,12 @@ def _find_3buy_standalone(engine, code, df):
                         vol_ok, vol_ratio = _check_volume_pattern(
                             df, pv_end, breakout_idx, k)
 
+                        # 条件8: 实体突破 (收盘价>ZG，非影线)
+                        solid_breakout = close.iloc[j] > zg
+
+                        # 条件9: 中枢扩张 (≥6笔=震荡充分，突破更可靠)
+                        zs_expanded = pv.get('is_expanded', False)
+
                         three_buy_checks = {
                             'above_gg': above_gg,         # 条件1
                             'support': has_support,       # 条件2
@@ -640,11 +664,13 @@ def _find_3buy_standalone(engine, code, df):
                             'breakout_strong': breakout_strong,  # 条件5
                             'golden_pass': golden_pass,   # 条件6
                             'vol_pattern': vol_ok,        # 条件7
+                            'solid_breakout': solid_breakout,  # 条件8
+                            'zs_expanded': zs_expanded,   # 条件9
                         }
 
-                        # === 基于回测验证的加权评分 (5184组网格搜索最优) ===
-                        # 最优: top_micro=+2, golden_pass=-2, support=-1, 其余=0
-                        # 筛选逻辑: 顶部小中枢 + 排除回调太浅(追高)
+                        # === 基于回测验证的加权评分 + 新增三要素 ===
+                        # 原最优: top_micro=+2, golden_pass=-2, support=-1, 其余=0
+                        # 新增: solid_breakout=+1, zs_expanded=+1
                         WEIGHTS = {
                             'top_micro': 2,          # 最强正贡献 — 顶部小中枢
                             'golden_pass': -2,       # 惩罚 — 回调太浅=追高
@@ -653,6 +679,8 @@ def _find_3buy_standalone(engine, code, df):
                             'pullback_div': 0,       # 无效
                             'breakout_strong': 0,    # 无效
                             'vol_pattern': 0,        # 无效
+                            'solid_breakout': 1,     # 实体突破 — 突破有效性加分
+                            'zs_expanded': 1,        # 扩张中枢 — 震荡充分后突破更可靠
                         }
                         weighted_score = sum(
                             WEIGHTS[k] * (1 if v else 0)
@@ -680,6 +708,9 @@ def _find_3buy_standalone(engine, code, df):
                             'pivot_gg': gg,
                             'breakout_high': breakout_high,
                             'pullback_low': pullback_low,
+                            'zs_bi_count': pv.get('bi_count', 3),
+                            'zs_expanded': zs_expanded,
+                            'solid_breakout': solid_breakout,
                             'three_buy_checks': three_buy_checks,
                             'three_buy_passed': passed_count,
                             'three_buy_weighted': weighted_score,

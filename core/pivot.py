@@ -88,6 +88,11 @@ class Pivot:
         return len(self.strokes)
 
     @property
+    def is_expanded(self) -> bool:
+        """中枢是否扩张 (≥6笔)。扩张中枢代表更强震荡，后续突破更有力"""
+        return len(self.strokes) >= 6
+
+    @property
     def start_datetime(self) -> datetime:
         """起始时间"""
         if self.strokes:

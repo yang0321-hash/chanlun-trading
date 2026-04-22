@@ -427,14 +427,36 @@ class BuySellPointDetector:
             strength_label = '弱三买'
             confidence -= 0.05
 
-        # ===== 黄金分割检查 =====
+        # ===== 中枢扩张加分 (≥6笔=扩张中枢，震荡充分，后续突破更有力) =====
+        zs_expanded_info = ''
+        if last_pivot.is_expanded:
+            confidence += 0.05
+            zs_expanded_info = f', 扩张中枢({last_pivot.strokes_count}笔)'
+
+        # ===== 突破三要素评分 =====
+        # 要素1: 实体突破 (突破笔终点>ZG，非影线突破)
+        breakout_solid = last_breakout.end_value > zg
+        breakout_info = ''
+        if breakout_solid:
+            confidence += 0.03
+            breakout_info = '实体突破'
+
+        # 要素2: 突破动能 (MACD面积比作为放量代理，离开>进入=放量)
+        breakout_volume_info = ''
+        if macd_ratio > 1.0:
+            confidence += 0.04
+            breakout_volume_info = f', 放量突破(MACD={macd_ratio:.2f})'
+
+        # 要素3: 回抽不破突破点 (已在上方通过pullback>ZG确认)
+
+        # ===== 黄金分割加分 (强三买特征之一，非硬性门槛) =====
         fib_info = ''
         breakout_range = last_breakout.high - zg
         if breakout_range > 0:
             pullback_range = last_breakout.high - last_pullback.end_value
             fib_ratio = pullback_range / breakout_range
             if 0 < fib_ratio < 0.618:
-                confidence += 0.08
+                confidence += 0.06
                 fib_info = f', 黄金分割({fib_ratio:.2f}<0.618)'
 
         # 中枢背驰修正（振幅主判定）
@@ -488,6 +510,10 @@ class BuySellPointDetector:
         if macd_confirmed:
             reason_suffix += f', MACD确认({macd_ratio:.2f})'
         reason_suffix += fib_info
+        reason_suffix += zs_expanded_info
+        if breakout_info:
+            reason_suffix += f', {breakout_info}'
+        reason_suffix += breakout_volume_info
         if sub_ok:
             reason_suffix += f', {sub_desc}'
         if seg_pivot_info:
