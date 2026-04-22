@@ -922,9 +922,12 @@ class IntradayAgent:
         send_notification(f'尾盘分析 {datetime.now().strftime("%m-%d")}', report)
 
     def _detect_sell_signals(self):
-        """检测30min减仓点 — 仅检测持仓股"""
+        """检测30min减仓点 — 持仓股 + 今日出买点的个股"""
         position_codes = {pos.code for pos in self.pm.get_all_positions()}
-        for code in position_codes:
+        # 也监控今日出买点的股票 (可能快速反转需要减仓)
+        signal_codes = {s['code'] for s in self.new_signals if 'code' in s}
+        check_codes = position_codes | signal_codes
+        for code in check_codes:
             try:
                 sell_info = self._check_30min_sell(code)
                 if sell_info:
