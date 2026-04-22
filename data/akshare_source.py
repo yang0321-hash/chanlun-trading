@@ -4,6 +4,11 @@ AKShare数据源实现
 使用AKShare免费获取A股数据
 """
 
+import os
+# 清除代理，避免eastmoney请求被Clash拦截
+for _k in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy']:
+    os.environ.pop(_k, None)
+
 from typing import List, Optional
 from datetime import datetime, timedelta
 import pandas as pd

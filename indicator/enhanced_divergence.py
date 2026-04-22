@@ -7,13 +7,16 @@
 3. 隐藏背离检测：趋势延续信号
 """
 
+from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, TYPE_CHECKING
 from enum import Enum
 import numpy as np
 
 from .macd import MACD
-from core.stroke import Stroke
+
+if TYPE_CHECKING:
+    from core.stroke import Stroke
 
 
 class DivergenceType(Enum):

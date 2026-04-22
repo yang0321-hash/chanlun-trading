@@ -159,9 +159,9 @@ class TDXDataSource(DataSource):
             for i in range(num_records):
                 offset = i * record_size
                 # 解包数据
-                # 通达信格式: 8个4字节整数
+                # 通达信格式: date(I4) open(I4) high(I4) low(I4) close(I4) amount(f4) vol(I4) reserved(I4)
                 date_val, open_p, high_p, low_p, close_p, amount, vol, reserved = \
-                    struct.unpack('IIIIIIII', data[offset:offset + record_size])
+                    struct.unpack('IIIIIfII', data[offset:offset + record_size])
 
                 # 日期转换：通达信日期是整数，格式为YYYYMMDD
                 # 需要转换为可读日期
@@ -218,9 +218,9 @@ class TDXDataSource(DataSource):
             return pd.DataFrame()
 
         if market == 'SH':
-            base_path = self.sh_min5_path if os.path.exists(self.sh_min5_path) else os.path.join(self.tdx_path, "minline")
+            base_path = self.sh_min_path if os.path.exists(self.sh_min_path) else os.path.join(self.tdx_path, "minline")
         else:
-            base_path = self.sz_min5_path if os.path.exists(self.sz_min5_path) else os.path.join(self.tdx_path, "minline")
+            base_path = self.sz_min_path if os.path.exists(self.sz_min_path) else os.path.join(self.tdx_path, "minline")
 
         file_path = os.path.join(base_path, file_name)
 
@@ -242,7 +242,7 @@ class TDXDataSource(DataSource):
             for i in range(num_records):
                 offset = i * record_size
                 date_val, time_val, open_p, high_p, low_p, close_p, amount, vol, _ = \
-                    struct.unpack('IIIIIIFII', data[offset:offset + record_size])
+                    struct.unpack('IIIIIIfII', data[offset:offset + record_size])
 
                 # 日期时间转换
                 date_str = str(date_val)

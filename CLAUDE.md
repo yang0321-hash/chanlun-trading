@@ -134,15 +134,15 @@ watchlist.txt        # Watchlist for batch backtest
 - `signals/agent_log.json`: 去重日志，防止重复推送
 - `signals/positions.json`: 持仓数据 (由PositionManager自动维护)
 
-### 委员会评分权重 (已标定)
+### 委员会评分权重 (已标定 2026-04-19)
 
 ```
-technical_bull: 0.30    # 牛分析师 (缠论买点+趋势+量价)
+technical_bull: 0.20    # 牛分析师 (缠论买点+趋势+量价)
 technical_bear: 0.15    # 熊分析师 (风险+背离+高位警告)
-sentiment:      0.10    # 市场情绪 (动量+量比+分位)
-sector_rotation:0.20    # 行业轮动 (动量+成长性) ← 最被低估
-scanner_base:   0.125   # 扫描器评分
-risk_adjustment:0.125   # 风控惩罚
+sentiment:      0.20    # 市场情绪 (动量+量比+分位)
+sector_rotation:0.15    # 行业轮动 (动量+成长性)
+scanner_base:   0.15    # 扫描器评分
+risk_adjustment:0.15    # 风控惩罚
 ```
 
 **决策阈值**: buy≥70+risk≤0.6 (强买) | buy≥55+risk≤0.4 (谨慎买) | reject<30
