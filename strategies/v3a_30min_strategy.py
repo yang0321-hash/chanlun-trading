@@ -81,7 +81,7 @@ class V3aConfig:
     daily_ma_long: int = 60         # 日线长期均线
     recent_bars: int = 30           # 信号回看K线数
     min_confidence: float = 0.5     # 最低置信度
-    stroke_min_bars: int = 5        # 笔最小K线数 (匹配czsc bi)
+    stroke_min_bars: int = 3        # 笔最小K线数 (网格搜索最优: 3>4>5)
     enable_5min_filter: bool = True  # 启用5分钟级别过滤
     min_5min_bars: int = 100        # 5分钟最少K线数
     stroke_5min_min_bars: int = 3   # 5分钟笔最小K线数

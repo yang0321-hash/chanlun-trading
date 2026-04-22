@@ -63,7 +63,7 @@ MAX_HOLD = 80
 RECENT_BARS = 30
 
 
-def get_chanlun_bi(df, min_bars=5):
+def get_chanlun_bi(df, min_bars=3):
     """从30min DataFrame获取bi买点索引"""
     kline = KLine.from_dataframe(df, strict_mode=False)
     fractals = FractalDetector(kline, confirm_required=False).get_fractals()
@@ -136,7 +136,7 @@ def run_backtest(hs, codes, enable_5min=True):
             fractals = FractalDetector(kline, confirm_required=False).get_fractals()
             if len(fractals) < 6:
                 continue
-            strokes = StrokeGenerator(kline, fractals, min_bars=5).get_strokes()
+            strokes = StrokeGenerator(kline, fractals, min_bars=3).get_strokes()
             if len(strokes) < 4:
                 continue
             bi_buy = [s.end_index for s in strokes if s.end_value < s.start_value]
