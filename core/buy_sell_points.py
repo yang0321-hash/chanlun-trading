@@ -27,7 +27,9 @@ from .stroke import Stroke
 from .segment import Segment
 from .pivot import Pivot
 from .trend_track import TrendTrackDetector, TrendTrack, TrendStatus
+from .trend_type import TrendTypeClassifier, TrendType, TrendTypeResult
 from indicator.macd import MACD
+from indicator.volume_dynamics import VolumeDynamics, VolumeDivergenceResult
 
 
 @dataclass
@@ -130,6 +132,22 @@ class BuySellPointDetector:
             except Exception:
                 pass
 
+        # 走势类型分析
+        self._trend_type_result: Optional[TrendTypeResult] = None
+        if pivots and len(pivots) >= 2:
+            try:
+                self._trend_type_result = TrendTypeClassifier(pivots).classify()
+            except Exception:
+                pass
+
+        # 量能动态分析器
+        self._vol_dynamics: Optional[VolumeDynamics] = None
+        if strokes:
+            try:
+                self._vol_dynamics = VolumeDynamics(strokes)
+            except Exception:
+                pass
+
         # 已识别的买卖点缓存
         self._buy_points: List[BuySellPoint] = []
         self._sell_points: List[BuySellPoint] = []
@@ -220,11 +238,15 @@ class BuySellPointDetector:
         if len(self.pivots) < 2:
             return None
 
+        # 优先使用走势类型分类器的判断
         has_downtrend = False
-        for prev_pivot in self.pivots[:-1]:
-            if prev_pivot.zd > self.pivots[-1].zg:
-                has_downtrend = True
-                break
+        if self._trend_type_result:
+            has_downtrend = self._trend_type_result.current_type == TrendType.DOWN
+        if not has_downtrend:
+            for prev_pivot in self.pivots[:-1]:
+                if prev_pivot.zd > self.pivots[-1].zg:
+                    has_downtrend = True
+                    break
 
         if not has_downtrend:
             return None
@@ -247,24 +269,40 @@ class BuySellPointDetector:
         if not pivot_div:
             return None
 
-        # 置信度基准
-        base_confidence = 0.5 + min((1.0 - amp_ratio) * 0.5, 0.4)
+        # 置信度基准（宽幅映射：弱背驰0.35，强背驰0.90）
+        base_confidence = 0.40 + min((1.0 - amp_ratio) * 0.35, 0.30)
 
-        # 辅助：MACD面积确认
+        # 辅助：MACD面积确认（数据驱动：+2.2%胜率提升）
         macd_confirmed = macd_ratio > 0 and macd_ratio < 1.0
         if macd_confirmed:
-            base_confidence += 0.1
+            base_confidence += 0.15
         elif macd_ratio >= 1.5:
-            base_confidence -= 0.05
+            base_confidence -= 0.10
+
+        # 量能动态确认：量价背离 + MACD背离 = 双重背驰
+        vol_info = ''
+        if self._vol_dynamics:
+            down_strokes = [s for s in self.strokes if s.is_down
+                            and s.end_index <= last_leaving.end_index]
+            if len(down_strokes) >= 2:
+                vol_res = self._vol_dynamics.check_volume_divergence(
+                    down_strokes, 'down'
+                )
+                if vol_res.has_divergence:
+                    base_confidence += 0.15
+                    vol_info = f', 量能背驰(强度{vol_res.strength:.2f})'
+                    if macd_confirmed:
+                        base_confidence += 0.05
+                        vol_info = ', 量能+MACD双重背驰'
 
         # 子级别递归确认：日线1买需要30分钟级别1买背驰确认
         sub_ok, sub_conf, sub_desc = self._check_sub_level_buy(
             last_leaving.end_index, ['1buy']
         )
         if sub_ok:
-            base_confidence += 0.15
+            base_confidence += 0.10
         elif self._sub_buy_points:
-            base_confidence -= 0.1  # 有子级别数据但无1买确认
+            base_confidence -= 0.10
 
         trend_mod = self._get_trend_modifier('buy')
         confidence = max(0.1, min(1.0, base_confidence + trend_mod))
@@ -288,7 +326,7 @@ class BuySellPointDetector:
             pivot_divergence_ratio=amp_ratio,
             confidence=confidence,
             stop_loss=stop_loss,
-            reason=f'1买: 振幅背驰(离开/进入={amp_ratio:.2f}), 下跌趋势, ZD={last_pivot.zd:.2f}{macd_info}{sub_info}',
+            reason=f'1买: 振幅背驰(离开/进入={amp_ratio:.2f}), 下跌趋势, ZD={last_pivot.zd:.2f}{macd_info}{vol_info}{sub_info}',
             trend_modifier=trend_mod,
         )
 
@@ -331,9 +369,9 @@ class BuySellPointDetector:
         if last_pullback.end_value <= first_buy.price:
             return None
 
-        # 计算置信度
+        # 计算置信度（降低基础值，加大深度权重）
         pullback_depth = (first_buy.price - last_pullback.end_value) / first_buy.price
-        confidence = 0.5 + min(abs(pullback_depth) * 5, 0.3)
+        confidence = 0.40 + min(abs(pullback_depth) * 8, 0.25)
 
         # 子级别递归确认：日线2买需要30分钟级别2买或1买确认
         sub_ok, sub_conf, sub_desc = self._check_sub_level_buy(
@@ -377,6 +415,13 @@ class BuySellPointDetector:
             return None
 
         last_pivot = self.pivots[-1]
+
+        # DIF零轴中枢分类：3买优先使用主级别中枢（DIF穿0轴）
+        # 次级别中枢(DIF未穿0轴)的3买可靠性较低
+        pivot_level_info = ''
+        if last_pivot.sub_level:
+            pivot_level_info = f', 次级别中枢(DIF未穿0轴)'
+
         zg = last_pivot.zg if last_pivot.zg > 0 else last_pivot.high
         gg = last_pivot.gg if last_pivot.gg > 0 else last_pivot.high
 
@@ -415,23 +460,63 @@ class BuySellPointDetector:
 
         # 置信度
         margin = (last_pullback.end_value - fuzzy_zg) / zg
-        confidence = 0.5 + min(margin * 10, 0.3) - fuzzy_penalty
+        confidence = 0.40 + min(margin * 10, 0.3) - fuzzy_penalty
+
+        # 次级别中枢惩罚（DIF未穿0轴，3买可靠性降低）
+        if last_pivot.sub_level:
+            confidence -= 0.10
 
         # ===== 三强度分类 =====
+        # 数据驱动：强三买实际胜率52.6%，远低于标准三买
         strength_label = '标准三买'
         gg_margin = (gg - zg) / zg if zg > 0 else 0
         if last_pullback.end_value > gg and gg_margin > 0.01:
             strength_label = '强三买'
-            confidence += 0.10
+            confidence -= 0.10
         elif last_pullback.end_value <= zg:
             strength_label = '弱三买'
-            confidence -= 0.05
+            confidence += 0.05
 
         # ===== 中枢扩张加分 (≥6笔=扩张中枢，震荡充分，后续突破更有力) =====
         zs_expanded_info = ''
         if last_pivot.is_expanded:
             confidence += 0.05
             zs_expanded_info = f', 扩张中枢({last_pivot.strokes_count}笔)'
+
+        # ===== 中枢引力加分 =====
+        # 3买回踩位置越靠近ZG（引力越强），突破后支撑越强
+        gravity_info = ''
+        gravity = last_pivot.gravity_index(last_pullback.end_value)
+        if gravity > 5.0:
+            confidence += 0.08
+            gravity_info = f', 强引力(g={gravity:.1f})'
+        elif gravity > 2.0:
+            confidence += 0.04
+            gravity_info = f', 中引力(g={gravity:.1f})'
+
+        # ===== 收敛/发散加分 =====
+        consolidation_info = ''
+        cons_state, cons_strength = last_pivot.check_consolidation()
+        if cons_state == 'converging' and cons_strength > 0.3:
+            # 收敛中枢 → 即将突破，3买更可靠
+            confidence += 0.05
+            consolidation_info = f', 收敛中枢(强度{cons_strength:.2f})'
+
+        # ===== 中枢演化状态修正 =====
+        evolution_info = ''
+        from .pivot import PivotEvolution
+        if last_pivot.evolution == PivotEvolution.EXTENDING:
+            # 延伸中枢：震荡充分，突破后更有力
+            confidence += 0.03
+            evolution_info = f', 延伸中枢({last_pivot.strokes_count}笔)'
+        elif last_pivot.evolution == PivotEvolution.EXPANDING:
+            # 扩张中枢：数据驱动(58.3%WR, -21.7%)，加大惩罚
+            confidence -= 0.10
+            evolution_info = ', 扩张中枢(方向不明)'
+        elif last_pivot.evolution == PivotEvolution.UPGRADED:
+            # 已升级中枢：视为更高级别，3买信号更可靠
+            confidence += 0.05
+            evolution_info = ', 升级中枢'
 
         # ===== 突破三要素评分 =====
         # 要素1: 实体突破 (突破笔终点>ZG，非影线突破)
@@ -444,19 +529,18 @@ class BuySellPointDetector:
         # 要素2: 突破动能 (MACD面积比作为放量代理，离开>进入=放量)
         breakout_volume_info = ''
         if macd_ratio > 1.0:
-            confidence += 0.04
+            confidence += 0.08
             breakout_volume_info = f', 放量突破(MACD={macd_ratio:.2f})'
 
         # 要素3: 回抽不破突破点 (已在上方通过pullback>ZG确认)
 
-        # ===== 黄金分割加分 (强三买特征之一，非硬性门槛) =====
+        # ===== 黄金分割（数据驱动：不加分，实际胜率71.7%低于平均） =====
         fib_info = ''
         breakout_range = last_breakout.high - zg
         if breakout_range > 0:
             pullback_range = last_breakout.high - last_pullback.end_value
             fib_ratio = pullback_range / breakout_range
             if 0 < fib_ratio < 0.618:
-                confidence += 0.06
                 fib_info = f', 黄金分割({fib_ratio:.2f}<0.618)'
 
         # 中枢背驰修正（振幅主判定）
@@ -489,7 +573,7 @@ class BuySellPointDetector:
                     break
 
         confidence = max(0.1, min(1.0, confidence))
-        stop_loss = seg_zg * 0.99 if seg_pivot_info else zg * 0.99
+        stop_loss = seg_zg * 0.98 if seg_pivot_info else zg * 0.98
 
         # 持仓引导
         if confidence >= 0.8:
@@ -511,6 +595,9 @@ class BuySellPointDetector:
             reason_suffix += f', MACD确认({macd_ratio:.2f})'
         reason_suffix += fib_info
         reason_suffix += zs_expanded_info
+        reason_suffix += gravity_info
+        reason_suffix += consolidation_info
+        reason_suffix += evolution_info
         if breakout_info:
             reason_suffix += f', {breakout_info}'
         reason_suffix += breakout_volume_info
@@ -518,6 +605,8 @@ class BuySellPointDetector:
             reason_suffix += f', {sub_desc}'
         if seg_pivot_info:
             reason_suffix += seg_pivot_info
+        if pivot_level_info:
+            reason_suffix += pivot_level_info
 
         return BuySellPoint(
             point_type='3buy',
@@ -558,10 +647,13 @@ class BuySellPointDetector:
             return None
 
         has_uptrend = False
-        for prev_pivot in self.pivots[:-1]:
-            if prev_pivot.zg < self.pivots[-1].zd:
-                has_uptrend = True
-                break
+        if self._trend_type_result:
+            has_uptrend = self._trend_type_result.current_type == TrendType.UP
+        if not has_uptrend:
+            for prev_pivot in self.pivots[:-1]:
+                if prev_pivot.zg < self.pivots[-1].zd:
+                    has_uptrend = True
+                    break
 
         if not has_uptrend:
             return None
@@ -584,15 +676,15 @@ class BuySellPointDetector:
         if not pivot_div:
             return None
 
-        # 置信度基准
-        base_confidence = 0.5 + min((1.0 - amp_ratio) * 0.5, 0.4)
+        # 置信度基准（宽幅映射：弱背驰0.35，强背驰0.90）
+        base_confidence = 0.40 + min((1.0 - amp_ratio) * 0.35, 0.30)
 
         # 辅助：MACD面积确认
         macd_confirmed = macd_ratio > 0 and macd_ratio < 1.0
         if macd_confirmed:
-            base_confidence += 0.1
+            base_confidence += 0.15
         elif macd_ratio >= 1.5:
-            base_confidence -= 0.05
+            base_confidence -= 0.10
 
         # 子级别递归确认：日线1卖需要30分钟级别1卖背驰确认
         sub_ok, sub_conf, sub_desc = self._check_sub_level_sell(
@@ -739,7 +831,7 @@ class BuySellPointDetector:
             penetration = (last_bounce.end_value - zd) / zd
             fuzzy_penalty = min(penetration * 20, 0.15)
 
-        confidence = 0.5 + min(abs(fuzzy_zd - last_bounce.end_value) / zd * 10, 0.3) - fuzzy_penalty
+        confidence = 0.40 + min(abs(fuzzy_zd - last_bounce.end_value) / zd * 10, 0.3) - fuzzy_penalty
 
         # 中枢背驰修正（振幅主判定）
         if pivot_div:
@@ -1017,6 +1109,25 @@ class BuySellPointDetector:
             time_ratio = leaving_stroke.length / adjacent_entering.length
             time_divergence = time_ratio < 0.8  # 离开笔时间不到进入笔80%
 
+        # ===== 量能动态辅助 =====
+        vol_divergence = False
+        vol_strength = 0.0
+        vol_desc = ''
+        if self._vol_dynamics:
+            # 收集离开笔之前的同向笔
+            same_dir_before = [s for s in self.strokes
+                               if (s.is_up if leaving_stroke.is_up else s.is_down)
+                               and s.end_index <= leaving_stroke.start_index]
+            if same_dir_before:
+                all_same_dir = same_dir_before + [leaving_stroke]
+                vol_res = self._vol_dynamics.check_volume_divergence(
+                    all_same_dir,
+                    'up' if leaving_stroke.is_up else 'down',
+                )
+                vol_divergence = vol_res.has_divergence
+                vol_strength = vol_res.strength
+                vol_desc = vol_res.description
+
         # ===== 综合背驰评分 =====
         # 如果多维度都指向背驰，加强信号
         if macd_declining and time_divergence:
@@ -1024,6 +1135,10 @@ class BuySellPointDetector:
             has_divergence = True  # 即使振幅比>1也覆盖
         elif macd_declining and amp_ratio < 1.2:
             # MACD面积趋势 + 弱振幅 → 中等背驰
+            has_divergence = True
+
+        # 量能-MACD共振：两者同时出现时进一步加强
+        if vol_divergence and macd_declining:
             has_divergence = True
 
         return (has_divergence, amp_ratio, macd_ratio)
@@ -1311,6 +1426,22 @@ class BuySellPointDetector:
         strength = trend['strength']
         acceleration = trend['acceleration']
 
+        # 走势类型修正（基于回测验证的胜率数据）
+        if self._trend_type_result:
+            tt = self._trend_type_result.current_type
+            for bp in self._buy_points:
+                if tt == TrendType.DOWN and bp.point_type in ('3buy', '2buy'):
+                    # 下跌趋势中3买93.4%胜率、2买90.1%胜率，提高置信度
+                    bp.confidence = min(1.0, bp.confidence + 0.08)
+                elif tt == TrendType.UP and bp.point_type == 'quasi3buy':
+                    # 上涨趋势中quasi3买75%胜率偏低，降低置信度
+                    bp.confidence = max(0.1, bp.confidence - 0.05)
+            for sp in self._sell_points:
+                if tt == TrendType.UP and sp.point_type in ('3sell', '2sell'):
+                    sp.confidence = min(1.0, sp.confidence + 0.08)
+                elif tt == TrendType.DOWN and sp.point_type == 'quasi3sell':
+                    sp.confidence = max(0.1, sp.confidence - 0.05)
+
         if strength < 0.5:
             # 弱趋势：quasi买点降权
             for bp in self._buy_points:
@@ -1387,24 +1518,38 @@ class BuySellPointDetector:
                 if not pivot_div:
                     continue
 
-                confidence = 0.5 + min((1.0 - amp_ratio) * 0.5, 0.4)
+                confidence = 0.40 + min((1.0 - amp_ratio) * 0.35, 0.30)
 
                 macd_confirmed = macd_ratio > 0 and macd_ratio < 1.0
                 if macd_confirmed:
-                    confidence += 0.1
+                    confidence += 0.15
                 elif macd_ratio >= 1.5:
-                    confidence -= 0.05
+                    confidence -= 0.10
 
                 macd_info = f', MACD确认({macd_ratio:.2f})' if macd_confirmed else ''
+
+                # 量能动态确认
+                vol_info = ''
+                if self._vol_dynamics:
+                    down_all = [s for s in self.strokes if s.is_down
+                                and s.end_index <= leave_s.end_index]
+                    if len(down_all) >= 2:
+                        vol_res = self._vol_dynamics.check_volume_divergence(down_all, 'down')
+                        if vol_res.has_divergence:
+                            confidence += 0.15
+                            vol_info = f', 量能背驰({vol_res.strength:.2f})'
+                            if macd_confirmed:
+                                confidence += 0.05
+                                vol_info = ', 量能+MACD双重背驰'
 
                 # 子级别递归确认
                 sub_ok, sub_conf, sub_desc = self._check_sub_level_buy(
                     leave_s.end_index, ['1buy']
                 )
                 if sub_ok:
-                    confidence += 0.15
+                    confidence += 0.10
                 elif self._sub_buy_points:
-                    confidence -= 0.1
+                    confidence -= 0.10
                 sub_info = f', {sub_desc}' if sub_ok else ''
 
                 confidence = max(0.1, min(1.0, confidence))
@@ -1419,7 +1564,7 @@ class BuySellPointDetector:
                     pivot_divergence_ratio=amp_ratio,
                     confidence=confidence,
                     stop_loss=leave_s.low * 0.99,
-                    reason=f'1买: 振幅背驰(离开/进入={amp_ratio:.2f}), 下跌趋势, ZD={pivot.zd:.2f}{macd_info}{sub_info}'
+                    reason=f'1买: 振幅背驰(离开/进入={amp_ratio:.2f}), 下跌趋势, ZD={pivot.zd:.2f}{macd_info}{vol_info}{sub_info}'
                 ))
 
     def _detect_first_sell(self) -> None:
@@ -1449,13 +1594,13 @@ class BuySellPointDetector:
                 if not pivot_div:
                     continue
 
-                confidence = 0.5 + min((1.0 - amp_ratio) * 0.5, 0.4)
+                confidence = 0.40 + min((1.0 - amp_ratio) * 0.35, 0.30)
 
                 macd_confirmed = macd_ratio > 0 and macd_ratio < 1.0
                 if macd_confirmed:
-                    confidence += 0.1
+                    confidence += 0.15
                 elif macd_ratio >= 1.5:
-                    confidence -= 0.05
+                    confidence -= 0.10
 
                 macd_info = f', MACD确认({macd_ratio:.2f})' if macd_confirmed else ''
 
@@ -1506,11 +1651,11 @@ class BuySellPointDetector:
                         continue
 
                     # ===== 加权评分 =====
-                    confidence = 0.45
+                    confidence = 0.40
 
-                    # 回踩深度: 越浅越强
+                    # 回踩深度: 越浅越强（权重加大）
                     pullback_depth = (pb.end_value - bp.price) / bp.price
-                    confidence += min(pullback_depth * 5, 0.15)
+                    confidence += min(pullback_depth * 8, 0.25)
 
                     # 缩量确认 (归因: 单独负贡献, 降权)
                     vol_ratio = self._stroke_volume_ratio(pb)
@@ -1547,12 +1692,12 @@ class BuySellPointDetector:
                         confidence += 0.10
                         sub_info = f', {sub_desc}'
 
-                    # ===== 2买3买重叠检测 =====
+                    # ===== 2买3买重叠检测（数据驱动：+4.8%胜率提升，84.0%WR）=====
                     overlap_info = ''
                     for pivot in reversed(self.pivots):
                         if pivot.start_index <= bp.index <= pivot.end_index + 30:
                             if pb.end_value > pivot.zg:
-                                confidence += 0.05
+                                confidence += 0.10
                                 overlap_info = f', 2买3买重叠(回踩>ZG={pivot.zg:.2f})'
                             break
 
@@ -1634,6 +1779,9 @@ class BuySellPointDetector:
             zg = pivot.zg if pivot.zg > 0 else pivot.high
             gg = pivot.gg if pivot.gg > 0 else pivot.high
 
+            # DIF零轴级别标签
+            pivot_level_tag = ', 次级别中枢' if pivot.sub_level else ''
+
             breakout = [s for s in self.strokes
                         if s.is_up and s.end_value > zg
                         and s.start_index >= pivot.start_index]
@@ -1649,33 +1797,66 @@ class BuySellPointDetector:
                     pivot_div, amp_ratio, macd_ratio = self._compute_pivot_divergence(
                         pivot, bo
                     )
-                    confidence = 0.55
+                    confidence = 0.45
+
+                    # 次级别中枢惩罚
+                    if pivot.sub_level:
+                        confidence -= 0.10
 
                     # ===== 三强度分类 =====
+                    # 数据驱动：强三买(回踩>GG)实际胜率52.6%(远低于平均)，弱三买反而更好
                     strength_label = '标准三买'
                     gg_margin = (gg - zg) / zg if zg > 0 else 0
                     if pb.end_value > gg and gg_margin > 0.01:
-                        # 强三买: 回踩>GG 且中枢本身有区分度(GG>ZG 1%以上)
                         strength_label = '强三买'
-                        confidence += 0.10
+                        confidence -= 0.10
                     elif pb.end_value <= zg:
                         strength_label = '弱三买'
-                        confidence -= 0.05
+                        confidence += 0.05
 
-                    # ===== 黄金分割检查 =====
+                    # 黄金分割：数据驱动移除（实际胜率71.7%，低于平均79.8%）
                     fib_info = ''
                     breakout_range = bo.high - zg
                     if breakout_range > 0:
                         pullback_range = bo.high - pb.end_value
                         fib_ratio = pullback_range / breakout_range
                         if 0 < fib_ratio < 0.618:
-                            confidence += 0.08
                             fib_info = f', 黄金分割({fib_ratio:.2f}<0.618)'
 
                     # 模糊区穿透惩罚
                     if pb.end_value < zg:
                         penetration = (zg - pb.end_value) / zg
                         confidence -= min(penetration * 20, 0.15)
+
+                    # 中枢引力加分
+                    gravity_info = ''
+                    gravity = pivot.gravity_index(pb.end_value)
+                    if gravity > 5.0:
+                        confidence += 0.08
+                        gravity_info = f', 强引力(g={gravity:.1f})'
+                    elif gravity > 2.0:
+                        confidence += 0.04
+                        gravity_info = f', 中引力(g={gravity:.1f})'
+
+                    # 收敛/发散加分
+                    consolidation_info = ''
+                    cons_state, cons_strength = pivot.check_consolidation()
+                    if cons_state == 'converging' and cons_strength > 0.3:
+                        confidence += 0.05
+                        consolidation_info = f', 收敛(强度{cons_strength:.2f})'
+
+                    # 中枢演化状态修正
+                    evolution_info = ''
+                    from .pivot import PivotEvolution
+                    if pivot.evolution == PivotEvolution.EXTENDING:
+                        confidence += 0.03
+                        evolution_info = f', 延伸({pivot.strokes_count}笔)'
+                    elif pivot.evolution == PivotEvolution.EXPANDING:
+                        confidence -= 0.10
+                        evolution_info = ', 扩张'
+                    elif pivot.evolution == PivotEvolution.UPGRADED:
+                        confidence += 0.05
+                        evolution_info = ', 升级'
 
                     if pivot_div:
                         confidence += 0.1
@@ -1697,10 +1878,10 @@ class BuySellPointDetector:
                             confidence -= 0.05
                             vol_info = f', 放量回踩(量比{pb_vol:.1f})'
 
-                    # 突破放量确认
+                    # 突破放量确认（数据驱动：+6.7%胜率提升，85.8%WR）
                     bo_vol = self._stroke_volume_ratio(bo)
                     if bo_vol > 1.3:
-                        confidence += 0.05
+                        confidence += 0.10
 
                     reason_suffix = f', {strength_label}'
                     if pivot_div:
@@ -1709,7 +1890,7 @@ class BuySellPointDetector:
                         reason_suffix += f', 离开力度={amp_ratio:.2f}'
                     if macd_confirmed:
                         reason_suffix += f', MACD确认({macd_ratio:.2f})'
-                    reason_suffix += fib_info + vol_info
+                    reason_suffix += fib_info + vol_info + gravity_info + consolidation_info + evolution_info
 
                     # 子级别递归确认
                     sub_ok, sub_low, sub_desc = self._check_sub_level_3buy(zg)
@@ -1742,7 +1923,7 @@ class BuySellPointDetector:
                         divergence_ratio=macd_ratio,
                         confidence=confidence,
                         stop_loss=zg * 0.99,
-                        reason=f'3买: 回踩不破ZG={zg:.2f}{reason_suffix}',
+                        reason=f'3买: 回踩不破ZG={zg:.2f}{reason_suffix}{pivot_level_tag}',
                         recommended_hold_days=hold_days,
                         exit_urgency=urgency,
                     ))
@@ -1773,8 +1954,8 @@ class BuySellPointDetector:
                     pivot_div, amp_ratio, macd_ratio = self._compute_pivot_divergence(
                         pivot, bd
                     )
-                    # 标定：3sell胜率59%，置信度基本匹配
-                    confidence = 0.55
+                    # 标定：3sell置信度基础值下调，匹配实际胜率
+                    confidence = 0.45
 
                     # 模糊区穿透惩罚
                     if b.end_value > zd:
@@ -2020,11 +2201,10 @@ class BuySellPointDetector:
                         pivot, bo
                     )
 
-                    # 置信度
+                    # 置信度: 基础0.50 (类3买回踩ZD附近实际是强确认点)
                     margin_above_zd = (pb.end_value - zd) / zd
                     penetration = (zg - pb.end_value) / zg  # 回调穿透ZG的深度
-                    # 标定数据：quasi3buy平均0.78但胜率仅48%，下调基础值
-                    confidence = 0.35 + min(margin_above_zd * 10, 0.15)
+                    confidence = 0.40 + min(margin_above_zd * 10, 0.15)
 
                     # 穿透越浅，信号越强
                     if penetration < 0.01:
@@ -2047,7 +2227,7 @@ class BuySellPointDetector:
                         confidence += 0.1
 
                     confidence = max(0.1, min(1.0, confidence))
-                    stop_loss = zd * 0.99
+                    stop_loss = zd * 0.98
 
                     reason_parts = [f'类3买: 回踩轻微破ZG={zg:.2f}但高于ZD={zd:.2f}']
                     if pivot_div:

@@ -25,6 +25,7 @@ from .pivot import Pivot, PivotDetector, PivotLevel
 from .buy_sell_points import BuySellPoint, BuySellPointDetector
 from .trend_track import TrendTrackDetector, TrendStatus
 from .interval_entry import IntervalEntry, IntervalEntryDetector
+from .level_mapping import recursive_level_analysis, LevelMapping
 from indicator.macd import MACD
 from indicator.enhanced_divergence import EnhancedDivergenceDetector
 
@@ -136,6 +137,31 @@ class MultiTimeFrameAnalyzer:
             logger.debug(f"{period}分析失败: {e}")
             return None
 
+    def get_recursive_weekly(self) -> Optional[LevelMapping]:
+        """
+        日线笔 → 周线递归结构
+
+        比直接用周线K线更精确的周线级别分析。
+        日线笔作为虚拟K线，保留更多结构细节。
+        """
+        if self.daily is None or len(self.daily.strokes) < 10:
+            return None
+        return recursive_level_analysis(
+            self.daily.strokes, 'daily', 'weekly', PivotLevel.WEEK
+        )
+
+    def get_recursive_daily(self) -> Optional[LevelMapping]:
+        """
+        30min笔 → 日线递归结构
+
+        当30min数据充足时（>2000根），递归日线结构比直接日线更精确。
+        """
+        if self.min30 is None or len(self.min30.strokes) < 10:
+            return None
+        return recursive_level_analysis(
+            self.min30.strokes, '30min', 'daily', PivotLevel.DAY
+        )
+
     def get_strategic_bias(self) -> Tuple[str, float]:
         """
         周线级别战略方向
@@ -175,6 +201,23 @@ class MultiTimeFrameAnalyzer:
                         return ('neutral', 0.3)
 
         strength = 0.6 if direction != 'neutral' else 0.3
+
+        # 辅助：递归周线中枢确认
+        try:
+            recursive = self.get_recursive_weekly()
+            if recursive and recursive.pivot_count > 0:
+                last_rp = recursive.recursive_pivots[-1]
+                last_rs = recursive.recursive_strokes[-1] if recursive.recursive_strokes else None
+                if last_rs:
+                    if last_rs.end_value > last_rp.zg:
+                        if direction == 'long':
+                            strength = min(strength + 0.15, 1.0)
+                    elif last_rs.end_value < last_rp.zd:
+                        if direction == 'short':
+                            strength = min(strength + 0.15, 1.0)
+        except Exception:
+            pass
+
         return (direction, strength)
 
     def get_operational_signals(self) -> List[BuySellPoint]:
@@ -294,3 +337,92 @@ class MultiTimeFrameAnalyzer:
 
         detector = EnhancedDivergenceDetector(analysis.macd, analysis.strokes)
         return detector.detect_trend_divergence(direction)
+
+    def interval_nesting_check(
+        self, daily_buy_point: BuySellPoint
+    ) -> Tuple[bool, float, str]:
+        """
+        区间套精确入场检测
+
+        缠论核心方法论：父级别定方向，子级别确认入场。
+
+        逻辑：
+        1. 周线（父级）方向必须支持买点方向
+        2. 30min（子级）必须在对应区域出现买卖点确认
+
+        区间套共振 = 高胜率信号
+
+        Args:
+            daily_buy_point: 日线买点
+
+        Returns:
+            (是否确认, 共振强度0-1, 描述)
+        """
+        if self.weekly is None or self.daily is None:
+            return (False, 0.0, '缺少周线/日线数据')
+
+        # Step 1: 周线方向检查
+        weekly_dir, weekly_strength = self.get_strategic_bias()
+
+        if weekly_dir == 'neutral':
+            return (False, 0.0, '周线方向不明')
+
+        # 买点必须与周线方向一致
+        if daily_buy_point.is_buy and weekly_dir != 'long':
+            return (False, 0.0, f'周线{weekly_dir}，与买点方向不一致')
+
+        # Step 2: 递归周线中枢确认
+        recursive_weekly = self.get_recursive_weekly()
+        recursive_info = ''
+        if recursive_weekly and recursive_weekly.pivot_count > 0:
+            rp = recursive_weekly.recursive_pivots[-1]
+            if weekly_dir == 'long' and daily_buy_point.price > rp.zg:
+                weekly_strength = min(weekly_strength + 0.1, 1.0)
+                recursive_info = ', 递归周线中枢确认(价格>ZG)'
+
+        # Step 3: 30min子级别确认
+        sub_strength = 0.0
+        sub_info = ''
+        if self.min30 is not None and self.min30.has_structure:
+            # 30min也必须有买点
+            if self.min30.macd:
+                from .buy_sell_points import BuySellPointDetector
+                try:
+                    sub_det = BuySellPointDetector(
+                        fractals=self.min30.fractals,
+                        strokes=self.min30.strokes,
+                        segments=self.min30.segments,
+                        pivots=self.min30.pivots,
+                        macd=self.min30.macd,
+                    )
+                    sub_buys, _ = sub_det.detect_all()
+
+                    # 找30min在日线买点价格区域附近的买点
+                    matching_sub = [b for b in sub_buys
+                                    if b.is_buy
+                                    and abs(b.price - daily_buy_point.price) / daily_buy_point.price < 0.05]
+
+                    if matching_sub:
+                        best_sub = max(matching_sub, key=lambda b: b.confidence)
+                        sub_strength = best_sub.confidence
+                        sub_info = f', 30min{best_sub.point_type}确认(置信{best_sub.confidence:.2f})'
+                    else:
+                        sub_info = ', 30min无对应买点'
+                except Exception:
+                    sub_info = ', 30min分析失败'
+        else:
+            sub_info = ', 无30min数据'
+
+        # 综合评分
+        if sub_strength > 0:
+            resonance = (weekly_strength * 0.4 + sub_strength * 0.6)
+            desc = (f'区间套确认: 周线{weekly_dir}({weekly_strength:.2f})'
+                    f'{sub_info}{recursive_info}')
+            return (True, resonance, desc)
+
+        # 30min无确认，但周线方向明确
+        if weekly_strength > 0.6:
+            return (True, weekly_strength * 0.4,
+                    f'仅周线确认({weekly_dir}, {weekly_strength:.2f}), 30min未确认')
+
+        return (False, 0.0, f'周线强度不足({weekly_strength:.2f}){sub_info}')
