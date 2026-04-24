@@ -954,12 +954,31 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
         ma60 = close.rolling(60).mean().iloc[-1]
         if pd.notna(ma60) and close.iloc[-1] < ma60 * 0.85:
             continue
+        # 条件4: MA20在MA60附近或上方 (中期趋势非空头)
+        if n >= 60:
+            ma20 = close.rolling(20).mean().iloc[-1]
+            if pd.notna(ma60) and pd.notna(ma20) and ma20 < ma60 * 0.92:
+                continue
+        # 条件5: MACD至少DIF不深度死叉 (DIF > -历史波动率的20%)
+        if n >= 35:
+            ema12 = close.ewm(span=12, adjust=False).mean()
+            ema26 = close.ewm(span=26, adjust=False).mean()
+            dif = ema12 - ema26
+            if dif.iloc[-1] < dif.iloc[-60:].min() * 0.5:
+                continue
         prefiltered_map[code] = df
     print(f'   粗筛后: {len(prefiltered_map)}/{len(daily_map)} 只')
 
-    # 5. CC15引擎 + 找所有买点(1买/2买/3买)
-    print('[5] 运行CC15引擎 + 识别买点...')
-    engine, daily_signals = run_daily_cc15(prefiltered_map)
+    # 5. 缠论分析 + 找所有买点(1买/2买/3买)
+    # 直接创建引擎, 跳过CC15的动态池/动量排名/组合管理 (扫描不需要回测管道)
+    print('[5] 缠论分析 + 识别买点...')
+    t_scan_start = time.time()
+    sys.path.insert(0, 'chanlun_unified')
+    from signal_engine_cc15 import SignalEngine
+    engine = SignalEngine()
+    engine.dynamic_pool_enabled = False
+    engine.momentum_factor_enabled = False
+    engine.vol_regime_enabled = False
 
     # === 规则5: 检测市场环境 ===
     market_regime = _detect_market_regime()
@@ -1026,7 +1045,9 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
     for s in all_signals:
         t = s.get('signal_type', '?')
         type_counts[t] = type_counts.get(t, 0) + 1
-    print(f'   最近{lookback_days}天信号: {dict(type_counts)} 共{len(all_signals)}个')
+    t_scan = time.time() - t_scan_start
+    print(f'   最近{lookback_days}天信号: {dict(type_counts)} 共{len(all_signals)}个 '
+          f'({t_scan:.1f}s, {len(prefiltered_map)}只)')
 
     if not all_signals:
         print('无近期买点信号')
