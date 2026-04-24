@@ -1,0 +1,10 @@
+{
+    "enabled": true,
+    "mode": "score",
+    "main_theme_phases": ["启动", "加速"],
+    "active_phases": ["高潮", "震荡"],
+    "fading_phases": ["退潮"],
+    "score_tier1": 20,
+    "score_tier2": 10,
+    "score_tier3": 0
+}

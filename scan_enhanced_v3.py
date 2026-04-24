@@ -25,6 +25,8 @@ from backtest_cc15_mtf import (
     fetch_sina_30min,
 )
 
+from core.trend_type import classify_trend_type, TrendType
+
 
 # 成长性行业优先列表（基于回测验证的高胜率行业）
 GROWTH_SECTORS = {
@@ -37,9 +39,113 @@ GROWTH_SECTORS = {
 # 行业评分加成
 SECTOR_BONUS = {
     'growth': 15,    # 成长性行业加15分
-    'hot': 10,       # 行业动量强势加10分
-    'normal': 0,     # 普通行业
 }
+
+
+# ==================== 主线赛道过滤 ====================
+
+from dataclasses import dataclass
+
+@dataclass
+class MainThemeConfig:
+    """主线赛道过滤配置"""
+    enabled: bool = True
+    main_theme_phases: tuple = ('启动', '加速')
+    active_phases: tuple = ('高潮', '震荡')
+    fading_phases: tuple = ('退潮',)
+    max_active_stocks: int = 100
+    max_discovery_stocks: int = 50
+    fallback_to_all: bool = True
+
+
+def _load_main_theme_config() -> MainThemeConfig:
+    path = 'chanlun_system/main_theme_config.json'
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            valid = {k: v for k, v in data.items()
+                     if k in MainThemeConfig.__dataclass_fields__}
+            return MainThemeConfig(**valid)
+        except Exception:
+            pass
+    return MainThemeConfig()
+
+
+def classify_sector_tier(sector_name: str, hot_sector_list: list,
+                         sector_mom: dict, config: MainThemeConfig,
+                         pool_main_sectors: list = None,
+                         pool_disaster_sectors: list = None) -> int:
+    """板块三级分类: 1=主线 2=活跃 3=非活跃"""
+    # 重灾区一票否决
+    if pool_disaster_sectors and sector_name in pool_disaster_sectors:
+        return 3
+
+    # HotSectorAnalyzer阶段判定
+    sector_info = None
+    for hs in hot_sector_list:
+        if hs.name == sector_name:
+            sector_info = hs
+            break
+
+    if sector_info is None:
+        # 不在HotSector列表中，检查板块扫描器是否标记为主线
+        if pool_main_sectors and sector_name in pool_main_sectors:
+            return 1
+        mom = sector_mom.get(sector_name, 0)
+        return 2 if mom > 0 else 3
+
+    if sector_info.phase in config.main_theme_phases:
+        return 1
+    elif sector_info.phase in config.active_phases:
+        return 2
+    elif sector_info.phase in config.fading_phases:
+        return 3
+    else:
+        if pool_main_sectors and sector_name in pool_main_sectors:
+            return 1
+        mom = sector_mom.get(sector_name, 0)
+        return 2 if mom > 3 else 3
+
+
+def compute_sector_tiers(daily_map: dict, sector_map: dict,
+                         hot_sector_list: list, sector_mom: dict,
+                         config: MainThemeConfig,
+                         pool_main_sectors: list = None,
+                         pool_disaster_sectors: list = None) -> dict:
+    """计算所有股票的tier评分（纯评分，不过滤）
+
+    Returns:
+        {code: tier} 映射，tier 1/2/3 用于后续评分加成
+    """
+    tier_map = {}
+    tier_counts = {1: 0, 2: 0, 3: 0}
+    growth_promoted = 0
+
+    for code in daily_map:
+        sector = sector_map.get(code, '')
+        if not sector or sector == '未知':
+            tier_map[code] = 3
+            tier_counts[3] += 1
+            continue
+        tier = classify_sector_tier(sector, hot_sector_list, sector_mom, config,
+                                    pool_main_sectors, pool_disaster_sectors)
+        if tier > 2 and sector in GROWTH_SECTORS:
+            tier = 2
+            growth_promoted += 1
+        tier_map[code] = tier
+        tier_counts[tier] += 1
+
+    t1, t2, t3 = tier_counts[1], tier_counts[2], tier_counts[3]
+    print(f'   [赛道评分] Tier1(主线)={t1} Tier2(活跃)={t2} Tier3(其他)={t3} '
+          f'成长保护={growth_promoted}')
+
+    main_names = [hs.name for hs in hot_sector_list
+                  if hs.phase in config.main_theme_phases]
+    if main_names:
+        print(f'   [主线赛道] {", ".join(main_names)}')
+
+    return tier_map
 
 
 def load_sector_map():
@@ -720,6 +826,13 @@ def _find_3buy_standalone(engine, code, df):
                         break  # 每个中枢只取第一个3买
                 break  # 每个中枢只看一次突破
 
+    # 走势类型分类 — 附加到每个3买信号
+    if pivots:
+        trend_result = classify_trend_type(pivots)
+        for r in results:
+            r['trend_type'] = trend_result.current_type.value
+            r['trend_strength'] = round(trend_result.trend_strength, 3)
+
     return results
 
 
@@ -796,6 +909,30 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
         print(f'   热点板块识别跳过: {e}')
         hot_sector_names = set()
         hot_sector_stock_map = {}
+        hot_sector_list = []
+
+    # 4.55 读取今日板块候选池扫描结果 (补充主线来源)
+    sector_pool_data = {}
+    sector_pool_path = f'signals/sector_pool_{datetime.now().strftime("%Y-%m-%d")}.json'
+    if os.path.exists(sector_pool_path):
+        try:
+            with open(sector_pool_path, 'r', encoding='utf-8') as f:
+                sector_pool_data = json.load(f)
+            pool_main = sector_pool_data.get('main_sectors', [])
+            if pool_main:
+                print(f'   板块扫描器主线: {", ".join(pool_main[:5])}')
+        except Exception:
+            pass
+
+    # 4.6 主线赛道评分 (纯评分，不过滤)
+    mt_config = _load_main_theme_config()
+    print('[4.6] 主线赛道评分...')
+    _pool_main = sector_pool_data.get('main_sectors', [])
+    _pool_disaster = list(sector_pool_data.get('disaster_sectors', {}).keys())
+    tier_map = compute_sector_tiers(
+        daily_map, sector_map, hot_sector_list, sector_mom, mt_config,
+        pool_main_sectors=_pool_main,
+        pool_disaster_sectors=_pool_disaster)
 
     # 4.7 快速粗筛: 排除明显无买点的股票 (加速CC15)
     print('[4.7] 快速粗筛...')
@@ -985,19 +1122,17 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
         # === 综合评分 ===
         tech_score = score_technical(df, entry_price, stop_price, rr_ratio)
 
-        # 行业加分: 成长性行业 + 动量强势
+        # 行业加分: 成长性 + 主线赛道层级
         sector_score = 0
         if sector in GROWTH_SECTORS:
             sector_score += SECTOR_BONUS['growth']
-        if sector in hot_sectors:
-            sector_score += SECTOR_BONUS['hot']
+        tier = tier_map.get(code, 3)
+        if tier == 1:
+            sector_score += 20
+        elif tier == 2:
+            sector_score += 10
 
-        # 热点板块加分 (TOP5热点板块的成分股)
-        is_hot_sector = False
-        code_num = code[2:] if code[:2] in ('sh', 'sz') else code
-        if code_num in hot_sector_stock_map:
-            is_hot_sector = True
-            sector_score += 8  # 热点板块成分股加分
+        is_hot_sector = tier == 1
 
         # === 买点强度加分 ===
         strength_bonus = 0
@@ -1049,13 +1184,32 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
         else:
             weekly_trend_str = '盘整'
 
-        total_score = tech_score + sector_score + strength_bonus + weekly_penalty
+        # === 走势类型加分 (基于回测验证的胜率数据) ===
+        # 3买: 上涨89.8%胜率 / 下跌93.4%胜率
+        # 2买: 上涨93.3%胜率 / 下跌90.1%胜率
+        # quasi3买: 上涨75.0%胜率 / 下跌88.9%胜率
+        trend_type_val = item.get('trend_type', '')
+        trend_str_val = item.get('trend_strength', 0)
+        trend_bonus = 0
+        trend_label = ''
+        if trend_type_val == 'up':
+            trend_bonus = 8   # 顺势加分
+        elif trend_type_val == 'down':
+            if signal_type in ('3buy', '2buy'):
+                trend_bonus = 12  # 下跌趋势中3买/2买胜率最高(93.4%/90.1%)
+            else:
+                trend_bonus = 5
+        elif trend_type_val == 'consolidation':
+            trend_bonus = 3
+
+        total_score = tech_score + sector_score + strength_bonus + weekly_penalty + trend_bonus
 
         results.append({
             'code': code,
             'name': name,
             'sector': sector,
             'sector_ret': round(sector_ret, 2),
+            'sector_tier': tier,
             'hot_sector': is_hot_sector,
             'price': price,
             'pct_chg': pct,
@@ -1077,6 +1231,8 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
             'weekly_rise_pct': item.get('weekly_rise_pct', 0),
             'three_buy_checks': item.get('three_buy_checks', {}),
             'three_buy_passed': item.get('three_buy_passed', 0),
+            'trend_type': trend_type_val,
+            'trend_strength': trend_str_val,
         })
 
         time.sleep(0.1)
@@ -1089,20 +1245,24 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
     print(f'扫描完成 ({elapsed:.0f}s) — {len(results)} 只候选股, 显示Top {top_n}')
     print(f'{"="*90}')
 
-    print(f'\n{"排名":<4} {"代码":<8} {"名称":<8} {"类型":<5} {"强度":<6} {"行业":<8} {"行业涨幅":>7} '
+    print(f'\n{"排名":<4} {"层级":<6} {"代码":<8} {"名称":<8} {"类型":<5} {"强度":<6} {"行业":<8} {"行业涨幅":>7} '
           f'{"现价":>8} {"入场价":>8} {"R/R":>5} {"评分":>4} {"周线涨幅":>7} {"周线":<10} {"信号日":<12}')
     print('-' * 120)
 
     strength_cn = {'strong': '强', 'standard': '标准', 'weak': '弱', '': ''}
+    tier_labels = {1: '[主线]', 2: '[活跃]', 3: '[发现]'}
+    trend_labels_map = {'up': '[up]', 'down': '[dn]', 'consolidation': '[==]', '': ''}
     for i, r in enumerate(results[:top_n]):
         st = strength_cn.get(r.get('buy_strength', ''), '')
         if r.get('golden_ratio_pass'):
             st += '★'  # 黄金分割加分标记
-        print(f'{i+1:<4} {r["code"]:<8} {r["name"]:<8} {r.get("signal_type","2buy"):<5} '
+        tl = tier_labels.get(r.get('sector_tier', 2), '')
+        t_lbl = trend_labels_map.get(r.get('trend_type', ''), '')
+        print(f'{i+1:<4} {tl:<6} {r["code"]:<8} {r["name"]:<8} {r.get("signal_type","2buy"):<5} '
               f'{st:<6} '
               f'{r["sector"]:<8} '
               f'{r["sector_ret"]:>+6.1f}% {r["price"]:>8.2f} {r["entry_price"]:>8.2f} '
-              f'{r["risk_reward"]:>5.1f} {r["total_score"]:>4} {r.get("weekly_rise_pct",0):>6.1f}% {r["weekly_trend"]:<10} {r["2buy_date"]:<12}')
+              f'{r["risk_reward"]:>5.1f} {r["total_score"]:>4} {r.get("weekly_rise_pct",0):>6.1f}% {r["weekly_trend"]:<10} {t_lbl} {r["2buy_date"]:<12}')
 
     # 保存
     output_file = f'signals/scan_enhanced_{datetime.now().strftime("%Y%m%d_%H%M")}.json'
