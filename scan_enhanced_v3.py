@@ -1055,31 +1055,92 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
 
     # 6. 30min确认 + 评分
     print('[6] 30分钟确认 + 综合评分...')
+    t_30min_start = time.time()
     results = []
     scanned = set()
 
+    # 6a. 周线过滤 (本地TDX, 快速)
+    print('   [6a] 周线过滤...')
+    weekly_passed = []
     for item in all_signals:
         code = item['code']
         if code in scanned:
             continue
         scanned.add(code)
-
-        # === 规则4: 周线定方向过滤 ===
         weekly_trend, weekly_score, weekly_rise_pct = _detect_weekly_trend(code, hs)
         item['weekly_rise_pct'] = round(weekly_rise_pct, 1)
-
-        # === 30分钟策略: 周线涨幅硬过滤 ===
-        # 周线从低点涨幅不足20% → 跳过 (回测验证: 20%阈值最优)
         if weekly_rise_pct < 20.0:
             continue
-
         if weekly_trend == 'bear':
-            # 周线空头不做多 → 降级但不过滤(保留记录)
             item['weekly_veto'] = True
         else:
             item['weekly_veto'] = False
+        item['weekly_trend'] = weekly_trend
+        item['weekly_score'] = weekly_score
+        weekly_passed.append(item)
+    print(f'   周线过滤: {len(weekly_passed)}/{len(scanned)} 通过 (涨幅>=20%)')
 
-        df_30 = fetch_sina_30min(code)
+    if not weekly_passed:
+        print('   无股票通过周线过滤')
+        return []
+
+    # 6b. 并发获取30min数据 (8线程)
+    print(f'   [6b] 并发获取30min数据 ({len(weekly_passed)}只)...')
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    data_30m = {}
+    def _fetch_30min_one(code):
+        try:
+            df = fetch_sina_30min(code)
+            return (code, df)
+        except Exception:
+            return (code, pd.DataFrame())
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_fetch_30min_one, item['code']): item['code']
+                   for item in weekly_passed}
+        done_count = 0
+        for f in as_completed(futures):
+            code, df = f.result()
+            data_30m[code] = df
+            done_count += 1
+            if done_count % 50 == 0:
+                print(f'     30min: {done_count}/{len(weekly_passed)}', flush=True)
+
+    valid_30m = sum(1 for df in data_30m.values() if len(df) >= 100)
+    print(f'   30min获取完成: {valid_30m}/{len(weekly_passed)} 有效')
+
+    # 6c. 批量获取实时报价
+    print('   [6c] 批量获取实时报价...')
+    quote_codes = []
+    for item in weekly_passed:
+        code = item['code']
+        pure = code
+        if not pure.endswith('.SZ') and not pure.endswith('.SH'):
+            pure = code + ('.SH' if code[0] in ('6', '9') else '.SZ')
+        quote_codes.append(pure)
+
+    quote_map = {}
+    try:
+        batch_size = 200
+        for i in range(0, len(quote_codes), batch_size):
+            batch = quote_codes[i:i+batch_size]
+            q = hs.get_realtime_quote(batch)
+            if len(q) > 0:
+                for _, row in q.iterrows():
+                    c = row.get('code', '')
+                    # 去掉.SH/.SZ后缀匹配
+                    pure = c.replace('.SH', '').replace('.SZ', '')
+                    quote_map[pure] = row
+    except Exception:
+        pass
+    print(f'   实时报价: {len(quote_map)}/{len(weekly_passed)} 获取成功')
+
+    # 6d. 30min分析 + 评分 (纯计算, 无网络)
+    print('   [6d] 30min分析 + 评分...')
+    for item in weekly_passed:
+        code = item['code']
+        df_30 = data_30m.get(code, pd.DataFrame())
         if len(df_30) < 100:
             continue
 
@@ -1090,22 +1151,16 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
         strokes_30 = detect_strokes_30min(df_30)
         pivots_30 = detect_pivot_30min(strokes_30)
 
-        # 获取最新价格
-        try:
-            pure = code
-            if not pure.endswith('.SZ') and not pure.endswith('.SH'):
-                if pure.startswith(('6', '9')):
-                    pure = pure + '.SH'
-                else:
-                    pure = pure + '.SZ'
-            q = hs.get_realtime_quote([pure])
-            if len(q) > 0:
-                name = q.iloc[0].get('name', code)
-                price = float(q.iloc[0].get('price', 0))
-                pct = float(q.iloc[0].get('pct_chg', 0))
-            else:
-                name, price, pct = code, 0, 0
-        except Exception:
+        # 获取报价
+        pure = code
+        if not pure.endswith('.SZ') and not pure.endswith('.SH'):
+            pure = code + ('.SH' if code[0] in ('6', '9') else '.SZ')
+        q_row = quote_map.get(code, None)
+        if q_row is not None:
+            name = q_row.get('name', code)
+            price = float(q_row.get('price', 0))
+            pct = float(q_row.get('pct_chg', 0))
+        else:
             name, price, pct = code, 0, 0
 
         # 行业信息
@@ -1194,6 +1249,8 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
             strength_bonus += 8   # 3买回撤未破0.618
 
         # === 周线方向过滤 ===
+        weekly_trend = item.get('weekly_trend', 'range')
+        weekly_score = item.get('weekly_score', 0)
         weekly_penalty = 0
         weekly_trend_str = '未知'
         if item.get('weekly_veto'):
@@ -1256,14 +1313,14 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
             'trend_strength': trend_str_val,
         })
 
-        time.sleep(0.1)
-
     # 7. 排序输出
+    t_30min = time.time() - t_30min_start
     elapsed = time.time() - t0
     results.sort(key=lambda x: x['total_score'], reverse=True)
 
     print(f'\n{"="*90}')
     print(f'扫描完成 ({elapsed:.0f}s) — {len(results)} 只候选股, 显示Top {top_n}')
+    print(f'  Step5缠论: {t_scan:.0f}s | Step6确认+评分: {t_30min:.0f}s')
     print(f'{"="*90}')
 
     print(f'\n{"排名":<4} {"层级":<6} {"代码":<8} {"名称":<8} {"类型":<5} {"强度":<6} {"行业":<8} {"行业涨幅":>7} '
