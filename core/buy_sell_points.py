@@ -167,7 +167,10 @@ class BuySellPointDetector:
         self._detect_second_buy()
         self._detect_second_sell()
         self._detect_third_buy()
+        self._detect_third_buy_pivot_based()
         self._detect_third_sell()
+        self._detect_third_sell_pivot_based()
+        self._dedup_pivot_based_3points()
         self._detect_quasi_second_buy()
         self._detect_quasi_second_sell()
         self._detect_quasi_third_buy()
@@ -190,6 +193,7 @@ class BuySellPointDetector:
             self._check_first_buy(),
             self._check_second_buy(),
             self._check_third_buy(),
+            self._check_third_buy_pivot_single(),
             self._check_quasi_second_buy(),
             self._check_quasi_third_buy(),
         ]
@@ -204,6 +208,7 @@ class BuySellPointDetector:
             self._check_first_sell(),
             self._check_second_sell(),
             self._check_third_sell(),
+            self._check_third_sell_pivot_single(),
             self._check_quasi_second_sell(),
             self._check_quasi_third_sell(),
         ]
@@ -1931,6 +1936,237 @@ class BuySellPointDetector:
                 if pullback:
                     break
 
+    def _detect_third_buy_pivot_based(self) -> None:
+        """
+        第二中枢法检测3买
+
+        缠论结构：a + A + b + B + c
+        三买本质 = 第二中枢B形成在第一中枢A上方，即 B.ZD > A.ZG
+
+        不找回调笔，而是检测脱离P1后是否形成了新的重叠中枢P2。
+        比回调法更可靠（需要完整3笔重叠确认），但检测时机更晚。
+        """
+        if len(self.pivots) < 2:
+            return
+
+        for i in range(len(self.pivots) - 1):
+            p1 = self.pivots[i]
+            p2 = self.pivots[i + 1]
+
+            p1_zg = p1.zg if p1.zg > 0 else p1.high
+            p1_zd = p1.zd if p1.zd > 0 else p1.low
+            p2_zg = p2.zg if p2.zg > 0 else p2.high
+            p2_zd = p2.zd if p2.zd > 0 else p2.low
+
+            # 核心：P2下沿 > P1上沿
+            if p2_zd <= p1_zg:
+                continue
+
+            # P2必须在P1之后（P2的结束在P1之后即可，中枢间可有部分重叠）
+            if p2.end_index <= p1.start_index:
+                continue
+
+            # 检查P1和P2之间是否存在离开段（至少1笔从P1区域到P2区域）
+            leaving = [s for s in self.strokes
+                       if s.is_up
+                       and s.start_index >= p1.start_index
+                       and s.start_index <= p1.end_index + 5
+                       and s.end_value > p1_zg]
+            if not leaving:
+                continue
+
+            # ===== 置信度评估 =====
+            gap = (p2_zd - p1_zg) / p1_zg
+            confidence = 0.50 + min(gap * 15, 0.25)
+
+            # P2质量：笔数越多（震荡充分）越可靠
+            p2_strokes_count = getattr(p2, 'strokes_count', len(p2.strokes) if p2.strokes else 3)
+            if p2_strokes_count >= 5:
+                confidence += 0.05
+                quality_info = f', P2延伸({p2_strokes_count}笔)'
+            elif p2_strokes_count >= 9:
+                confidence += 0.03
+                quality_info = f', P2升级({p2_strokes_count}笔)'
+            else:
+                quality_info = f', P2标准({p2_strokes_count}笔)'
+
+            # P1演化状态
+            from .pivot import PivotEvolution
+            evo_info = ''
+            if p1.evolution == PivotEvolution.EXTENDING:
+                confidence += 0.03
+                evo_info = f', P1延伸({getattr(p1, "strokes_count", "?")}笔)'
+            elif p1.evolution == PivotEvolution.EXPANDING:
+                confidence -= 0.05
+                evo_info = ', P1扩张'
+            elif p1.evolution == PivotEvolution.UPGRADED:
+                confidence += 0.05
+                evo_info = ', P1升级'
+
+            # 次级别中枢惩罚
+            sub_level_info = ''
+            if p1.sub_level:
+                confidence -= 0.08
+                sub_level_info = ', P1次级别'
+            if p2.sub_level:
+                confidence -= 0.05
+                sub_level_info += ', P2次级别'
+
+            # 离开段力度
+            best_leaving = leaving[-1]
+            pivot_div, amp_ratio, macd_ratio = self._compute_pivot_divergence(p1, best_leaving)
+            amp_info = ''
+            if pivot_div:
+                confidence += 0.10
+                amp_info = f', 离开背驰({amp_ratio:.2f})'
+            elif amp_ratio > 0:
+                amp_info = f', 离开力度={amp_ratio:.2f}'
+
+            macd_info = ''
+            if macd_ratio > 0 and macd_ratio < 1.0:
+                confidence += 0.05
+                macd_info = f', MACD确认({macd_ratio:.2f})'
+
+            # 子级别递归确认
+            sub_ok, sub_low, sub_desc = self._check_sub_level_3buy(p1_zg)
+            sub_info = ''
+            if sub_ok:
+                confidence += 0.10
+                sub_info = f', {sub_desc}'
+            elif self._sub_strokes:
+                confidence -= 0.05
+
+            # 中枢引力
+            gravity_info = ''
+            gravity = p1.gravity_index(p2_zd)
+            if gravity > 5.0:
+                confidence += 0.08
+                gravity_info = f', 强引力(g={gravity:.1f})'
+            elif gravity > 2.0:
+                confidence += 0.04
+                gravity_info = f', 中引力(g={gravity:.1f})'
+
+            confidence = max(0.1, min(1.0, confidence))
+
+            # 止损 = P2.ZD * 0.98（第二中枢下沿）
+            stop_loss = p2_zd * 0.98
+
+            # 3买价格 = P2内最后一笔向下笔的终点（回调低点，真正的买入位）
+            down_in_p2 = [s for s in (p2.strokes or []) if s.is_down]
+            if down_in_p2:
+                buy_price = down_in_p2[-1].end_value
+                buy_index = down_in_p2[-1].end_index
+            else:
+                buy_price = p2_zd
+                buy_index = p2.end_index
+
+            # 持仓引导
+            if confidence >= 0.8:
+                hold_days = 25
+            elif confidence >= 0.65:
+                hold_days = 15
+            else:
+                hold_days = 8
+
+            margin = (p2_zd - p1_zg) / p1_zg
+            urgency = 0.2 if margin < 0.03 else 0.0
+
+            self._buy_points.append(BuySellPoint(
+                point_type='3buy',
+                price=buy_price,
+                index=buy_index,
+                related_pivot=p2,
+                related_strokes=p2.strokes[:3] if p2.strokes else [],
+                pivot_divergence_ratio=amp_ratio,
+                divergence_ratio=macd_ratio,
+                confidence=confidence,
+                stop_loss=stop_loss,
+                reason=f'3买[中枢法]: P2.ZD={p2_zd:.2f}>P1.ZG={p1_zg:.2f}, gap={gap:.2%}'
+                       f'{amp_info}{macd_info}{quality_info}{evo_info}'
+                       f'{sub_level_info}{gravity_info}{sub_info}',
+                recommended_hold_days=hold_days,
+                exit_urgency=urgency,
+            ))
+
+    def _detect_third_sell_pivot_based(self) -> None:
+        """
+        第二中枢法检测3卖（P2在P1下方：P2.ZG < P1.ZD）
+        """
+        if len(self.pivots) < 2:
+            return
+
+        for i in range(len(self.pivots) - 1):
+            p1 = self.pivots[i]
+            p2 = self.pivots[i + 1]
+
+            p1_zd = p1.zd if p1.zd > 0 else p1.low
+            p2_zg = p2.zg if p2.zg > 0 else p2.high
+
+            # 核心：P2上沿 < P1下沿
+            if p2_zg >= p1_zd:
+                continue
+
+            if p2.end_index <= p1.start_index:
+                continue
+
+            leaving = [s for s in self.strokes
+                       if s.is_down
+                       and s.start_index >= p1.start_index
+                       and s.start_index <= p1.end_index + 5
+                       and s.end_value < p1_zd]
+            if not leaving:
+                continue
+
+            gap = (p1_zd - p2_zg) / p1_zd
+            confidence = 0.50 + min(gap * 15, 0.25)
+
+            p2_strokes_count = getattr(p2, 'strokes_count', len(p2.strokes) if p2.strokes else 3)
+            if p2_strokes_count >= 5:
+                confidence += 0.05
+
+            from .pivot import PivotEvolution
+            if p1.evolution == PivotEvolution.EXTENDING:
+                confidence += 0.03
+            elif p1.evolution == PivotEvolution.EXPANDING:
+                confidence -= 0.05
+
+            best_leaving = leaving[-1]
+            pivot_div, amp_ratio, macd_ratio = self._compute_pivot_divergence(p1, best_leaving)
+            if pivot_div:
+                confidence += 0.10
+            if macd_ratio > 0 and macd_ratio < 1.0:
+                confidence += 0.05
+
+            sub_ok, _, sub_desc = self._check_sub_level_3sell(p1_zd)
+            if sub_ok:
+                confidence += 0.10
+            elif self._sub_strokes:
+                confidence -= 0.05
+
+            confidence = max(0.1, min(1.0, confidence))
+            stop_loss = p2_zg * 1.02
+
+            up_in_p2 = [s for s in (p2.strokes or []) if s.is_up]
+            if up_in_p2:
+                sell_price = up_in_p2[-1].end_value
+                sell_index = up_in_p2[-1].end_index
+            else:
+                sell_price = p2_zg
+                sell_index = p2.end_index
+
+            self._sell_points.append(BuySellPoint(
+                point_type='3sell',
+                price=sell_price,
+                index=sell_index,
+                related_pivot=p2,
+                related_strokes=p2.strokes[:3] if p2.strokes else [],
+                pivot_divergence_ratio=amp_ratio,
+                divergence_ratio=macd_ratio,
+                confidence=confidence,
+                stop_loss=stop_loss,
+                reason=f'3卖[中枢法]: P2.ZG={p2_zg:.2f}<P1.ZD={p1_zd:.2f}, gap={gap:.2%}',
+            ))
+
     def _detect_third_sell(self) -> None:
         """批量检测所有3卖点（振幅背驰主判定 + MACD辅助 + ZD判定 + 子级别确认）"""
         if not self.pivots:
@@ -2140,6 +2376,164 @@ class BuySellPointDetector:
                 ))
 
         return results
+
+    # ==================== 中枢法单次检测（detect_latest用） ====================
+
+    def _check_third_buy_pivot_single(self) -> Optional[BuySellPoint]:
+        """中枢法单次3买检测，返回最近的1个"""
+        if len(self.pivots) < 2:
+            return None
+
+        p1 = self.pivots[-2]
+        p2 = self.pivots[-1]
+
+        p1_zg = p1.zg if p1.zg > 0 else p1.high
+        p2_zd = p2.zd if p2.zd > 0 else p2.low
+
+        if p2_zd <= p1_zg or p2.start_index <= p1.end_index:
+            return None
+
+        leaving = [s for s in self.strokes
+                   if s.is_up
+                   and s.start_index >= p1.start_index
+                   and s.start_index <= p1.end_index + 5
+                   and s.end_value > p1_zg]
+        if not leaving:
+            return None
+
+        gap = (p2_zd - p1_zg) / p1_zg
+        confidence = 0.50 + min(gap * 15, 0.25)
+
+        from .pivot import PivotEvolution
+        if p1.evolution == PivotEvolution.EXTENDING:
+            confidence += 0.03
+        elif p1.evolution == PivotEvolution.EXPANDING:
+            confidence -= 0.05
+
+        best_leaving = leaving[-1]
+        pivot_div, amp_ratio, macd_ratio = self._compute_pivot_divergence(p1, best_leaving)
+        if pivot_div:
+            confidence += 0.10
+        if macd_ratio > 0 and macd_ratio < 1.0:
+            confidence += 0.05
+
+        sub_ok, _, sub_desc = self._check_sub_level_3buy(p1_zg)
+        if sub_ok:
+            confidence += 0.10
+        elif self._sub_strokes:
+            confidence -= 0.05
+
+        confidence = max(0.1, min(1.0, confidence))
+        stop_loss = p2_zd * 0.98
+
+        down_in_p2 = [s for s in (p2.strokes or []) if s.is_down]
+        if down_in_p2:
+            buy_price = down_in_p2[-1].end_value
+            buy_index = down_in_p2[-1].end_index
+        else:
+            buy_price = p2_zd
+            buy_index = p2.end_index
+
+        return BuySellPoint(
+            point_type='3buy',
+            price=buy_price,
+            index=buy_index,
+            related_pivot=p2,
+            confidence=confidence,
+            stop_loss=stop_loss,
+            reason=f'3买[中枢法]: P2.ZD={p2_zd:.2f}>P1.ZG={p1_zg:.2f}, gap={gap:.2%}',
+        )
+
+    def _check_third_sell_pivot_single(self) -> Optional[BuySellPoint]:
+        """中枢法单次3卖检测，返回最近的1个"""
+        if len(self.pivots) < 2:
+            return None
+
+        p1 = self.pivots[-2]
+        p2 = self.pivots[-1]
+
+        p1_zd = p1.zd if p1.zd > 0 else p1.low
+        p2_zg = p2.zg if p2.zg > 0 else p2.high
+
+        if p2_zg >= p1_zd or p2.start_index <= p1.end_index:
+            return None
+
+        leaving = [s for s in self.strokes
+                   if s.is_down
+                   and s.start_index >= p1.start_index
+                   and s.start_index <= p1.end_index + 5
+                   and s.end_value < p1_zd]
+        if not leaving:
+            return None
+
+        gap = (p1_zd - p2_zg) / p1_zd
+        confidence = 0.50 + min(gap * 15, 0.25)
+
+        best_leaving = leaving[-1]
+        pivot_div, amp_ratio, macd_ratio = self._compute_pivot_divergence(p1, best_leaving)
+        if pivot_div:
+            confidence += 0.10
+        if macd_ratio > 0 and macd_ratio < 1.0:
+            confidence += 0.05
+
+        confidence = max(0.1, min(1.0, confidence))
+
+        return BuySellPoint(
+            point_type='3sell',
+            price=p2_zg,
+            index=p2.end_index,
+            related_pivot=p2,
+            confidence=confidence,
+            stop_loss=p2_zg * 1.02,
+            reason=f'3卖[中枢法]: P2.ZG={p2_zg:.2f}<P1.ZD={p1_zd:.2f}, gap={gap:.2%}',
+        )
+
+    # ==================== 去重：中枢法 vs 回调法 ====================
+
+    def _dedup_pivot_based_3points(self) -> None:
+        """
+        去重：同一位置中枢法和回调法可能都检出3买/3卖，
+        保留置信度更高的那个。
+
+        判定"同一位置"：两信号的index差 < 10根K线 且 related_pivot相同。
+        """
+        self._buy_points = self._dedup_3points_list(self._buy_points, '3buy')
+        self._sell_points = self._dedup_3points_list(self._sell_points, '3sell')
+
+    def _dedup_3points_list(
+        self, points: List[BuySellPoint], point_type: str
+    ) -> List[BuySellPoint]:
+        """对买卖点列表中同类型的3买/3卖做去重"""
+        candidates = [p for p in points if p.point_type == point_type]
+        others = [p for p in points if p.point_type != point_type]
+
+        if len(candidates) <= 1:
+            return points
+
+        # 按index排序
+        candidates.sort(key=lambda p: p.index)
+
+        merged = []
+        skip = set()
+
+        for i, c in enumerate(candidates):
+            if i in skip:
+                continue
+            nearby = [c]
+            for j in range(i + 1, len(candidates)):
+                if j in skip:
+                    continue
+                other = candidates[j]
+                # 同一位置：index差 < 20（中枢法检测点可能比回调法早几根K线）
+                if abs(other.index - c.index) < 20:
+                    nearby.append(other)
+                    skip.add(j)
+
+            # 保留置信度最高的
+            best = max(nearby, key=lambda p: p.confidence)
+            merged.append(best)
+
+        return others + merged
 
     def _detect_quasi_third_buy(self) -> None:
         """批量检测所有类3买点"""
