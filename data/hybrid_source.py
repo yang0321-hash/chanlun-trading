@@ -94,7 +94,8 @@ class HybridSource(DataSource):
             return 'sz', 'SZ', code
 
     def _read_tdx_day(self, symbol: str) -> pd.DataFrame:
-        """从TDX本地读取日线 .day 文件（自动前复权）"""
+        """从TDX本地读取日线 .day 文件（自动前复权，向量化解析）"""
+        import numpy as np
         market_dir, market_tag, code = self._parse_code(symbol)
         filepath = os.path.join(self.tdx_path, market_dir, 'lday', f'{market_dir}{code}.day')
         if not os.path.exists(filepath):
@@ -104,49 +105,118 @@ class HybridSource(DataSource):
             with open(filepath, 'rb') as f:
                 data = f.read()
             record_size = 32
-            num_records = len(data) // record_size
-            if num_records == 0:
+            n = len(data) // record_size
+            if n == 0:
                 return pd.DataFrame()
 
-            records = []
-            for i in range(num_records):
-                offset = i * record_size
-                date_val, open_p, high_p, low_p, close_p, amount, vol, _ = \
-                    struct.unpack('IIIIIIII', data[offset:offset + record_size])
-                date_str = str(date_val)
-                if len(date_str) == 8:
-                    year = int(date_str[:4])
-                    month = int(date_str[4:6])
-                    day = int(date_str[6:8])
-                    if year >= 1990:
-                        try:
-                            dt = pd.Timestamp(year, month, day)
-                            records.append({
-                                'datetime': dt,
-                                'open': open_p / 100,
-                                'high': high_p / 100,
-                                'low': low_p / 100,
-                                'close': close_p / 100,
-                                'volume': float(vol),
-                            })
-                        except Exception:
-                            continue
+            arr = np.frombuffer(data[:n * record_size], dtype='<u4').reshape(n, 8)
+            dates = arr[:, 0]
+            valid = dates >= 19900101
+            arr = arr[valid]
+            dates = dates[valid]
 
-            if not records:
+            if len(arr) == 0:
                 return pd.DataFrame()
-            df = pd.DataFrame(records).set_index('datetime').sort_index()
+
+            df = pd.DataFrame({
+                'open': arr[:, 1] / 100.0,
+                'high': arr[:, 2] / 100.0,
+                'low': arr[:, 3] / 100.0,
+                'close': arr[:, 4] / 100.0,
+                'volume': arr[:, 6].astype(np.int64),
+            }, index=pd.to_datetime(dates.astype(str), format='%Y%m%d'))
+            df.index.name = 'datetime'
+            df = df.sort_index()
 
             # 前复权处理
             try:
-                from data.tdx_adj_factor import adjust_tdx_daily, to_ts_code
+                from data.tdx_adj_factor import adjust_tdx_daily
                 ts_code = f'{code}.{market_dir.upper()}'
                 df = adjust_tdx_daily(df, ts_code)
             except Exception:
-                pass  # 复权因子不可用时返回原始数据
+                pass
 
             return df
         except Exception:
             return pd.DataFrame()
+
+    def load_all_daily(self, codes: list, min_price: float = 3.0,
+                       max_price: float = 200.0, min_bars: int = 200,
+                       use_cache: bool = True) -> dict:
+        """批量加载日线数据（带缓存，向量化解析）
+
+        Args:
+            codes: 股票代码列表（纯数字格式）
+            min_price/max_price: 价格范围
+            min_bars: 最小K线数
+            use_cache: 是否使用pickle缓存（同交易日只读一次文件）
+
+        Returns:
+            {code: DataFrame} 字典
+        """
+        import numpy as np
+        import pickle
+
+        if not self._tdx_available:
+            return {}
+
+        cache_dir = os.path.join(os.path.dirname(__file__), '..', '.claude', 'cache')
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file = os.path.join(cache_dir, 'daily_map_cache.pkl')
+
+        # 尝试加载缓存
+        if use_cache and os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'rb') as f:
+                    cached = pickle.load(f)
+                cache_date = cached.get('date', '')
+                today = pd.Timestamp.now().strftime('%Y-%m-%d')
+                if cache_date == today:
+                    daily_map = cached['data']
+                    # 过滤价格范围
+                    filtered = {}
+                    for code, df in daily_map.items():
+                        if code in codes and len(df) >= min_bars:
+                            last_close = df['close'].iloc[-1]
+                            if min_price <= last_close <= max_price:
+                                filtered[code] = df
+                    print(f'   [缓存] 日线数据命中 ({len(filtered)}只, 日期={cache_date})',
+                          flush=True)
+                    return filtered
+            except Exception:
+                pass
+
+        # 全量加载
+        daily_map = {}
+        for code in codes:
+            try:
+                df = self._read_tdx_day(code)
+                if len(df) >= min_bars:
+                    last_close = df['close'].iloc[-1]
+                    if min_price <= last_close <= max_price:
+                        daily_map[code] = df
+            except Exception:
+                pass
+
+        # 保存缓存（保存全量数据，不过滤价格，下次按需过滤）
+        if use_cache and daily_map:
+            try:
+                # 保存前先收集全量（包括价格范围外的）
+                full_map = {}
+                for code in codes:
+                    try:
+                        df = self._read_tdx_day(code)
+                        if len(df) >= min_bars:
+                            full_map[code] = df
+                    except Exception:
+                        pass
+                today = pd.Timestamp.now().strftime('%Y-%m-%d')
+                with open(cache_file, 'wb') as f:
+                    pickle.dump({'date': today, 'data': full_map}, f)
+            except Exception:
+                pass
+
+        return daily_map
 
     def _read_tdx_1min(self, symbol: str) -> pd.DataFrame:
         """从TDX本地读取1分钟线 (.lc1格式)

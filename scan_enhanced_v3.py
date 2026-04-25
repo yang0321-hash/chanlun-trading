@@ -859,24 +859,13 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
     sector_map = load_sector_map()
     print(f'   行业映射: {len(sector_map)} 只')
 
-    # 3. 加载日线数据
+    # 3. 加载日线数据 (向量化解析 + pickle缓存)
     print('[3] 加载日线数据...')
-    daily_map = {}
-    batch_size = 100
-    for i in range(0, len(pure_codes), batch_size):
-        batch = pure_codes[i:i+batch_size]
-        for code in batch:
-            try:
-                df = hs.get_kline(code, period='daily')
-                if len(df) >= 200:
-                    last_close = df['close'].iloc[-1]
-                    if min_price <= last_close <= max_price:
-                        daily_map[code] = df
-            except Exception:
-                pass
-        print(f'   [{min(i+batch_size, len(pure_codes))}/{len(pure_codes)}] '
-              f'日线={len(daily_map)}', end='\r')
-    print(f'   日线数据: {len(daily_map)} 只')
+    t_load_start = time.time()
+    daily_map = hs.load_all_daily(pure_codes, min_price=min_price,
+                                   max_price=max_price, min_bars=200)
+    t_load = time.time() - t_load_start
+    print(f'   日线数据: {len(daily_map)} 只 ({t_load:.1f}s)')
 
     # 4. 计算行业动量
     print('[4] 计算行业动量...')
