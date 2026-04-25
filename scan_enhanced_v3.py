@@ -836,6 +836,70 @@ def _find_3buy_standalone(engine, code, df):
     return results
 
 
+def _mp_worker(args):
+    """多进程Worker: 每个进程独立创建SignalEngine, 分析单只股票"""
+    code, sdata, mkt_regime, cutoff = args
+    import pandas as pd
+    df = pd.DataFrame({
+        'open': sdata['open'], 'high': sdata['high'],
+        'low': sdata['low'], 'close': sdata['close'],
+        'volume': sdata['volume'],
+    }, index=sdata['index'])
+
+    sys.path.insert(0, 'chanlun_unified')
+    from signal_engine_cc15 import SignalEngine
+    from backtest_cc15_mtf import find_daily_1buy_2buy
+    engine = SignalEngine()
+    engine.dynamic_pool_enabled = False
+    engine.momentum_factor_enabled = False
+    engine.vol_regime_enabled = False
+
+    signals = []
+    try:
+        pairs = find_daily_1buy_2buy(engine, code, df)
+        for p in pairs:
+            if p['2buy_idx'] >= len(df):
+                continue
+            sig_date = df.index[p['2buy_idx']]
+            if sig_date >= pd.Timestamp(cutoff):
+                p['code'] = code
+                p['signal_type'] = '2buy'
+                p['entry_price'] = p['2buy_price']
+                p['stop_price'] = p['1buy_low']
+                p['sig_idx'] = p['2buy_idx']
+                p['sig_date'] = sig_date
+                p['buy_strength'] = _classify_2buy_strength(df, p, engine)
+                p['golden_ratio_pass'] = False
+                signals.append(p)
+
+        if mkt_regime != 'strong':
+            for p in pairs:
+                idx = p.get('1buy_idx', -1)
+                if idx < 0 or idx >= len(df):
+                    continue
+                sig_date = df.index[idx]
+                if sig_date >= pd.Timestamp(cutoff):
+                    signals.append({
+                        'code': code, 'signal_type': '1buy',
+                        'entry_price': p.get('1buy_price', df['close'].iloc[idx]),
+                        'stop_price': p.get('1buy_low', df['low'].iloc[idx]),
+                        'sig_idx': idx, 'sig_date': sig_date,
+                        'confidence': p.get('confidence', 0.5),
+                    })
+
+        threes = _find_3buy_standalone(engine, code, df)
+        for s in threes:
+            if s['sig_idx'] < len(df):
+                sig_date = df.index[s['sig_idx']]
+                if sig_date >= pd.Timestamp(cutoff):
+                    s['code'] = code
+                    s['sig_date'] = sig_date
+                    signals.append(s)
+    except Exception:
+        pass
+    return signals
+
+
 def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200.0,
                   top_n=10):
     """增强版扫描"""
@@ -960,70 +1024,37 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
 
     # 5. 缠论分析 + 找所有买点(1买/2买/3买)
     # 直接创建引擎, 跳过CC15的动态池/动量排名/组合管理 (扫描不需要回测管道)
-    print('[5] 缠论分析 + 识别买点...')
+    print('[5] 缠论分析 + 识别买点 (多进程)...')
     t_scan_start = time.time()
-    sys.path.insert(0, 'chanlun_unified')
-    from signal_engine_cc15 import SignalEngine
-    engine = SignalEngine()
-    engine.dynamic_pool_enabled = False
-    engine.momentum_factor_enabled = False
-    engine.vol_regime_enabled = False
 
     # === 规则5: 检测市场环境 ===
     market_regime = _detect_market_regime()
     print(f'   市场环境: {market_regime} (强势行情不做1买)')
 
-    cutoff = datetime.now() - timedelta(days=lookback_days)
-    all_signals = []  # 统一收集所有买点信号
+    cutoff_ts = datetime.now() - timedelta(days=lookback_days)
 
-    for code in prefiltered_map:
-        df = prefiltered_map[code]
+    # 准备轻量数据用于多进程传输 (避免pickle整个DataFrame)
+    stock_data = {}
+    for code, df in prefiltered_map.items():
+        stock_data[code] = {
+            'open': df['open'].values,
+            'high': df['high'].values,
+            'low': df['low'].values,
+            'close': df['close'].values,
+            'volume': df['volume'].values,
+            'index': df.index,
+        }
 
-        # --- 2买信号 ---
-        pairs = find_daily_1buy_2buy(engine, code, df)
-        for p in pairs:
-            if p['2buy_idx'] >= len(df):
-                continue
-            sig_date = df.index[p['2buy_idx']]
-            if sig_date >= pd.Timestamp(cutoff):
-                p['code'] = code
-                p['signal_type'] = '2buy'
-                p['entry_price'] = p['2buy_price']
-                p['stop_price'] = p['1buy_low']
-                p['sig_idx'] = p['2buy_idx']
-                p['sig_date'] = sig_date
+    # 分批提交到进程池
+    from multiprocessing import Pool
+    n_workers = min(os.cpu_count() or 4, 8)
+    task_args = [(code, stock_data[code], market_regime, cutoff_ts)
+                 for code in stock_data]
 
-                p['buy_strength'] = _classify_2buy_strength(df, p, engine)
-                p['golden_ratio_pass'] = False
-                all_signals.append(p)
-
-        # --- 1买信号 (底背驰) ---
-        if market_regime != 'strong':
-            for p in pairs:
-                idx = p.get('1buy_idx', -1)
-                if idx < 0 or idx >= len(df):
-                    continue
-                sig_date = df.index[idx]
-                if sig_date >= pd.Timestamp(cutoff):
-                    all_signals.append({
-                        'code': code,
-                        'signal_type': '1buy',
-                        'entry_price': p.get('1buy_price', df['close'].iloc[idx]),
-                        'stop_price': p.get('1buy_low', df['low'].iloc[idx]),
-                        'sig_idx': idx,
-                        'sig_date': sig_date,
-                        'confidence': p.get('confidence', 0.5),
-                    })
-
-        # --- 3买信号 (突破中枢回踩不进) ---
-        threes = _find_3buy_standalone(engine, code, df)
-        for s in threes:
-            if s['sig_idx'] < len(df):
-                sig_date = df.index[s['sig_idx']]
-                if sig_date >= pd.Timestamp(cutoff):
-                    s['code'] = code
-                    s['sig_date'] = sig_date
-                    all_signals.append(s)
+    all_signals = []
+    with Pool(processes=n_workers) as pool:
+        for result in pool.imap_unordered(_mp_worker, task_args, chunksize=50):
+            all_signals.extend(result)
 
     # 按类型统计
     type_counts = {}
