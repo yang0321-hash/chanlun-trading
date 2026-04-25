@@ -993,15 +993,11 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
                 p['sig_idx'] = p['2buy_idx']
                 p['sig_date'] = sig_date
 
-                # === 2买三档强度分类 ===
-                # 1. 找中枢位置(需要从CC15引擎获取)
                 p['buy_strength'] = _classify_2buy_strength(df, p, engine)
-                p['golden_ratio_pass'] = False  # 2买不用黄金分割
-
+                p['golden_ratio_pass'] = False
                 all_signals.append(p)
 
         # --- 1买信号 (底背驰) ---
-        # 仅在弱势行情检测1买，强势行情1买不可靠
         if market_regime != 'strong':
             for p in pairs:
                 idx = p.get('1buy_idx', -1)
