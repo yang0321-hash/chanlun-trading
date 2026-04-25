@@ -2009,8 +2009,10 @@ class BuySellPointDetector:
                 confidence -= 0.08
                 sub_level_info = ', P1次级别'
             if p2.sub_level:
-                confidence -= 0.05
-                sub_level_info += ', P2次级别'
+                # P2次级别（DIF/DEA未回贴0轴）= 非本级别中枢
+                # 缠论要求P2是本级别中枢才确认3买，次级别P2降权
+                confidence -= 0.15
+                sub_level_info += ', P2次级别(DIF未穿0轴)'
 
             # 离开段力度
             best_leaving = leaving[-1]

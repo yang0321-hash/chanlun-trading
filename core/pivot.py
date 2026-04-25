@@ -613,14 +613,16 @@ class PivotDetector:
 
     def _check_dif_level(self, pivot: Pivot) -> None:
         """
-        检查中枢区间内MACD DIF是否穿越0轴
+        检查中枢区间内MACD DIF+DEA是否回贴0轴
 
-        规则：
-        - DIF从负变正 或 从正变负 → 本级别中枢 (sub_level=False)
-        - DIF始终同侧 → 次级别中枢 (sub_level=True)
+        缠论标准：上涨趋势中，中枢期间DIF和DEA都应回到0轴附近。
+        双线贴近0轴 → 本级别中枢（多空真正平衡）
+        双线远离0轴 → 次级别中枢（趋势中的小波动）
 
-        趋势中的回调中枢（DIF不穿0轴）= 次级别
-        真正的转折中枢（DIF穿0轴）= 本级别
+        判定规则（双条件，满足任一即可）：
+        1. DIF穿越0轴（有正有负）且DEA也穿越0轴 → 强本级别
+        2. DIF和DEA的proximity（min_abs/max_abs）都 < 0.25 → 本级别
+           proximity接近0 = 双线穿越了0轴，接近1 = 一直远离
         """
         closes = [kd.close for kd in self.kline.data]
         if len(closes) < 35:
@@ -663,18 +665,38 @@ class PivotDetector:
             ema26 = ema26 * 25 / 26 + c / 26
             dif_values.append(ema12 - ema26)
 
+        # 计算DEA = EMA(DIF, 9)
+        dea_values = [dif_values[0]]
+        for d in dif_values[1:]:
+            dea_values.append(dea_values[-1] * 8 / 9 + d / 9)
+
         pivot_offset = start_idx - macd_start
         pivot_dif = dif_values[pivot_offset:]
+        pivot_dea = dea_values[pivot_offset:]
 
         if len(pivot_dif) < 3:
             return
 
-        has_positive = any(d > 0 for d in pivot_dif)
-        has_negative = any(d < 0 for d in pivot_dif)
+        # 条件1: DIF穿越0轴
+        dif_crossed = any(d > 0 for d in pivot_dif) and any(d < 0 for d in pivot_dif)
+        # 条件1: DEA穿越0轴
+        dea_crossed = any(d > 0 for d in pivot_dea) and any(d < 0 for d in pivot_dea)
 
-        if has_positive and has_negative:
+        # 条件2: proximity（贴近0轴程度）
+        dif_max_abs = max(abs(d) for d in pivot_dif) or 0.001
+        dea_max_abs = max(abs(d) for d in pivot_dea) or 0.001
+        dif_min_abs = min(abs(d) for d in pivot_dif)
+        dea_min_abs = min(abs(d) for d in pivot_dea)
+        dif_proximity = dif_min_abs / dif_max_abs
+        dea_proximity = dea_min_abs / dea_max_abs
+
+        PROX_THRESHOLD = 0.25
+        both_proximate = dif_proximity < PROX_THRESHOLD and dea_proximity < PROX_THRESHOLD
+
+        # 双线穿越0轴 或 双线都贴近0轴 → 本级别
+        if (dif_crossed and dea_crossed) or both_proximate:
             pivot.sub_level = False
-            pivot.dif_crossed_zero = True
+            pivot.dif_crossed_zero = dif_crossed
         else:
             pivot.sub_level = True
             pivot.dif_crossed_zero = False
