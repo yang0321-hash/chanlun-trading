@@ -826,6 +826,53 @@ def _find_3buy_standalone(engine, code, df):
                         break  # 每个中枢只取第一个3买
                 break  # 每个中枢只看一次突破
 
+    # === 中枢法3买: P2.ZD > P1.ZG (第二中枢形成在第一中枢上方) ===
+    if len(pivots) >= 2:
+        for pi in range(len(pivots) - 1):
+            p1 = pivots[pi]
+            p2 = pivots[pi + 1]
+            if p2['zd'] <= p1['zg']:
+                continue
+            if p2['end_idx'] <= p1['start_idx']:
+                continue
+
+            # 3买价格 = P2内最后一笔向下笔的终点（回调低点）
+            entry_idx = p2['end_idx']
+            entry_price = close.iloc[entry_idx] if entry_idx < n else close.iloc[-1]
+            stop_price = p2['zd']  # 止损=P2下沿
+
+            # gap = P2.ZD - P1.ZG 越大越强
+            gap = (p2['zd'] - p1['zg']) / p1['zg'] if p1['zg'] > 0 else 0
+            if gap > 0.10:
+                strength = 'strong'
+            elif gap > 0.03:
+                strength = 'standard'
+            else:
+                strength = 'normal'
+
+            results.append({
+                'signal_type': '3buy',
+                'entry_price': entry_price,
+                'stop_price': stop_price,
+                'sig_idx': entry_idx,
+                'buy_strength': strength,
+                'golden_ratio_pass': False,
+                'pivot_zg': p1['zg'],
+                'pivot_zd': p1['zd'],
+                'pivot_gg': p1.get('gg', p1['zg']),
+                'breakout_high': p2.get('gg', p2['zg']),
+                'pullback_low': p2['zd'],
+                'zs_bi_count': p2.get('bi_count', 3),
+                'zs_expanded': p2.get('is_expanded', False),
+                'solid_breakout': True,
+                'three_buy_checks': {'pivot_method': True},
+                'three_buy_passed': 1,
+                'three_buy_weighted': 2,
+                'breakout_ratio': 0,
+                'vol_ratio': 0,
+                'pivot_method': True,  # 标记中枢法
+            })
+
     # 走势类型分类 — 附加到每个3买信号
     if pivots:
         trend_result = classify_trend_type(pivots)
@@ -889,6 +936,8 @@ def _mp_worker(args):
 
         threes = _find_3buy_standalone(engine, code, df)
         for s in threes:
+            if s.get('trend_type') == 'down':
+                continue
             if s['sig_idx'] < len(df):
                 sig_date = df.index[s['sig_idx']]
                 if sig_date >= pd.Timestamp(cutoff):
@@ -1278,23 +1327,20 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
         else:
             weekly_trend_str = '盘整'
 
-        # === 走势类型加分 (基于回测验证的胜率数据) ===
-        # 3买: 上涨89.8%胜率 / 下跌93.4%胜率
-        # 2买: 上涨93.3%胜率 / 下跌90.1%胜率
-        # quasi3买: 上涨75.0%胜率 / 下跌88.9%胜率
+        # === 走势类型加分 (基于全市场4382信号验证 2026-04-25) ===
+        # 上涨趋势: 54.2%胜率, +4.27% → 加分
+        # 下跌趋势: 22.1%胜率, -5.08% → 重罚 (3买已在_mp_worker过滤)
+        # 盘整: 33.5%胜率, -3.47% → 轻罚
         trend_type_val = item.get('trend_type', '')
         trend_str_val = item.get('trend_strength', 0)
         trend_bonus = 0
         trend_label = ''
         if trend_type_val == 'up':
-            trend_bonus = 8   # 顺势加分
+            trend_bonus = 8
         elif trend_type_val == 'down':
-            if signal_type in ('3buy', '2buy'):
-                trend_bonus = 12  # 下跌趋势中3买/2买胜率最高(93.4%/90.1%)
-            else:
-                trend_bonus = 5
+            trend_bonus = -20
         elif trend_type_val == 'consolidation':
-            trend_bonus = 3
+            trend_bonus = -8
 
         total_score = tech_score + sector_score + strength_bonus + weekly_penalty + trend_bonus
 
