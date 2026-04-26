@@ -324,11 +324,15 @@ class PivotDetector:
     4. 突破中枢后回抽不破则为第三类买卖点
     """
 
+    MAX_EXTENSION_STROKES = 9
+    DEDUP_OVERLAP_THRESHOLD = 0.8
+
     def __init__(
         self,
         kline: KLine,
         strokes: Optional[List[Stroke]] = None,
-        level: PivotLevel = PivotLevel.DAY
+        level: PivotLevel = PivotLevel.DAY,
+        max_extension_strokes: Optional[int] = None,
     ):
         """
         初始化中枢识别器
@@ -337,8 +341,10 @@ class PivotDetector:
             kline: K线对象
             strokes: 笔列表，如果为None则自动生成
             level: 中枢级别
+            max_extension_strokes: 中枢扩展最大笔数 (默认9)
         """
         self.kline = kline
+        self._max_ext = max_extension_strokes or self.MAX_EXTENSION_STROKES
         self.level = level
 
         if strokes is None:
@@ -369,6 +375,9 @@ class PivotDetector:
 
         # 检查中枢延伸
         self._check_pivot_extension()
+
+        # 去重重叠中枢
+        self._dedup_overlapping_pivots()
 
         # 检查中枢演化状态 + DIF级别
         self._check_evolution()
@@ -424,9 +433,9 @@ class PivotDetector:
         start_index = s1.start_index
         end_index = s3.end_index
 
-        # 尝试扩展中枢（ZG/ZD保持不变，只检查重叠）
+        # 尝试扩展中枢（ZG/ZD保持不变，只检查重叠，有笔数上限）
         idx = start_idx + 3
-        while idx < len(self.strokes):
+        while idx < len(self.strokes) and len(pivot_strokes) < self._max_ext:
             next_stroke = self.strokes[idx]
 
             # 扩展条件：新笔与 [ZD, ZG] 有重叠
@@ -440,6 +449,13 @@ class PivotDetector:
         # GG/DD 取所有构成笔的极值
         gg = max(s.high for s in pivot_strokes)
         dd = min(s.low for s in pivot_strokes)
+
+        # GG/DD去除极端值：笔数>=5时排除最高/最低的各1笔
+        if len(pivot_strokes) >= 5:
+            sorted_highs = sorted(s.high for s in pivot_strokes)
+            sorted_lows = sorted(s.low for s in pivot_strokes)
+            gg = sorted_highs[-2]  # 第2高
+            dd = sorted_lows[1]    # 第2低
 
         # 判断演化状态
         n_strokes = len(pivot_strokes)
@@ -493,99 +509,98 @@ class PivotDetector:
         """
         return stroke.low <= pivot_high and stroke.high >= pivot_low
 
-    def _check_pivot_extension(self) -> None:
-        """合并有重叠区间的中枢 (中枢扩展)
+    def _dedup_overlapping_pivots(self) -> None:
+        """移除时间范围高度重叠的中枢，保留quality_score更高的"""
+        if len(self.pivots) < 2:
+            return
 
-        检查所有中枢对(含非相邻)的ZG/ZD重叠，用Union-Find分组，
-        传递性合并: A重叠B, B重叠C → A,B,C合并为一个中枢。
-        合并后的中枢包含组内所有笔画，ZG/ZD取交集，GG/DD取全域极值。
+        self.pivots.sort(key=lambda p: p.start_index)
+        to_remove = set()
+        n = len(self.pivots)
+        threshold = self.DEDUP_OVERLAP_THRESHOLD
+
+        for i in range(n):
+            if i in to_remove:
+                continue
+            for j in range(i + 1, n):
+                if j in to_remove:
+                    continue
+                p1, p2 = self.pivots[i], self.pivots[j]
+
+                overlap_start = max(p1.start_index, p2.start_index)
+                overlap_end = min(p1.end_index, p2.end_index)
+                if overlap_start >= overlap_end:
+                    continue
+
+                range1 = p1.end_index - p1.start_index
+                range2 = p2.end_index - p2.start_index
+                smaller = min(range1, range2)
+                if smaller > 0 and (overlap_end - overlap_start) / smaller > threshold:
+                    if p1.quality_score >= p2.quality_score:
+                        to_remove.add(j)
+                    else:
+                        to_remove.add(i)
+                        break
+
+        if to_remove:
+            self.pivots = [p for idx, p in enumerate(self.pivots) if idx not in to_remove]
+
+    def _check_pivot_extension(self) -> None:
+        """合并相邻中枢的ZG/ZD重叠（替代Union-Find传递链合并）
+
+        与旧算法的区别:
+        1. 仅检查相邻中枢对（p[i]和p[i+1]），禁止传递链合并
+        2. 最多合并2个中枢，防止跨千日巨无霸
+        3. 不注入过渡笔画，仅使用组件中枢的笔
         """
         n = len(self.pivots)
         if n < 2:
             return
 
-        # Union-Find
-        parent = list(range(n))
-
-        def find(x):
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
-        def union(a, b):
-            ra, rb = find(a), find(b)
-            if ra != rb:
-                parent[ra] = rb
-
-        # 检查所有中枢对: ZG/ZD核心区间是否有重叠
-        for i in range(n):
-            for j in range(i + 1, n):
-                p1, p2 = self.pivots[i], self.pivots[j]
-                if p1.zg >= p2.zd and p2.zg >= p1.zd:
-                    union(i, j)
-
-        # 按根节点分组
-        groups = {}
-        for i in range(n):
-            root = find(i)
-            if root not in groups:
-                groups[root] = []
-            groups[root].append(i)
-
-        # 合并每组
+        merged_set = set()
         new_pivots = []
-        for indices in groups.values():
-            if len(indices) == 1:
-                new_pivots.append(self.pivots[indices[0]])
+
+        for i in range(n - 1):
+            if i in merged_set:
+                continue
+            j = i + 1
+            if j in merged_set:
                 continue
 
-            # 收集组内所有笔画 + 中间过渡笔画
-            first = self.pivots[indices[0]]
-            last = self.pivots[indices[-1]]
-            start_idx = first.start_index
-            end_idx = last.end_index
+            p1, p2 = self.pivots[i], self.pivots[j]
 
+            # ZG/ZD重叠检查
+            if not (p1.zg >= p2.zd and p2.zg >= p1.zd):
+                continue
+
+            # 合并两组件中枢的笔（不注入过渡笔）
+            seen = set()
             combined = []
-            seen = {id(s) for p in (self.pivots[i] for i in indices) for s in p.strokes}
-            for s in self.pivots[indices[0]].strokes:
-                combined.append(s)
-            for idx in indices[1:]:
-                for s in self.pivots[idx].strokes:
-                    if id(s) not in seen:
-                        seen.add(id(s))
-                        combined.append(s)
-
-            # 补充中间过渡笔画 (属于同一段K线范围但未被任何中枢收录)
-            for s in self.strokes:
-                if s.start_index >= start_idx and s.end_index <= end_idx and id(s) not in seen:
+            for s in p1.strokes + p2.strokes:
+                if id(s) not in seen:
                     seen.add(id(s))
                     combined.append(s)
-
             combined.sort(key=lambda s: s.start_index)
 
-            # ZG/ZD: 取组内所有中枢ZG/ZD的交集
-            new_zg = min(self.pivots[i].zg for i in indices)
-            new_zd = max(self.pivots[i].zd for i in indices)
-
+            # ZG/ZD取交集
+            new_zg = min(p1.zg, p2.zg)
+            new_zd = max(p1.zd, p2.zd)
             if new_zg <= new_zd:
-                # 交集无效, 用前2笔重算
-                if len(combined) >= 2:
-                    new_zg = min(combined[0].high, combined[1].high)
-                    new_zd = max(combined[0].low, combined[1].low)
-                if new_zg <= new_zd:
-                    # 无法构成有效中枢, 保留原始中枢不合并
-                    for i in indices:
-                        new_pivots.append(self.pivots[i])
-                    continue
+                continue
 
+            # GG/DD: 组件笔极值（>=5笔时去除极端值）
             new_gg = max(s.high for s in combined)
             new_dd = min(s.low for s in combined)
+            if len(combined) >= 5:
+                sorted_highs = sorted(s.high for s in combined)
+                sorted_lows = sorted(s.low for s in combined)
+                new_gg = sorted_highs[-2]
+                new_dd = sorted_lows[1]
 
             merged = Pivot(
-                level=first.level,
-                start_index=start_idx,
-                end_index=end_idx,
+                level=p1.level,
+                start_index=p1.start_index,
+                end_index=p2.end_index,
                 high=new_zg,
                 low=new_zd,
                 zg=new_zg,
@@ -593,22 +608,29 @@ class PivotDetector:
                 gg=new_gg,
                 dd=new_dd,
                 strokes=combined,
-                direction=first.direction,
+                direction=p1.direction,
                 confirmed=True,
                 extended=True,
                 evolution=PivotEvolution.EXTENDING,
                 segment_count=len(combined),
-                upgrade_reason="两中枢重叠合并" if len(indices) > 1 else '',
+                upgrade_reason="两中枢重叠合并",
                 evolution_level=2 if len(combined) >= 9 else 1,
             )
-
-            for i in indices:
-                for seg in self.pivots[i].segments:
+            for p in (p1, p2):
+                for seg in p.segments:
                     if seg not in merged.segments:
                         merged.segments.append(seg)
 
+            merged_set.add(i)
+            merged_set.add(j)
             new_pivots.append(merged)
 
+        # 收集未合并的中枢
+        for i in range(n):
+            if i not in merged_set:
+                new_pivots.append(self.pivots[i])
+
+        new_pivots.sort(key=lambda p: p.start_index)
         self.pivots = new_pivots
 
     def _check_dif_level(self, pivot: Pivot) -> None:
