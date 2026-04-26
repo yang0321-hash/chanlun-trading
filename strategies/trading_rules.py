@@ -170,17 +170,17 @@ class TradingRules:
         # 状态判定
         if score >= 9:
             state = 'strong'
-            allowed = ['1buy', '2buy', '3buy']
+            allowed = ['1buy', '2buy', '3buy', 'sub1buy']
             max_pos = 80
             single_max = 30
         elif score >= 6:
             state = 'moderate'
-            allowed = ['2buy', '3buy']
+            allowed = ['2buy', '3buy', 'sub1buy']
             max_pos = 60
             single_max = 25
         elif score >= 3:
             state = 'weak'
-            allowed = ['1buy']
+            allowed = ['1buy', 'sub1buy']
             max_pos = 40
             single_max = 20
         else:

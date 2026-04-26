@@ -163,6 +163,7 @@ class BuySellPointDetector:
         self._sell_points = []
 
         self._detect_first_buy()
+        self._detect_consolidation_first_buy()
         self._detect_first_sell()
         self._detect_second_buy()
         self._detect_second_sell()
@@ -1570,6 +1571,96 @@ class BuySellPointDetector:
                     confidence=confidence,
                     stop_loss=leave_s.low * 0.99,
                     reason=f'1买: 振幅背驰(离开/进入={amp_ratio:.2f}), 下跌趋势, ZD={pivot.zd:.2f}{macd_info}{vol_info}{sub_info}'
+                ))
+
+    def _detect_consolidation_first_buy(self) -> None:
+        """检测盘整背驰1买 (sub1B)
+
+        盘整背驰: 中枢盘整中，离开中枢的向下笔出现背驰，但不要求下跌趋势。
+        缠论第15课: "没有趋势就没有背驰" — 盘整背驰是背驰的特殊形态，
+        发生在中枢震荡中，动能衰竭后反转。
+
+        与标准1买的区别:
+        - 不要求 has_downtrend（之前的更高中枢）
+        - 置信度上限更低 (0.80 vs 1.00)
+        - 仅在盘整中枢（无明确趋势方向）中触发
+        """
+        if not self.pivots or len(self.strokes) < 3:
+            return
+
+        for pivot_idx, pivot in enumerate(self.pivots):
+            # 跳过已有下跌趋势的中枢 — 由标准1买处理
+            has_downtrend = any(
+                prev_p.zd > pivot.zg
+                for prev_p in self.pivots[:pivot_idx]
+            )
+            if has_downtrend:
+                continue
+
+            # 盘整中枢：前后无更高中枢也无更低中枢（纯震荡）
+            has_uptrend = any(
+                prev_p.zd < pivot.zg
+                and prev_p.zg > pivot.zg
+                for prev_p in self.pivots[:pivot_idx]
+            )
+
+            # 找离开此中枢的向下笔（终点低于ZD）
+            leaving = [s for s in self.strokes
+                       if s.is_down and s.end_value < pivot.zd
+                       and s.start_index >= pivot.start_index]
+
+            for leave_s in leaving:
+                pivot_div, amp_ratio, macd_ratio = self._compute_pivot_divergence(
+                    pivot, leave_s
+                )
+                if not pivot_div:
+                    continue
+
+                # sub1B 置信度略低于标准1买
+                confidence = 0.30 + min((1.0 - amp_ratio) * 0.25, 0.25)
+
+                macd_confirmed = macd_ratio > 0 and macd_ratio < 1.0
+                if macd_confirmed:
+                    confidence += 0.10
+                elif macd_ratio >= 1.5:
+                    confidence -= 0.10
+
+                macd_info = f', MACD确认({macd_ratio:.2f})' if macd_confirmed else ''
+
+                # 量能确认
+                vol_info = ''
+                if self._vol_dynamics:
+                    down_all = [s for s in self.strokes if s.is_down
+                                and s.end_index <= leave_s.end_index]
+                    if len(down_all) >= 2:
+                        vol_res = self._vol_dynamics.check_volume_divergence(down_all, 'down')
+                        if vol_res.has_divergence:
+                            confidence += 0.10
+                            vol_info = f', 量能背驰({vol_res.strength:.2f})'
+
+                # 子级别确认
+                sub_ok, sub_conf, sub_desc = self._check_sub_level_buy(
+                    leave_s.end_index, ['1buy', 'sub1buy']
+                )
+                if sub_ok:
+                    confidence += 0.10
+                elif self._sub_buy_points:
+                    confidence -= 0.10
+                sub_info = f', {sub_desc}' if sub_ok else ''
+
+                confidence = max(0.1, min(0.80, confidence))
+
+                self._buy_points.append(BuySellPoint(
+                    point_type='sub1buy',
+                    price=leave_s.end_value,
+                    index=leave_s.end_index,
+                    related_pivot=pivot,
+                    related_strokes=[leave_s],
+                    divergence_ratio=macd_ratio,
+                    pivot_divergence_ratio=amp_ratio,
+                    confidence=confidence,
+                    stop_loss=leave_s.low * 0.99,
+                    reason=f'sub1B: 盘整背驰(离开/进入={amp_ratio:.2f}), ZD={pivot.zd:.2f}{macd_info}{vol_info}{sub_info}'
                 ))
 
     def _detect_first_sell(self) -> None:
