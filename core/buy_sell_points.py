@@ -313,10 +313,11 @@ class BuySellPointDetector:
         trend_mod = self._get_trend_modifier('buy')
         confidence = max(0.1, min(1.0, base_confidence + trend_mod))
 
-        # 止损
-        theory_stop = last_leaving.low * 0.99
-        max_stop = last_leaving.end_value * 0.95
-        stop_loss = max(theory_stop, max_stop)
+        # 止损：必须 < 入场价（安全 guard）
+        theory_stop = last_leaving.end_value * 0.97
+        max_stop = last_leaving.low * 0.95
+        stop_loss = min(theory_stop, max_stop)
+        stop_loss = min(stop_loss, last_leaving.end_value * 0.98)
 
         # 原因描述
         macd_info = f', MACD确认({macd_ratio:.2f})' if macd_confirmed else ''
@@ -1569,7 +1570,7 @@ class BuySellPointDetector:
                     divergence_ratio=macd_ratio,
                     pivot_divergence_ratio=amp_ratio,
                     confidence=confidence,
-                    stop_loss=leave_s.low * 0.99,
+                    stop_loss=leave_s.end_value * 0.97,
                     reason=f'1买: 振幅背驰(离开/进入={amp_ratio:.2f}), 下跌趋势, ZD={pivot.zd:.2f}{macd_info}{vol_info}{sub_info}'
                 ))
 
@@ -1659,7 +1660,7 @@ class BuySellPointDetector:
                     divergence_ratio=macd_ratio,
                     pivot_divergence_ratio=amp_ratio,
                     confidence=confidence,
-                    stop_loss=leave_s.low * 0.99,
+                    stop_loss=leave_s.end_value * 0.97,
                     reason=f'sub1B: 盘整背驰(离开/进入={amp_ratio:.2f}), ZD={pivot.zd:.2f}{macd_info}{vol_info}{sub_info}'
                 ))
 
@@ -2147,9 +2148,6 @@ class BuySellPointDetector:
 
             confidence = max(0.1, min(1.0, confidence))
 
-            # 止损 = P2.ZD * 0.98（第二中枢下沿）
-            stop_loss = p2_zd * 0.98
-
             # 3买价格 = P2内最后一笔向下笔的终点（回调低点，真正的买入位）
             down_in_p2 = [s for s in (p2.strokes or []) if s.is_down]
             if down_in_p2:
@@ -2158,6 +2156,9 @@ class BuySellPointDetector:
             else:
                 buy_price = p2_zd
                 buy_index = p2.end_index
+
+            # 止损 = P2.ZD * 0.98，但必须低于入场价
+            stop_loss = min(p2_zd * 0.98, buy_price * 0.99)
 
             # 持仓引导
             if confidence >= 0.8:
@@ -2523,7 +2524,6 @@ class BuySellPointDetector:
             confidence -= 0.05
 
         confidence = max(0.1, min(1.0, confidence))
-        stop_loss = p2_zd * 0.98
 
         down_in_p2 = [s for s in (p2.strokes or []) if s.is_down]
         if down_in_p2:
@@ -2532,6 +2532,8 @@ class BuySellPointDetector:
         else:
             buy_price = p2_zd
             buy_index = p2.end_index
+
+        stop_loss = min(p2_zd * 0.98, buy_price * 0.99)
 
         return BuySellPoint(
             point_type='3buy',
