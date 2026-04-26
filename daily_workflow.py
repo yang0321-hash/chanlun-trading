@@ -379,6 +379,7 @@ def format_report_text(committee_results: List[dict],
     reject = [r for r in committee_results if r.get('decision') == 'reject']
 
     if buy:
+        tier_labels = {1: '[主线]', 2: '[活跃]', 3: '[发现]'}
         lines.append(f'【委员会推荐 BUY】({len(buy)}只)')
         for i, r in enumerate(buy[:5], 1):
             code = r.get('symbol', '') or r.get('code', '')
@@ -387,8 +388,10 @@ def format_report_text(committee_results: List[dict],
             stop = r.get('stop_loss', 0)
             rr = r.get('risk_reward', 0)
             factors = ', '.join(r.get('key_factors', [])[:2])
+            tier = r.get('sector_tier', 2)
+            tl = tier_labels.get(tier, '')
             lines.append(
-                f'  {i}. {code_to_prefix(code)} ({name}) '
+                f'  {i}. {tl}{code_to_prefix(code)} ({name}) '
                 f'评分:{score:.0f} 止损:{stop:.2f} R/R:{rr:.1f}')
             if factors:
                 lines.append(f'     {factors}')
@@ -610,6 +613,19 @@ def main():
     sector_map = load_sector_map()
     scan_count = 0
 
+    # ---- Phase 0: 板块候选池扫描 ----
+    print('[0] 板块候选池扫描...')
+    try:
+        from trading_agents.sector_scanner import SectorScanner
+        ss = SectorScanner()
+        sector_report = ss.run()
+        main_sectors = ss.get_main_theme_sectors()
+        if main_sectors:
+            print(f'  今日主线: {", ".join(main_sectors[:5])}')
+    except Exception as e:
+        print(f'  板块扫描跳过: {e}')
+        main_sectors = []
+
     # ---- Phase 1: 扫描 ----
     print('[1] 扫描买点信号...')
     candidates = run_scan_enhanced(hs, top_n=args.top)
@@ -623,8 +639,14 @@ def main():
         else:
             print('  无候选池，跳过扫描')
 
+    # 构建候选lookup (Phase 2.5需要日线中枢数据)
+    candidate_lookup = {}
     if candidates:
         scan_count = scan_count or len(candidates)
+        for c in candidates:
+            c_code = c.get('code', '')
+            if c_code:
+                candidate_lookup[c_code] = c
         print(f'  扫描完成: {len(candidates)} 只候选股')
         for i, c in enumerate(candidates[:5], 1):
             code = c.get('code', '')
@@ -663,52 +685,58 @@ def main():
     else:
         print('  无候选股，跳过委员会评估')
 
-    # ---- Phase 2.5: v3a 30min二次确认 ----
+    # ---- Phase 2.5: 30min二次确认 (日线信号感知) ----
     print()
-    print('[2.5] v3a 30分钟二次确认...')
+    print('[2.5] 30分钟二次确认...')
     v3a_confirmed = []
     if committee_results:
         buy_results = [r for r in committee_results if r.get('decision') == 'buy']
         if buy_results:
             try:
-                import importlib.util
-                _v3a_path = os.path.join(os.path.dirname(__file__), 'strategies', 'v3a_30min_strategy.py')
-                _v3a_spec = importlib.util.spec_from_file_location('v3a_30min_strategy', _v3a_path)
-                _v3a_mod = importlib.util.module_from_spec(_v3a_spec)
-                _v3a_spec.loader.exec_module(_v3a_mod)
-                V3a30MinStrategy = _v3a_mod.V3a30MinStrategy
-                V3aConfig = _v3a_mod.V3aConfig
-                v3a = V3a30MinStrategy(V3aConfig(mode='trend'), hs)
+                from strategies.daily_30min_confirm import Daily30minConfirmer
+                confirmer = Daily30minConfirmer(hs)
+
                 for r in buy_results:
                     code = r.get('symbol', '') or r.get('code', '')
                     name = r.get('name', '')
                     score = r.get('composite_score', 0)
 
-                    sig = v3a.scan_entry(code)
-                    if sig and sig.confidence >= 0.60:
+                    # 从原始候选数据获取日线中枢信息
+                    orig = candidate_lookup.get(code, {})
+                    daily_context = {
+                        'signal_type': orig.get('signal_type', '2buy'),
+                        'pivot_zg': orig.get('pivot_zg', 0),
+                        'pivot_zd': orig.get('pivot_zd', 0),
+                        'pivot_gg': orig.get('pivot_gg', orig.get('pivot_zg', 0)),
+                        'entry_price': r.get('entry_price', orig.get('entry_price', 0)),
+                        'stop_price': r.get('stop_loss', orig.get('stop_price', 0)),
+                    }
+
+                    result = confirmer.confirm_daily_signal(code, daily_context)
+                    if result and result.passed and result.confidence >= 0.45:
                         r['v3a_confirmed'] = True
-                        r['v3a_confidence'] = sig.confidence
-                        r['v3a_signal_type'] = sig.signal_type
-                        r['v3a_stop'] = sig.stop_loss
-                        # 取委员会止损和v3a止损中较高的
+                        r['v3a_confidence'] = result.confidence
+                        r['v3a_signal_type'] = daily_context['signal_type']
+                        r['v3a_stop'] = result.stop_loss
                         committee_stop = r.get('stop_loss', 0)
-                        final_stop = max(committee_stop, sig.stop_loss) if committee_stop > 0 else sig.stop_loss
+                        final_stop = max(committee_stop, result.stop_loss) if committee_stop > 0 else result.stop_loss
                         r['final_stop'] = final_stop
                         v3a_confirmed.append(r)
                         print(f'  [OK] {code_to_prefix(code)} ({name}) '
-                              f'v3a确认 conf={sig.confidence:.2f} '
-                              f'类型={sig.signal_type} 止损={final_stop:.2f}')
+                              f'确认通过 conf={result.confidence:.2f} '
+                              f'类型={daily_context["signal_type"]} '
+                              f'止损={final_stop:.2f} ({result.reason})')
                     else:
                         r['decision'] = 'hold'
                         r['v3a_confirmed'] = False
-                        conf_str = f'{sig.confidence:.2f}' if sig else '无信号'
+                        conf_str = f'{result.confidence:.2f}' if result else '无数据'
+                        reason_str = f' ({result.reason})' if result else ''
                         print(f'  [X] {code_to_prefix(code)} ({name}) '
-                              f'v3a未确认 ({conf_str}) -> 降为HOLD')
+                              f'未确认 ({conf_str}){reason_str} -> 降为HOLD')
 
                 if v3a_confirmed:
-                    print(f'\n  v3a确认: {len(v3a_confirmed)}/{len(buy_results)}只')
+                    print(f'\n  30min确认: {len(v3a_confirmed)}/{len(buy_results)}只')
 
-                    # 推送确认结果通知
                     chanlun_webhook = os.getenv('CHANLUN_FEISHU_WEBHOOK_URL')
                     if chanlun_webhook and args.notify:
                         try:
@@ -720,23 +748,135 @@ def main():
                                 lines.append(
                                     f"{code_to_prefix(code)} ({r.get('name', '')}) "
                                     f"评分:{r.get('composite_score', 0):.0f} "
-                                    f"v3a={r.get('v3a_confidence', 0):.2f} "
+                                    f"确认={r.get('v3a_confidence', 0):.2f} "
                                     f"止损:{r.get('final_stop', 0):.2f}")
                             notifier.send_text(
-                                f'v3a确认买入 ({len(v3a_confirmed)}只)\n' +
+                                f'30min确认买入 ({len(v3a_confirmed)}只)\n' +
                                 '\n'.join(lines) +
                                 '\n\n[!] 请人工确认后操作')
                             print('  飞书通知已推送')
                         except Exception as e:
                             print(f'  通知推送失败: {e}')
                 else:
-                    print('  无v3a确认通过')
+                    print('  无确认通过')
             except Exception as e:
-                print(f'  v3a加载失败: {e}')
+                print(f'  确认模块加载失败: {e}')
+                import traceback; traceback.print_exc()
         else:
             print('  无BUY推荐，跳过')
     else:
         print('  无委员会结果，跳过')
+
+    # ---- Phase 2.8: v2.0规则引擎 — 仓位调整 ----
+    print()
+    print('[2.8] v2.0规则引擎 — 仓位调整...')
+    try:
+        from strategies.trading_rules import TradingRules
+        # 获取大盘评分: 优先读缓存，回退到实时计算
+        market_score = 6  # 默认偏强
+        score_loaded = False
+
+        # 1) 读今日盘前/板块扫描缓存的评分
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        for cache_file in [f'signals/market_score_{today_str}.json',
+                           f'signals/sector_pool_{today_str}.json']:
+            if os.path.exists(cache_file):
+                try:
+                    with open(cache_file, 'r', encoding='utf-8') as f:
+                        cached = json.load(f)
+                    if 'market_score' in cached:
+                        market_score = cached['market_score']
+                        score_loaded = True
+                        print(f'  大盘评分: {market_score}/12 (来自{os.path.basename(cache_file)})')
+                        break
+                except Exception:
+                    pass
+
+        # 2) 回退/验证: 用TDX本地数据实时计算
+        try:
+            idx_df = hs.get_kline('sh000001', period='daily')
+            if idx_df is not None and len(idx_df) >= 25:
+                m_closes = idx_df['close'].values.astype(float)
+                m_volumes = idx_df.get('volume')
+                if m_volumes is not None:
+                    m_volumes = m_volumes.values.astype(float)
+                mr = TradingRules.calc_market_score(m_closes, m_volumes)
+                if not score_loaded:
+                    market_score = mr.score
+                    score_loaded = True
+                    print(f'  大盘评分: {mr.score}/12 ({mr.state}, 本地计算)')
+                elif mr.score != market_score:
+                    print(f'  大盘评分: 缓存={market_score} vs 实时={mr.score} → 使用实时值')
+                    market_score = mr.score
+                # 缓存供后续使用
+                try:
+                    os.makedirs('signals', exist_ok=True)
+                    with open(f'signals/market_score_{today_str}.json', 'w',
+                              encoding='utf-8') as f:
+                        json.dump({'market_score': market_score,
+                                   'state': mr.state,
+                                   'date': today_str},
+                                  f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+        except Exception:
+            if not score_loaded:
+                print(f'  大盘评分: 使用默认值 {market_score}')
+
+        # 对BUY推荐应用仓位限制
+        for r in committee_results:
+            if r.get('decision') != 'buy':
+                continue
+            code = r.get('symbol', '') or r.get('code', '')
+            # 优先从候选数据获取signal_type，委员会结果可能丢失此字段
+            orig_candidate = candidate_lookup.get(code, {})
+            signal_type = (r.get('buy_type') or r.get('signal_type')
+                           or orig_candidate.get('signal_type', '2buy'))
+            sector_tier = orig_candidate.get('sector_tier', 2)
+
+            # 买点限制检查
+            allowed, reason = TradingRules.is_buy_allowed(
+                signal_type, market_score, sector_tier)
+            if not allowed:
+                r['decision'] = 'hold'
+                r['v2_veto'] = reason
+                print(f'  [VETO] {code_to_prefix(code)} '
+                      f'{signal_type} → HOLD ({reason})')
+                continue
+
+            # 仓位矩阵计算
+            max_pos = TradingRules.get_max_position(market_score, sector_tier)
+            if max_pos == 0:
+                r['decision'] = 'hold'
+                r['v2_veto'] = '板块禁止'
+                continue
+
+            # 调整仓位不超过规则上限
+            orig_pos = r.get('position_pct', 0.3)
+            adj_pos = min(orig_pos, max_pos / 100)
+            r['position_pct'] = adj_pos
+            r['market_score'] = market_score
+            r['v2_adjusted'] = True
+
+            # 弱势市特殊规则
+            if TradingRules.is_weak_market(market_score):
+                stop_pct = TradingRules.get_stop_loss_pct(signal_type, market_score)
+                entry = r.get('entry_price', r.get('stop_loss', 0) / (1 + stop_pct))
+                if entry > 0:
+                    r['stop_loss'] = entry * (1 + stop_pct)
+                r['weak_market'] = True
+                r['time_stop_days'] = 3
+                print(f'  [弱市] {code_to_prefix(code)} '
+                      f'仓位:{adj_pos:.0%} 止损:{stop_pct:.0%} 限时3日')
+            else:
+                print(f'  [OK] {code_to_prefix(code)} '
+                      f'Tier{sector_tier} 仓位:{adj_pos:.0%}')
+
+        vetoed = sum(1 for r in committee_results if r.get('v2_veto'))
+        adjusted = sum(1 for r in committee_results if r.get('v2_adjusted'))
+        print(f'  规则引擎: 调整{adjusted}只 拦截{vetoed}只')
+    except Exception as e:
+        print(f'  规则引擎异常: {e}')
 
     # ---- Phase 3: 更新持仓 ----
     print()
