@@ -324,7 +324,6 @@ class PivotDetector:
     4. 突破中枢后回抽不破则为第三类买卖点
     """
 
-    MAX_EXTENSION_STROKES = 9
     DEDUP_OVERLAP_THRESHOLD = 0.8
 
     def __init__(
@@ -332,7 +331,6 @@ class PivotDetector:
         kline: KLine,
         strokes: Optional[List[Stroke]] = None,
         level: PivotLevel = PivotLevel.DAY,
-        max_extension_strokes: Optional[int] = None,
     ):
         """
         初始化中枢识别器
@@ -341,10 +339,8 @@ class PivotDetector:
             kline: K线对象
             strokes: 笔列表，如果为None则自动生成
             level: 中枢级别
-            max_extension_strokes: 中枢扩展最大笔数 (默认9)
         """
         self.kline = kline
-        self._max_ext = max_extension_strokes or self.MAX_EXTENSION_STROKES
         self.level = level
 
         if strokes is None:
@@ -433,9 +429,9 @@ class PivotDetector:
         start_index = s1.start_index
         end_index = s3.end_index
 
-        # 尝试扩展中枢（ZG/ZD保持不变，只检查重叠，有笔数上限）
+        # 尝试扩展中枢（ZG/ZD保持不变，只检查重叠）
         idx = start_idx + 3
-        while idx < len(self.strokes) and len(pivot_strokes) < self._max_ext:
+        while idx < len(self.strokes):
             next_stroke = self.strokes[idx]
 
             # 扩展条件：新笔与 [ZD, ZG] 有重叠
