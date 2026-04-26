@@ -1422,11 +1422,21 @@ class SignalEngine:
         while i <= len(strokes) - 3:
             s1, s2, s3 = strokes[i], strokes[i + 1], strokes[i + 2]
 
-            # === Step 1: 形成标准中枢 ===
-            zg_orig = min(s1['high'], s2['high'], s3['high'])
-            zd_orig = max(s1['low'], s2['low'], s3['low'])
+            # === Step 1: 形成标准中枢 (缠论原文优化) ===
+            # ZG = min(下降笔的high) — 下降笔是 end_type='top'
+            # ZD = max(上升笔的low)  — 上升笔是 end_type='bottom'
+            down_strokes = [s for s in [s1, s2, s3] if s['end_type'] == 'top']
+            up_strokes   = [s for s in [s1, s2, s3] if s['end_type'] == 'bottom']
 
-            if zd_orig < zg_orig:
+            if not down_strokes or not up_strokes:
+                i += 1
+                continue  # 需要至少1笔上升+1笔下降才能形成中枢
+
+            zg_raw = min(s['high'] for s in down_strokes)
+            zd_raw = max(s['low']  for s in up_strokes)
+
+            # 重叠检查 (缠论skill方法): ZG > ZD 表示有效重叠
+            if zg_raw > zd_raw:
                 direction = 'down' if s1['end_type'] == 'bottom' else 'up'
 
                 # 中枢内笔序列(从形成段开始)
@@ -1439,10 +1449,10 @@ class SignalEngine:
                 expanded_mode = None   # 'A'/'B'/'C'
                 extended_flag = False
                 upgraded_flag = False
-                zg_cur = zg_orig       # 当前ZG(可能因扩张而变化)
-                zd_cur = zd_orig       # 当前ZD
-                zg_expanded = zg_orig  # 扩张后ZG(仅expanded时有效)
-                zd_expanded = zd_orig  # 扩张后ZD
+                zg_cur = zg_raw       # 当前ZG(可能因扩张而变化)
+                zd_cur = zd_raw       # 当前ZD
+                zg_expanded = zg_raw  # 扩张后ZG(仅expanded时有效)
+                zd_expanded = zd_raw  # 扩张后ZD
                 expansion_triggered_stroke = None  # 触发扩张的那笔
 
                 j = i + 3
@@ -1466,24 +1476,24 @@ class SignalEngine:
 
                     # B. 扩张触发检测 (条件A/B/C)
                     # 条件A(上扩): sj的高点>ZG_orig 但 下一笔回到[ZD_orig, ZG_orig]内
-                    cond_A = (sj['high'] > zg_orig and
+                    cond_A = (sj['high'] > zg_raw and
                               j + 1 < len(strokes) and
-                              zd_orig <= strokes[j + 1]['low'] <= zg_orig)
+                              zd_raw <= strokes[j + 1]['low'] <= zg_raw)
 
                     # 条件B(下扩): sj的低点<ZD_orig 但 下一笔回到[ZD_orig, ZG_orig]内
-                    cond_B = (sj['low'] < zd_orig and
+                    cond_B = (sj['low'] < zd_raw and
                               j + 1 < len(strokes) and
-                              zd_orig <= strokes[j + 1]['high'] <= zg_orig)
+                              zd_raw <= strokes[j + 1]['high'] <= zg_raw)
 
                     if cond_A or cond_B:
                         # 扩张触发! 将该笔的极端点加入中枢
                         if cond_A:
-                            zg_expanded = max(zg_orig, sj['high'])
-                            zd_expanded = zd_orig
+                            zg_expanded = max(zg_raw, sj['high'])
+                            zd_expanded = zd_raw
                             expanded_mode = 'A'
                         else:  # cond_B
-                            zg_expanded = zg_orig
-                            zd_expanded = min(zd_orig, sj['low'])
+                            zg_expanded = zg_raw
+                            zd_expanded = min(zd_raw, sj['low'])
                             expanded_mode = 'B'
 
                         expanded_flag = True
@@ -1521,8 +1531,8 @@ class SignalEngine:
 
                 # ===== 构建中枢记录 =====
                 pivot_rec = {
-                    'zg': zg_orig,
-                    'zd': zd_orig,
+                    'zg': zg_raw,
+                    'zd': zd_raw,
                     'zg_expanded': zg_expanded,
                     'zd_expanded': zd_expanded,
                     'stroke_start': i,
