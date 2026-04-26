@@ -248,12 +248,16 @@ class UnifiedExitManager:
                     )
 
         # === 6. Time stop ===
-        if self.config.use_time_stop and record.bars_held >= self.config.time_stop_bars:
-            if profit_pct < 0.03:
+        weak_time_stop = 3 if getattr(record, 'weak_market', False) else None
+        time_bars = weak_time_stop or self.config.time_stop_bars
+        if self.config.use_time_stop and record.bars_held >= time_bars:
+            if profit_pct < 0.03 or weak_time_stop:
                 return ExitSignal(
                     action='sell',
                     quantity=current_qty,
-                    reason=f'Time stop: held {record.bars_held} bars, profit only {profit_pct:.2%}',
+                    reason=f'Time stop: held {record.bars_held} bars'
+                           f'{" (弱市3日强制)" if weak_time_stop else ""}'
+                           f', profit {profit_pct:.2%}',
                     confidence=0.6,
                     exit_type='time_stop',
                 )

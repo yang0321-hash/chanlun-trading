@@ -41,6 +41,7 @@ class IndexAnalysis:
     low_20d: float = 0
     position_pct: float = 0  # 当前价在20日高低之间的分位
     ma_trend: str = 'mixed'  # bullish/bearish/mixed
+    ma5_trend_score: int = 1  # 0=连续3日下降 1=拐头/持平 2=连续3日上升
     # 缠论
     daily_pivot_zg: float = 0
     daily_pivot_zd: float = 0
@@ -55,6 +56,7 @@ class IndexAnalysis:
     min30_death_cross: bool = False
     # 综合判断
     phase: str = 'unknown'  # 上涨趋势/高位震荡/下跌趋势/低位反弹/收敛变盘
+    v2_score: int = 6       # TradingRules 12分制评分
 
 
 @dataclass
@@ -163,6 +165,18 @@ class MarketAnalyzer:
         else:
             idx.ma_trend = 'mixed'
 
+        # MA5趋势方向 (连续3日变化)
+        ma5_series = close.rolling(5).mean()
+        if len(ma5_series) >= 3:
+            last3 = ma5_series.iloc[-3:].values
+            diffs = [last3[i+1] - last3[i] for i in range(2)]
+            if all(d > 0 for d in diffs):
+                idx.ma5_trend_score = 2
+            elif all(d < 0 for d in diffs):
+                idx.ma5_trend_score = 0
+            else:
+                idx.ma5_trend_score = 1
+
         # 日线缠论
         try:
             kline = KLine.from_dataframe(df)
@@ -210,19 +224,34 @@ class MarketAnalyzer:
         # 综合判断phase
         idx.phase = self._classify_index_phase(idx)
 
+        # v2.0评分 (12分制，供规则引擎使用)
+        try:
+            from strategies.trading_rules import TradingRules
+            result = TradingRules.calc_market_score(close.values)
+            idx.v2_score = result.score
+        except Exception:
+            pass
+
         return idx
 
     def _classify_index_phase(self, idx: IndexAnalysis) -> str:
-        """单指数阶段判断"""
+        """单指数阶段判断 (6因子，满分+8/-8)"""
         score = 0
 
-        # MA趋势贡献
+        # 因子1: MA趋势排列 (+2/-2)
         if idx.ma_trend == 'bullish':
             score += 2
         elif idx.ma_trend == 'bearish':
             score -= 2
 
-        # 涨幅贡献
+        # 因子2: MA5趋势方向 (+2/0)
+        #   2=连续3日上升, 1=拐头/持平, 0=连续3日下降
+        if idx.ma5_trend_score == 2:
+            score += 2
+        elif idx.ma5_trend_score == 0:
+            score -= 0  # 下降不额外惩罚，但不得分
+
+        # 因子3: 涨幅贡献 (+2/-2)
         if idx.ret_20d > 0.08:
             score += 2
         elif idx.ret_20d > 0.03:
@@ -232,13 +261,13 @@ class MarketAnalyzer:
         elif idx.ret_20d < -0.03:
             score -= 1
 
-        # 位置分位
+        # 因子4: 位置分位 (+1/-1)
         if idx.position_pct > 0.8:
-            score += 1  # 高位
+            score += 1
         elif idx.position_pct < 0.2:
-            score -= 1  # 低位
+            score -= 1
 
-        # 中枢位置
+        # 因子5: 中枢位置 (+1/-1)
         if idx.pivot_position == 'above':
             score += 1
         elif idx.pivot_position == 'below':

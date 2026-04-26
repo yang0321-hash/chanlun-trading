@@ -376,7 +376,7 @@ class PreMarketAgent:
         except Exception as e:
             lines.append(f'  大盘数据获取失败: {e}')
 
-        # 简单趋势判断 — 用Sina
+        # 大盘评分 (v2.0 — 6因子12分制)
         try:
             import requests, re
             session = requests.Session()
@@ -388,20 +388,38 @@ class PreMarketAgent:
             match = re.search(r'callback\((.*)\)', resp.text)
             if match:
                 klines = json.loads(match.group(1))
-                if len(klines) >= 20:
+                if len(klines) >= 25:
                     closes = np.array([float(k['close']) for k in klines])
+                    volumes = np.array([float(k.get('volume', 0)) for k in klines])
+                    if volumes[-1] == 0:
+                        volumes = None
+
+                    from strategies.trading_rules import TradingRules
+                    result = TradingRules.calc_market_score(closes, volumes)
+
+                    state_cn = {
+                        'strong': '强势', 'moderate': '偏强/震荡',
+                        'weak': '偏弱', 'very_weak': '弱势',
+                    }
+                    env = state_cn.get(result.state, result.state)
+
+                    lines.append(f'  大盘评分: {result.score}/12 ({env})')
                     ma5 = np.mean(closes[-5:])
+                    ma10 = np.mean(closes[-10:])
                     ma20 = np.mean(closes[-20:])
-                    last = closes[-1]
+                    lines.append(f'  MA5:{ma5:,.0f} MA10:{ma10:,.0f} MA20:{ma20:,.0f}')
+                    lines.append(f'  仓位上限: {result.max_total_position}%  '
+                                 f'单票: {result.single_stock_max}%')
+                    lines.append(f'  可用买点: {", ".join(result.allowed_buy_types) or "无"}')
 
-                    if last > ma5 > ma20:
-                        trend = '多头排列'
-                    elif last < ma5 < ma20:
-                        trend = '空头排列'
-                    else:
-                        trend = '震荡'
-
-                    lines.append(f'  趋势: {trend} | MA5:{ma5:,.0f} MA20:{ma20:,.0f}')
+                    f = result.factors
+                    fstr = (f'价格vsMA5:{f.get("price_vs_ma5",0)} '
+                            f'MA5vsMA10:{f.get("ma5_vs_ma10",0)} '
+                            f'价格vsMA20:{f.get("price_vs_ma20",0)} '
+                            f'MACD:{f.get("macd_dif",0)} '
+                            f'量能:{f.get("volume",0)} '
+                            f'MA5方向:{f.get("ma5_trend",0)}')
+                    lines.append(f'  因子: {fstr}')
         except Exception:
             pass
 
