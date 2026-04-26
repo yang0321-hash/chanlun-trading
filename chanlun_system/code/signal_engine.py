@@ -1,11 +1,19 @@
 """
-缠论交易信号引擎 v14.1 (中枢背驰, 2026-04-15)
+缠论交易信号引擎 v15-final (中枢延伸/扩张/升级, 2026-04-23)
 
-v14→v14.1 新增:
-1. [P0] 中枢识别: 3笔重叠区域形成中枢[ZD, ZG]
-2. [P0] 趋势背驰1买: 2个下跌中枢+离开段MACD面积<进入段面积+分型确认
-3. [P0] 趋势背驰1卖: 2个上涨中枢+离开段MACD面积<进入段面积+分型确认
-4. 中枢背驰信号仓位加成0.18(与笔级背驰/2买/3买同等)
+v14.1→v15-final 新增(按v2.0附录A规范):
+1. [P0] 中枢延伸检测: N=4~8笔在中枢区间内震荡, ZG/ZD不变
+   - extended=True (N=6~8, 走势积蓄期, 2买降权)
+2. [P0] 中枢扩张检测(条件A/B):
+   - 条件A(上扩): stroke.high > ZG_orig 且 next.low ∈ [ZD_orig, ZG_orig]
+   - 条件B(下扩): stroke.low < ZD_orig 且 next.high ∈ [ZD_orig, ZG_orig]
+   - expanded=True, expanded_mode='A'/'B', zg_expanded/zd_expanded
+3. [P0] 中枢升级检测: N≥9触发升级
+   - upgraded=True (需上级别周期验证方能确认)
+4. 信号层影响:
+   - 扩展中枢(N=6~8): 2买/3买降权(方向不明)
+   - 扩张中枢: 3买目标位用zg_expanded
+   - 升级中枢: 3买失效需重新确认
 
 继承v14核心:
 v13→v14 新增:
@@ -1375,22 +1383,34 @@ class SignalEngine:
         return sell_2
 
     def _detect_pivots(self, strokes: List[Dict]) -> List[Dict]:
-        """v14.1: 中枢识别
+        """v15-final: 中枢识别 + 延伸/扩张/升级 (严格按附录A)
 
-        缠论中枢定义: 至少3笔重叠区域
-        中枢区间 = [ZD, ZG]（重叠部分的高低点）
-        中枢延伸: 后续笔高低点在中枢区间内，中枢继续
-        中枢新生: 笔离开中枢区间，当前中枢结束
+        【标准中枢】N=3笔重叠
+        【延伸 Extension】N=4~8: 笔在中枢区间内反复震荡，ZG/ZD不变
+            → extended=True (N=6~8), 走势积蓄期
+        【扩张 Expansion】ZG或ZD被突破后回撤，区间扩大但级别不变
+            → expanded=True, zg_expanded/zd_expanded更新
+            → 条件A(上扩): stroke.high > ZG_orig 且 next.low ∈ [ZD_orig, ZG_orig]
+            → 条件B(下扩): stroke.low < ZD_orig 且 next.high ∈ [ZD_orig, ZG_orig]
+        【升级 Upgrade】N≥9: 中枢级别提升(30分→日线等)
+            → upgraded=True, upgrade_level
 
         Returns:
-            pivots: [{
-                'zg': float,           # 中枢上沿
-                'zd': float,           # 中枢下沿
-                'stroke_start': int,   # 中枢起始笔索引
-                'stroke_end': int,     # 中枢结束笔索引(含延伸)
-                'direction': 'up'|'down',  # 中枢前的趋势方向
-                'start_idx': int,      # 起始K线索引
-                'end_idx': int,        # 结束K线索引
+            [{
+                'zg': float,           # 中枢上沿(原始)
+                'zd': float,           # 中枢下沿(原始)
+                'zg_expanded': float,  # 扩张后ZG(仅expanded=True时有效)
+                'zd_expanded': float,  # 扩张后ZD(仅expanded=True时有效)
+                'stroke_start': int,
+                'stroke_end': int,
+                'direction': 'up'|'down',
+                'start_idx': int,
+                'end_idx': int,
+                'total_strokes': int,    # 笔总数(含形成段+延伸段)
+                'extended': bool,         # N=6~8延伸(extended zone)
+                'expanded': bool,         # 扩张(区间已扩大)
+                'expanded_mode': None|'A'|'B'|'C',  # 扩张类型
+                'upgraded': bool,          # N≥9触发升级
             }]
         """
         if len(strokes) < 3:
@@ -1402,49 +1422,123 @@ class SignalEngine:
         while i <= len(strokes) - 3:
             s1, s2, s3 = strokes[i], strokes[i + 1], strokes[i + 2]
 
-            # 计算3笔重叠区域
-            zg = min(s1['high'], s2['high'], s3['high'])
-            zd = max(s1['low'], s2['low'], s3['low'])
+            # === Step 1: 形成标准中枢 ===
+            zg_orig = min(s1['high'], s2['high'], s3['high'])
+            zd_orig = max(s1['low'], s2['low'], s3['low'])
 
-            if zd < zg:
-                # 有效中枢成立
-                # 判断中枢前的趋势方向: 第1笔方向
+            if zd_orig < zg_orig:
                 direction = 'down' if s1['end_type'] == 'bottom' else 'up'
 
-                pivot_end = i + 2  # 中枢结束笔索引(初始为第3笔)
+                # 中枢内笔序列(从形成段开始)
+                pivot_strokes = [s1, s2, s3]
+                pivot_end = i + 2
+                total_strokes = 3  # 包含形成段
 
-                # 中枢延伸: 检查后续笔是否在中枢区间内
+                # === Step 2: 延伸/扩张/升级检测 ===
+                expanded_flag = False
+                expanded_mode = None   # 'A'/'B'/'C'
+                extended_flag = False
+                upgraded_flag = False
+                zg_cur = zg_orig       # 当前ZG(可能因扩张而变化)
+                zd_cur = zd_orig       # 当前ZD
+                zg_expanded = zg_orig  # 扩张后ZG(仅expanded时有效)
+                zd_expanded = zd_orig  # 扩张后ZD
+                expansion_triggered_stroke = None  # 触发扩张的那笔
+
                 j = i + 3
+
                 while j < len(strokes):
                     sj = strokes[j]
-                    # 笔的高低点完全在中枢内 → 延伸
-                    if sj['high'] <= zg and sj['low'] >= zd:
+
+                    # ===== 判断该笔是否属于本中枢 =====
+                    # A. 完全在中枢内 → 延伸
+                    if sj['high'] <= zg_cur and sj['low'] >= zd_cur:
+                        pivot_strokes.append(sj)
                         pivot_end = j
+                        total_strokes += 1
+
+                        # 扩展标记: N=6~8 (total_strokes=6~9 means extension=3~6)
+                        if 6 <= total_strokes <= 9:
+                            extended_flag = True
+
                         j += 1
-                    elif sj['high'] > zg or sj['low'] < zd:
-                        # 笔离开中枢 → 中枢结束
-                        # 但如果笔又回到中枢区间内，也算延伸
-                        if j + 1 < len(strokes):
-                            sj_next = strokes[j + 1]
-                            if sj_next['high'] <= zg and sj_next['low'] >= zd:
-                                pivot_end = j + 1
-                                j += 2
-                                continue
-                        break
+                        continue
+
+                    # B. 扩张触发检测 (条件A/B/C)
+                    # 条件A(上扩): sj的高点>ZG_orig 但 下一笔回到[ZD_orig, ZG_orig]内
+                    cond_A = (sj['high'] > zg_orig and
+                              j + 1 < len(strokes) and
+                              zd_orig <= strokes[j + 1]['low'] <= zg_orig)
+
+                    # 条件B(下扩): sj的低点<ZD_orig 但 下一笔回到[ZD_orig, ZG_orig]内
+                    cond_B = (sj['low'] < zd_orig and
+                              j + 1 < len(strokes) and
+                              zd_orig <= strokes[j + 1]['high'] <= zg_orig)
+
+                    if cond_A or cond_B:
+                        # 扩张触发! 将该笔的极端点加入中枢
+                        if cond_A:
+                            zg_expanded = max(zg_orig, sj['high'])
+                            zd_expanded = zd_orig
+                            expanded_mode = 'A'
+                        else:  # cond_B
+                            zg_expanded = zg_orig
+                            zd_expanded = min(zd_orig, sj['low'])
+                            expanded_mode = 'B'
+
+                        expanded_flag = True
+                        expansion_triggered_stroke = sj
+
+                        # 扩张触发笔加入中枢
+                        pivot_strokes.append(sj)
+                        pivot_end = j
+                        total_strokes += 1
+                        zg_cur = zg_expanded
+                        zd_cur = zd_expanded
+
+                        # 继续收集扩张后的延伸笔(用扩大后的区间判断)
+                        k = j + 1
+                        while k < len(strokes):
+                            sk = strokes[k]
+                            if sk['high'] <= zg_cur and sk['low'] >= zd_cur:
+                                pivot_strokes.append(sk)
+                                pivot_end = k
+                                total_strokes += 1
+                                k += 1
+                            else:
+                                break
+                        j = k  # 推进到脱离点
+
+                        # N≥9 → 升级
+                        if total_strokes >= 9:
+                            upgraded_flag = True
+
+                        break  # 扩张笔处理完，退出延伸循环
+
+                    # C. 既不在中枢内，也不触发扩张 → 中枢结束
                     else:
                         break
 
-                pivots.append({
-                    'zg': zg,
-                    'zd': zd,
+                # ===== 构建中枢记录 =====
+                pivot_rec = {
+                    'zg': zg_orig,
+                    'zd': zd_orig,
+                    'zg_expanded': zg_expanded,
+                    'zd_expanded': zd_expanded,
                     'stroke_start': i,
                     'stroke_end': pivot_end,
                     'direction': direction,
                     'start_idx': s1['start_idx'],
                     'end_idx': strokes[pivot_end]['end_idx'],
-                })
+                    'total_strokes': total_strokes,
+                    'extended': extended_flag,            # N=6~8延伸
+                    'expanded': expanded_flag,            # 扩张状态
+                    'expanded_mode': expanded_mode,      # 'A'/'B'/'C'/None
+                    'upgraded': upgraded_flag,           # N≥9升级
+                }
+                pivots.append(pivot_rec)
 
-                # 从中枢结束的下一笔继续寻找新中枢
+                # 从中枢结束的下一笔继续
                 i = pivot_end + 1
             else:
                 i += 1
@@ -1565,80 +1659,59 @@ class SignalEngine:
 
         return buy_divergence, sell_divergence
 
-    def _detect_3buy_context(self, filtered_fractals: List[Dict], df: pd.DataFrame) -> pd.Series:
-        """检测3买信号上下文 [v11]
+    def _detect_3buy_context(self, filtered_fractals: List[Dict], df: pd.DataFrame,
+                              strokes_from_bi: List[Dict] = None) -> pd.Series:
+        """v15: 检测3买信号上下文
 
         3买条件(缠论标准定义):
         1. 中枢形成: >=3笔重叠区间 [ZD, ZG]
         2. 向上突破: 笔的高点 > ZG
-        3. 回踩不破: 下一笔回调的低点 >= ZG
+        3. 回踩不破: 下一笔回调的低点 >= ZG (扩张中枢用zg_expanded)
         4. 回踩底分型 = 3买点
 
-        返回: 与bi_buy同索引的布尔Series, True表示该bi_buy同时也是3买
+        v15升级:
+        - 调用统一的_detect_pivots获取中枢(含扩张/扩展状态)
+        - 扩张中枢的回踩验证使用zg_expanded而非zg
+        - 扩展中枢的3买降权处理
 
-        注意: 3买是bi_buy的子集(在结构上满足3买条件的bi_buy), 不产生额外信号
+        Returns: 与bi_buy同索引的布尔Series, True表示该bi_buy同时也是3买
         """
         n = len(df)
         third_buy = pd.Series(False, index=df.index)
 
-        if len(filtered_fractals) < 5:  # 至少需要4个分型(3笔)才能形成中枢
+        if len(filtered_fractals) < 5:
             return third_buy
 
-        # 从分型序列构建笔序列
-        # filtered_fractals: [top, bottom, top, bottom, ...] 交替排列
+        # 构建笔序列 (供_detect_pivots使用)
         strokes = []
         for j in range(len(filtered_fractals) - 1):
             f1, f2 = filtered_fractals[j], filtered_fractals[j + 1]
             strokes.append({
+                'start_idx': f1['idx'],
                 'high': max(f1['val'], f2['val']),
                 'low': min(f1['val'], f2['val']),
-                'end_idx': f2['idx'],      # 原始K线索引
-                'end_type': f2['type'],     # 'top' 或 'bottom'
+                'end_idx': f2['idx'],
+                'end_type': f2['type'],
             })
 
         if len(strokes) < 3:
             return third_buy
 
-        # Step 1: 检测中枢(Zhongshu)
-        # 中枢: >=3笔连续重叠, ZG = min(各笔高点), ZD = max(各笔低点), ZG > ZD
-        zhongshu_list = []
-        j = 0
-        while j <= len(strokes) - 3:
-            s1, s2, s3 = strokes[j], strokes[j + 1], strokes[j + 2]
-            zg = min(s1['high'], s2['high'], s3['high'])
-            zd = max(s1['low'], s2['low'], s3['low'])
+        # v15: 使用统一的_detect_pivots获取中枢(含扩张/扩展字段)
+        pivots = self._detect_pivots(strokes)
 
-            if zg > zd:
-                # 中枢存在, 尝试向后延伸
-                k = j + 3
-                stroke_count = 3
-                while k < len(strokes):
-                    sk = strokes[k]
-                    new_zg = min(zg, sk['high'])
-                    new_zd = max(zd, sk['low'])
-                    if new_zg > new_zd:
-                        zg, zd = new_zg, new_zd
-                        k += 1
-                        stroke_count += 1
-                    else:
-                        break
+        if not pivots:
+            return third_buy
 
+        # Step 2: 检测3买 — 中枢后向上突破 + 回踩不破ZG(扩张时用zg_expanded)
+        for pivot in pivots:
+            # v15: 使用扩张后的ZG
+            zg = pivot['zg_expanded'] if pivot['expanded'] else pivot['zg']
+            zd = pivot['zd_expanded'] if pivot['expanded'] else pivot['zd']
+            pivot_expanded = pivot['expanded']
+            pivot_extended = pivot['extended']
 
-                zhongshu_list.append({
-                    'end_stroke': k - 1,
-                    'ZG': zg,
-                    'ZD': zd,
-                    'stroke_count': stroke_count,
-                })
-                j = k  # 跳过已属于该中枢的笔
-            else:
-                j += 1
-
-        # Step 2: 检测3买 — 中枢后向上突破 + 回踩不破ZG
-        for zs in zhongshu_list:
-            zg = zs['ZG']
-            zd = zs['ZD']
-            next_s = zs['end_stroke'] + 1
+            next_s = pivot['stroke_end'] + 1
 
             if next_s >= len(strokes):
                 continue
@@ -1657,15 +1730,15 @@ class SignalEngine:
             if broke_out_idx < 0:
                 continue  # 未突破, 跳过
 
-            # Phase 2: 突破后寻找回踩 [v13 fix: 修复or True bug]
-            # 标准3买: 回踩低点 >= ZG
+            # Phase 2: 突破后寻找回踩
+            # 标准3买: 回踩低点 >= ZG (扩张中枢用zg_expanded)
             # 弱3买:   回踩低点 >= ZD (仅当无标准3买时)
             found_standard_3buy = False
             weak_3buy_signal = None
             for k in range(broke_out_idx + 1, len(strokes)):
                 sk = strokes[k]
                 if sk['end_type'] == 'bottom' and sk['low'] >= zg:
-                    # 标准3买!
+                    # v15: 扩张中枢的3买有效, 扩展中枢3买降权(不做为独立信号增强)
                     signal_idx = sk['end_idx'] + self.bi_confirm_delay
                     if 0 <= signal_idx < n:
                         third_buy.iloc[signal_idx] = True

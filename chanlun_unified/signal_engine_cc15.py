@@ -157,11 +157,13 @@ class SignalEngine:
         except Exception:
             pass
 
-    def generate(self, data_map: Dict[str, pd.DataFrame], live_mode: bool = False) -> Dict[str, pd.Series]:
+    def generate(self, data_map: Dict[str, pd.DataFrame], live_mode: bool = False,
+                 use_pivots: bool = False) -> Dict[str, pd.Series]:
         """组合层信号生成，初始化共享状态
 
         live_mode=True: 只算当月动态池top50(秒级), 用于实盘扫描
         live_mode=False: 算所有月份进入过池的股票(分钟级), 用于回测
+        use_pivots=True: 使用_detect_pivots(支持扩展/扩张/升级中枢状态)
         """
         # 标准化: 确保datetime列设为index
         normalized_map = {}
@@ -221,7 +223,7 @@ class SignalEngine:
                 if not in_pool:
                     signals[code] = pd.Series(0.0, index=df.index)
                     continue
-            signals[code] = self._generate_single(code, df, monthly_momentum_rank, dynamic_pool)
+            signals[code] = self._generate_single(code, df, monthly_momentum_rank, dynamic_pool, use_pivots=use_pivots)
 
         return signals
 
@@ -488,7 +490,8 @@ class SignalEngine:
 
     def _generate_single(self, code: str, df: pd.DataFrame,
                          monthly_momentum_rank: Dict[str, Dict[str, float]] = None,
-                         dynamic_pool: Dict[str, set] = None) -> pd.Series:
+                         dynamic_pool: Dict[str, set] = None,
+                         use_pivots: bool = False) -> pd.Series:
         """单只股票信号生成
 
         信号语义:
@@ -509,6 +512,26 @@ class SignalEngine:
         # ===== 预计算指标 =====
         bi_buy, bi_sell, filtered_fractals, strokes = self._detect_bi_deterministic(df)
 
+        # ===== v15-final: 中枢状态预计算 (扩展/扩张/升级) =====
+        # 仅在 use_pivots=True 时计算; strokes 已在上方定义
+        pivot_pos_multiplier = 1.0  # 全局默认
+        if use_pivots and strokes:  # strokes可能为空/None
+            try:
+                pivot_list = self._detect_pivots(strokes)
+                # 统计各类枢状态
+                ext_count = sum(1 for p in pivot_list if p['extended'] and not p['expanded'] and not p['upgraded'])
+                upgr_count = sum(1 for p in pivot_list if p['upgraded'])
+                exp_count = sum(1 for p in pivot_list if p['expanded'])
+                # 如果枢列表中扩展/升级占比>30%，整体降权
+                total = len(pivot_list)
+                if total > 0:
+                    if upgr_count / total > 0.3:
+                        pivot_pos_multiplier = 0.5
+                    elif ext_count / total > 0.3:
+                        pivot_pos_multiplier = 0.7
+            except Exception:
+                pivot_pos_multiplier = 1.0
+
         # MACD (v13: 提前计算, 面积背驰需要)
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
@@ -522,7 +545,7 @@ class SignalEngine:
             third_buy = self._detect_3buy_context(filtered_fractals, df)
 
         # ===== v13→v15: 面积背驰(区分趋势/盘整) + 2买预计算 =====
-        buy_div_set, sell_div_set, trend_buy_div, trend_sell_div = self._compute_area_divergence(strokes, macd_hist, n)
+        buy_div_set, sell_div_set, trend_buy_div, trend_sell_div = self._compute_area_divergence(strokes, macd_hist, n, use_pivots=use_pivots)
         buy_2buy_set = self._detect_2buy(strokes, buy_div_set, n)
 
         # ===== v14: 线段检测 + 线段背驰 + 2卖 =====
@@ -903,6 +926,12 @@ class SignalEngine:
                     final_pos = max(self.min_position * 0.5, min(final_pos, self.max_position))
                     stop_pct = min(stop_pct, self.max_stop_pct)
 
+                # [v15-final] 中枢状态仓位降权: 扩展枢×0.7, 升级枢×0.5
+                # 适用于所有买点信号; 在volatility调整之后应用(避免重复乘)
+                if pivot_pos_multiplier < 1.0:
+                    final_pos *= pivot_pos_multiplier
+                    final_pos = max(self.min_position, final_pos)
+
                 # 输出买入信号
                 signals.iloc[i] = final_pos
                 position = final_pos
@@ -1058,11 +1087,12 @@ class SignalEngine:
 
         return buy_signals, sell_signals, filtered, strokes
 
-    def _compute_area_divergence(self, strokes: List[Dict], macd_hist: pd.Series, n: int):
+    def _compute_area_divergence(self, strokes: List[Dict], macd_hist: pd.Series, n: int,
+                                  use_pivots: bool = False):
         """v13→v15: MACD面积背驰检测, 区分盘整背驰与趋势背驰
 
-        趋势背驰(强): 两段同向笔都不在同一中枢内(离开中枢后的背驰)
-        盘整背驰(弱): 两段同向笔至少有一段在中枢震荡内
+        use_pivots=True 时使用 _detect_pivots(支持扩展/扩张/升级状态)，
+        use_pivots=False 时使用 _detect_zhongshu_from_strokes。
 
         Returns:
             buy_divergence: set of signal_idx — 底背驰(1买)位置
@@ -1075,8 +1105,11 @@ class SignalEngine:
         trend_buy_div = set()
         trend_sell_div = set()
 
-        # 预计算中枢(与3买检测一致)
-        zhongshu_list = self._detect_zhongshu_from_strokes(strokes)
+        # 预计算中枢
+        if use_pivots:
+            zhongshu_list = self._detect_pivots(strokes)
+        else:
+            zhongshu_list = self._detect_zhongshu_from_strokes(strokes)
 
         # 分类下跌笔和上涨笔
         down_strokes = [s for s in strokes
@@ -1183,6 +1216,140 @@ class SignalEngine:
                 j += 1
 
         return zhongshu_list
+
+    def _detect_pivots(self, strokes: List[Dict]) -> List[Dict]:
+        """v15-final: 中枢识别 + 延伸/扩张/升级 (严格按v2.0附录A)
+
+        【标准中枢】N=3笔重叠
+        【延伸 Extension】N=4~8: 笔在中枢区间内反复震荡，ZG/ZD不变
+            → extended=True (N=6~8, 走势积蓄期)
+        【扩张 Expansion】ZG或ZD被突破后回撤，区间扩大但级别不变
+            → expanded=True, ZG_expanded/ZD_expanded更新
+            → 条件A(上扩): stroke.high > ZG_orig 且 next.low ∈ [ZD_orig, ZG_orig]
+            → 条件B(下扩): stroke.low < ZD_orig 且 next.high ∈ [ZD_orig, ZG_orig]
+        【升级 Upgrade】N≥9: 中枢级别提升(30分→日线等)
+            → upgraded=True
+
+        字段名适配CC15: ZG/ZD/ZG_expanded/ZD_expanded
+        Returns:
+            [{
+                'ZG': float, 'ZD': float,
+                'ZG_expanded': float, 'ZD_expanded': float,
+                'stroke_start': int, 'stroke_end': int,
+                'direction': 'up'|'down',
+                'total_strokes': int,
+                'extended': bool,     # N=6~8延伸
+                'expanded': bool,     # 扩张状态
+                'expanded_mode': None|'A'|'B',
+                'upgraded': bool,     # N≥9升级
+            }]
+        """
+        if len(strokes) < 3:
+            return []
+
+        pivots = []
+        i = 0
+
+        while i <= len(strokes) - 3:
+            s1, s2, s3 = strokes[i], strokes[i + 1], strokes[i + 2]
+
+            zg_orig = min(s1['high'], s2['high'], s3['high'])
+            zd_orig = max(s1['low'], s2['low'], s3['low'])
+
+            if zd_orig < zg_orig:
+                direction = 'down' if s1['end_type'] == 'bottom' else 'up'
+
+                pivot_strokes = [s1, s2, s3]
+                pivot_end = i + 2
+                total_strokes = 3
+
+                expanded_flag = False
+                expanded_mode = None
+                extended_flag = False
+                upgraded_flag = False
+                zg_cur = zg_orig
+                zd_cur = zd_orig
+                zg_expanded = zg_orig
+                zd_expanded = zd_orig
+
+                j = i + 3
+                while j < len(strokes):
+                    sj = strokes[j]
+
+                    # A. 完全在中枢内 → 延伸
+                    if sj['high'] <= zg_cur and sj['low'] >= zd_cur:
+                        pivot_strokes.append(sj)
+                        pivot_end = j
+                        total_strokes += 1
+                        if 6 <= total_strokes <= 9:
+                            extended_flag = True
+                        j += 1
+                        continue
+
+                    # B. 扩张触发检测
+                    cond_A = (sj['high'] > zg_orig and
+                              j + 1 < len(strokes) and
+                              zd_orig <= strokes[j + 1]['low'] <= zg_orig)
+                    cond_B = (sj['low'] < zd_orig and
+                              j + 1 < len(strokes) and
+                              zd_orig <= strokes[j + 1]['high'] <= zg_orig)
+
+                    if cond_A or cond_B:
+                        if cond_A:
+                            zg_expanded = max(zg_orig, sj['high'])
+                            zd_expanded = zd_cur
+                            expanded_mode = 'A'
+                        else:
+                            zg_expanded = zg_cur
+                            zd_expanded = min(zd_orig, sj['low'])
+                            expanded_mode = 'B'
+
+                        expanded_flag = True
+                        pivot_strokes.append(sj)
+                        pivot_end = j
+                        total_strokes += 1
+                        zg_cur = zg_expanded
+                        zd_cur = zd_expanded
+
+                        k = j + 1
+                        while k < len(strokes):
+                            sk = strokes[k]
+                            if sk['high'] <= zg_cur and sk['low'] >= zd_cur:
+                                pivot_strokes.append(sk)
+                                pivot_end = k
+                                total_strokes += 1
+                                k += 1
+                            else:
+                                break
+                        j = k
+
+                        if total_strokes >= 9:
+                            upgraded_flag = True
+                        break
+                    else:
+                        break
+
+                pivots.append({
+                    'ZG': zg_orig,
+                    'ZD': zd_orig,
+                    'ZG_expanded': zg_expanded,
+                    'ZD_expanded': zd_expanded,
+                    'stroke_start': i,
+                    'stroke_end': pivot_end,
+                    'direction': direction,
+                    'start_idx': s1['start_idx'],
+                    'end_idx': strokes[pivot_end]['end_idx'],
+                    'total_strokes': total_strokes,
+                    'extended': extended_flag,
+                    'expanded': expanded_flag,
+                    'expanded_mode': expanded_mode,
+                    'upgraded': upgraded_flag,
+                })
+                i = pivot_end + 1
+            else:
+                i += 1
+
+        return pivots
 
     def _detect_2buy(self, strokes: List[Dict], buy_divergence: set, n: int) -> set:
         """v13: 2买检测
