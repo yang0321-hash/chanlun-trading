@@ -190,11 +190,11 @@ class KLine:
         direction = self._get_direction(processed)
 
         if direction == 'up':
-            # 上升趋势：取高点的高，低点的低
+            # 上升趋势：取高点中的高，低点中的高 => 向上合并，保留偏高的边界
             new_high = max(k1.high, k2.high)
             new_low = max(k1.low, k2.low)
         else:
-            # 下降趋势：取低点的低，高点的高
+            # 下降趋势：取高点中的低，低点中的低 => 向下合并，保留偏低的边界
             new_high = min(k1.high, k2.high)
             new_low = min(k1.low, k2.low)
 

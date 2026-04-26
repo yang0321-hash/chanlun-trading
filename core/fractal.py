@@ -120,17 +120,12 @@ class FractalDetector:
                 if self.confirm_required:
                     if self._check_fractal_confirmed(fractal):
                         self.fractals.append(fractal)
-                        # 分型已确认，从中间K线下一根开始（不跳过，
-                        # 因为第3根K线可能是下一个分型的第1根）
                         i += 2
                     else:
-                        # 未确认，继续下一根K线
                         i += 1
                 else:
                     self.fractals.append(fractal)
-                    # 不需要确认时也从中间K线下一根开始，
-                    # 但不跳过第3根（它可能参与下一个分型）
-                    i += 1
+                    i += 2
             else:
                 i += 1
 
