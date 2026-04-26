@@ -1726,8 +1726,8 @@ class BuySellPointDetector:
 
     def _detect_second_buy(self) -> None:
         """批量检测所有2买点（加权评分 + 2买3买重叠检测）"""
-        for bp in self._buy_points:
-            if bp.point_type != '1buy':
+        for bp in list(self._buy_points):
+            if bp.point_type not in ('1buy', 'sub1buy'):
                 continue
 
             up_after = [s for s in self.strokes
@@ -1788,12 +1788,14 @@ class BuySellPointDetector:
                         confidence += 0.10
                         sub_info = f', {sub_desc}'
 
-                    # ===== 2买3买重叠检测（数据驱动：+4.8%胜率提升，84.0%WR）=====
+                    # ===== 2买3买重叠检测 =====
+                    is_overlap = False
                     overlap_info = ''
                     for pivot in reversed(self.pivots):
                         if pivot.start_index <= bp.index <= pivot.end_index + 30:
                             if pb.end_value > pivot.zg:
-                                confidence += 0.10
+                                is_overlap = True
+                                confidence += 0.15
                                 overlap_info = f', 2买3买重叠(回踩>ZG={pivot.zg:.2f})'
                             break
 
@@ -1805,15 +1807,19 @@ class BuySellPointDetector:
                     confidence = max(0.1, min(1.0, confidence))
                     stop_loss = pb.low * 0.99
 
+                    # 重叠用独立类型，否则普通2买
+                    pt_type = '2b3bbuy' if is_overlap else '2buy'
+                    base_reason = f'2买3买重叠: 回踩>ZG不进中枢' if is_overlap else f'2买: 回调不破{bp.point_type}{bp.price:.2f}'
+
                     self._buy_points.append(BuySellPoint(
-                        point_type='2buy',
+                        point_type=pt_type,
                         price=pb.end_value,
                         index=pb.end_index,
                         related_pivot=bp.related_pivot,
                         related_strokes=[up_s, pb],
                         confidence=confidence,
                         stop_loss=stop_loss,
-                        reason=f'2买: 回调不破1买{bp.price:.2f}{vol_info}{macd_info}{sub_info}{overlap_info}'
+                        reason=f'{base_reason}{vol_info}{macd_info}{sub_info}'
                     ))
                     break
                 break

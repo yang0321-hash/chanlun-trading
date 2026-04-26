@@ -883,6 +883,127 @@ def _find_3buy_standalone(engine, code, df):
     return results
 
 
+def _find_sub1buy_standalone(engine, code, df):
+    """找日线盘整背驰1买 (sub1B)
+
+    盘整背驰: 中枢震荡中，离开中枢的向下笔出现MACD面积背驰，
+    但不要求之前有更高中枢（无下跌趋势）。
+
+    检测逻辑:
+    1. 识别中枢
+    2. 找无下跌趋势的中枢（盘整中枢）
+    3. 离开中枢的向下笔MACD面积 < 进入中枢的向下笔MACD面积
+    """
+    n = len(df)
+    if n < 120:
+        return []
+
+    close = df['close']
+    low = df['low']
+    high = df['high']
+
+    bi_buy, bi_sell, filtered_fractals, strokes = engine._detect_bi_deterministic(df)
+    if len(strokes) < 6:
+        return []
+
+    # MACD
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    dif = ema12 - ema26
+    dea = dif.ewm(span=9, adjust=False).mean()
+    hist = 2 * (dif - dea)
+
+    # 检测中枢 (复用3买的逻辑)
+    pivots = []
+    i = 0
+    while i <= len(strokes) - 3:
+        s1, s2, s3 = strokes[i], strokes[i+1], strokes[i+2]
+        highs = [max(s['start_val'], s['end_val']) for s in [s1, s2, s3]]
+        lows = [min(s['start_val'], s['end_val']) for s in [s1, s2, s3]]
+        zg = min(highs)
+        zd = max(lows)
+        if zg > zd:
+            end_i = i + 2
+            for j in range(i + 3, len(strokes)):
+                sj_high = max(strokes[j]['start_val'], strokes[j]['end_val'])
+                sj_low = min(strokes[j]['start_val'], strokes[j]['end_val'])
+                if min(sj_high, zg) > max(sj_low, zd):
+                    end_i = j
+                else:
+                    break
+            end_idx = max(*[strokes[k]['end_idx'] for k in range(i, end_i + 1)])
+            start_idx = min(*[strokes[k]['start_idx'] for k in range(i, end_i + 1)])
+            pivots.append({
+                'zg': zg, 'zd': zd,
+                'start_idx': start_idx, 'end_idx': end_idx,
+                'stroke_start': i, 'stroke_end': end_i,
+                'bi_count': end_i - i + 1,
+            })
+            i = end_i + 1
+        else:
+            i += 1
+
+    if not pivots:
+        return []
+
+    results = []
+    for pi, pv in enumerate(pivots):
+        # 跳过有下跌趋势的中枢（标准1buy处理）
+        has_downtrend = any(
+            prev['zd'] > pv['zg'] for prev in pivots[:pi]
+        )
+        if has_downtrend:
+            continue
+
+        # 找离开中枢的向下笔
+        for si in range(pv['stroke_end'] + 1, len(strokes)):
+            s = strokes[si]
+            if s['start_type'] != 'top' or s['end_type'] != 'bottom':
+                continue
+            s_low = min(s['start_val'], s['end_val'])
+            if s_low >= pv['zd']:
+                continue  # 未离开中枢
+
+            # MACD面积背驰检测
+            leave_start = max(0, s['start_idx'] - 1)
+            leave_end = min(n - 1, s['end_idx'] + 1)
+            leave_area = abs(hist.iloc[leave_start:leave_end+1].clip(upper=0).sum())
+
+            # 找进入中枢的向下笔MACD面积
+            enter_area = 0
+            for ei in range(pv['stroke_start'], pv['stroke_end'] + 1):
+                es = strokes[ei]
+                if es['start_type'] == 'top' and es['end_type'] == 'bottom':
+                    e_start = max(0, es['start_idx'] - 1)
+                    e_end = min(n - 1, es['end_idx'] + 1)
+                    e_area = abs(hist.iloc[e_start:e_end+1].clip(upper=0).sum())
+                    enter_area = max(enter_area, e_area)
+
+            if enter_area > 0 and leave_area < enter_area * 0.8:
+                # 背驰确认：离开面积 < 进入面积 × 0.8
+                entry_idx = s['end_idx']
+                if entry_idx >= n:
+                    continue
+                entry_price = close.iloc[entry_idx]
+                stop_price = s_low * 0.99
+                ratio = leave_area / enter_area
+
+                results.append({
+                    'signal_type': 'sub1buy',
+                    'entry_price': entry_price,
+                    'stop_price': stop_price,
+                    'sig_idx': entry_idx,
+                    'pivot_zg': pv['zg'],
+                    'pivot_zd': pv['zd'],
+                    'divergence_ratio': round(ratio, 3),
+                    'confidence': min(0.75, 0.40 + (1.0 - ratio) * 0.35),
+                })
+
+            break  # 每个中枢只看第一笔离开
+
+    return results
+
+
 def _mp_worker(args):
     """多进程Worker: 每个进程独立创建SignalEngine, 分析单只股票"""
     code, sdata, mkt_regime, cutoff = args
@@ -938,6 +1059,16 @@ def _mp_worker(args):
         for s in threes:
             if s.get('trend_type') == 'down':
                 continue
+            if s['sig_idx'] < len(df):
+                sig_date = df.index[s['sig_idx']]
+                if sig_date >= pd.Timestamp(cutoff):
+                    s['code'] = code
+                    s['sig_date'] = sig_date
+                    signals.append(s)
+
+        # 盘整背驰1买 (sub1B) — 所有行情均可检测
+        sub1s = _find_sub1buy_standalone(engine, code, df)
+        for s in sub1s:
             if s['sig_idx'] < len(df):
                 sig_date = df.index[s['sig_idx']]
                 if sig_date >= pd.Timestamp(cutoff):
@@ -1289,6 +1420,14 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
                 strength_bonus += 3   # 强2买(不进中枢): 追高风险
             else:
                 strength_bonus += 5   # 普通中枢下2买
+        elif signal_type == 'sub1buy':
+            # sub1B: 盘整背驰，胜率与1buy持平，略低于2/3买
+            div_ratio = item.get('divergence_ratio', 1.0)
+            strength_bonus += 5  # 基础分
+            if div_ratio < 0.5:
+                strength_bonus += 8  # 强背驰
+            elif div_ratio < 0.8:
+                strength_bonus += 3
         else:
             # 3买和其他: 保持原逻辑
             if buy_strength == 'strong':
