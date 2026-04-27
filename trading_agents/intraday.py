@@ -260,6 +260,30 @@ class IntradayAgent:
             except Exception:
                 pass
 
+        # 观察池 (委员会BUY候选等回踩)
+        obs_file = 'signals/observation_pool.json'
+        if os.path.exists(obs_file):
+            try:
+                with open(obs_file, 'r', encoding='utf-8') as f:
+                    obs = json.load(f)
+                for item in obs.get('stocks', []):
+                    if item.get('status') == 'watching':
+                        c = item.get('code', '')
+                        if c:
+                            codes.add(c)
+                            self.watchlist_names[c] = item.get('name', '')
+                            # Also store entry zone for pullback check
+                            if not hasattr(self, '_obs_entries'):
+                                self._obs_entries = {}
+                            self._obs_entries[c] = {
+                                'entry_zone': item.get('entry_zone', ''),
+                                'stop_loss': item.get('stop_loss', 0),
+                                'score': item.get('score', 0),
+                                'name': item.get('name', ''),
+                            }
+            except Exception:
+                pass
+
         # 额外监控列表 (手动添加的候选股)
         extra_file = 'signals/extra_watchlist.json'
         if os.path.exists(extra_file):
@@ -371,6 +395,10 @@ class IntradayAgent:
         # 减仓点检测 (每5轮一次)
         if self.scan_count % 5 == 2:
             self._detect_sell_signals()
+
+        # 观察池回踩检测 (每3轮一次)
+        if self.scan_count % 3 == 0:
+            self._check_observation_pool()
 
     def _check_realtime_quotes(self):
         """获取实时报价，记录涨跌"""
@@ -921,6 +949,127 @@ class IntradayAgent:
         report = '\n'.join(lines)
         send_notification(f'尾盘分析 {datetime.now().strftime("%m-%d")}', report)
 
+    def _check_observation_pool(self):
+        """检查观察池股票是否回踩到入场区并出现缠论买点确认"""
+        if not hasattr(self, '_obs_entries') or not self._obs_entries:
+            return
+
+        for code, info in self._obs_entries.items():
+            if info.get('confirmed'):
+                continue
+
+            # Get current price from events
+            price = 0
+            for ev in self.events:
+                if ev.get('code') == code or ev.get('code') == code.upper():
+                    price = ev.get('price', 0)
+                    break
+            if price <= 0:
+                continue
+
+            # Parse entry zone
+            entry_zone = info.get('entry_zone', '')
+            try:
+                zone_part = entry_zone.split('(')[0].strip()
+                lo, hi = zone_part.split('-')
+                lo, hi = float(lo), float(hi)
+            except Exception:
+                lo = price * 0.95
+                hi = price * 1.0
+
+            if not (lo <= price <= hi or price < lo):
+                continue
+
+            # Price in entry zone — run ChanLun confirmation
+            try:
+                from core.kline import KLine
+                from core.fractal import FractalDetector
+                from core.stroke import StrokeGenerator
+                from core.pivot import PivotDetector
+                from indicator.macd import MACD
+                from core.buy_sell_points import BuySellPointDetector
+
+                df = self.hs.get_kline(code, period='daily')
+                if df is None or len(df) < 60:
+                    continue
+
+                close_s = pd.Series(df['close'].values)
+                macd_obj = MACD(close_s)
+                kline = KLine.from_dataframe(df, strict_mode=False)
+                fractals = FractalDetector(kline, confirm_required=False).get_fractals()
+                if len(fractals) < 4:
+                    continue
+                strokes = StrokeGenerator(kline, fractals, min_bars=3).get_strokes()
+                if len(strokes) < 3:
+                    continue
+                pivots = PivotDetector(kline, strokes).get_pivots()
+                det = BuySellPointDetector(fractals, strokes, [], pivots, macd=macd_obj)
+                buys, _ = det.detect_all()
+
+                n = len(df)
+                recent_buys = [b for b in buys if b.index >= n - 5]
+                if not recent_buys:
+                    continue
+
+                best = max(recent_buys, key=lambda b: b.confidence)
+                types = list(set(b.point_type for b in recent_buys))
+
+                # Mark confirmed
+                info['confirmed'] = True
+                msg = (f"★ 观察池回踩确认! {info.get('name',code)} "
+                       f"价格={price:.2f} 入场区=[{lo:.1f}-{hi:.1f}] "
+                       f"买点={','.join(types)} conf={best.confidence:.2f} "
+                       f"止损={info.get('stop_loss',0):.2f}")
+
+                print(f'  {msg}')
+                self.events.append({
+                    'time': datetime.now().strftime('%H:%M'),
+                    'type': 'pullback_confirm',
+                    'code': code,
+                    'name': info.get('name', ''),
+                    'price': price,
+                    'signal': ','.join(types),
+                    'confidence': best.confidence,
+                })
+
+                # Save alert
+                alert_file = 'signals/observation_alerts.json'
+                all_alerts = []
+                if os.path.exists(alert_file):
+                    try:
+                        with open(alert_file, 'r', encoding='utf-8') as f:
+                            all_alerts = json.load(f)
+                    except Exception:
+                        pass
+                all_alerts.append({
+                    'time': datetime.now().strftime('%Y-%m-%d %H:%M'),
+                    'code': code,
+                    'name': info.get('name', ''),
+                    'price': price,
+                    'stop_loss': info.get('stop_loss', 0),
+                    'signal_type': ','.join(types),
+                    'confidence': best.confidence,
+                    'message': msg,
+                })
+                with open(alert_file, 'w', encoding='utf-8') as f:
+                    json.dump(all_alerts, f, ensure_ascii=False, indent=2)
+
+                # Update pool status
+                pool_file = 'signals/observation_pool.json'
+                if os.path.exists(pool_file):
+                    with open(pool_file, 'r', encoding='utf-8') as f:
+                        pool = json.load(f)
+                    for s in pool.get('stocks', []):
+                        if s.get('code') == code:
+                            s['status'] = 'confirmed'
+                            s['confirm_price'] = price
+                            s['confirm_time'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+                    with open(pool_file, 'w', encoding='utf-8') as f:
+                        json.dump(pool, f, ensure_ascii=False, indent=2)
+
+            except Exception as e:
+                print(f'  观察池检查 {code} 异常: {e}')
+
     def _detect_sell_signals(self):
         """检测30min减仓点 — 持仓股 + 今日出买点的个股"""
         position_codes = {pos.code for pos in self.pm.get_all_positions()}
@@ -1110,6 +1259,10 @@ class IntradayAgent:
                 elif e.get('type') == 'drop':
                     lines.append(f'  {e["time"]} [跌] {code_to_prefix(e["code"])} '
                                f'({e["name"]}) {e["pct"]:+.2f}%')
+                elif e.get('type') == 'pullback_confirm':
+                    lines.append(f'  {e["time"]} [回踩确认] {code_to_prefix(e["code"])} '
+                               f'({e["name"]}) 价格={e["price"]:.2f} '
+                               f'{e["signal"]} conf={e["confidence"]:.2f}')
 
         report = '\n'.join(lines)
         filename = f'signals/intraday_{self.today.replace("-", "")}.txt'
