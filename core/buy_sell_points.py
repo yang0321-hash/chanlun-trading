@@ -1986,6 +1986,25 @@ class BuySellPointDetector:
                     if bo_vol > 1.3:
                         confidence += 0.10
 
+                    # === 3买增强过滤 (147只回测验证) ===
+                    # MACD方向: DIF递增=97.8%WR, DIF递减扣分
+                    macd_dir_info = ''
+                    if self.macd:
+                        try:
+                            dif_s = self.macd.get_dif_series()
+                            idx_m = min(pb.end_index, len(dif_s) - 1)
+                            if idx_m > 0 and dif_s.iloc[idx_m] <= dif_s.iloc[idx_m - 1]:
+                                confidence -= 0.08
+                                macd_dir_info = ', MACD下行'
+                        except (IndexError, AttributeError):
+                            pass
+
+                    # 入场量能: vol<0.8x均量=90.5%WR(比均值低2%), 惩罚
+                    entry_vol_info = ''
+                    if bo_vol > 0 and bo_vol < 0.8:
+                        confidence -= 0.06
+                        entry_vol_info = ', 突破缩量'
+
                     reason_suffix = f', {strength_label}'
                     if pivot_div:
                         reason_suffix += f', 振幅背驰({amp_ratio:.2f})'
@@ -1993,7 +2012,7 @@ class BuySellPointDetector:
                         reason_suffix += f', 离开力度={amp_ratio:.2f}'
                     if macd_confirmed:
                         reason_suffix += f', MACD确认({macd_ratio:.2f})'
-                    reason_suffix += fib_info + vol_info + gravity_info + consolidation_info + evolution_info
+                    reason_suffix += fib_info + vol_info + gravity_info + consolidation_info + evolution_info + macd_dir_info + entry_vol_info
 
                     # 子级别递归确认
                     sub_ok, sub_low, sub_desc = self._check_sub_level_3buy(zg)
@@ -2146,6 +2165,18 @@ class BuySellPointDetector:
                 confidence += 0.04
                 gravity_info = f', 中引力(g={gravity:.1f})'
 
+            # === 3买增强过滤: MACD方向 + 突破量能 ===
+            pivot_3buy_filter_info = ''
+            if self.macd:
+                try:
+                    dif_s = self.macd.get_dif_series()
+                    idx_m = min(p2.end_index, len(dif_s) - 1)
+                    if idx_m > 0 and dif_s.iloc[idx_m] <= dif_s.iloc[idx_m - 1]:
+                        confidence -= 0.08
+                        pivot_3buy_filter_info = ', MACD下行'
+                except (IndexError, AttributeError):
+                    pass
+
             confidence = max(0.1, min(1.0, confidence))
 
             # 3买价格 = P2内最后一笔向下笔的终点（回调低点，真正的买入位）
@@ -2183,7 +2214,7 @@ class BuySellPointDetector:
                 stop_loss=stop_loss,
                 reason=f'3买[中枢法]: P2.ZD={p2_zd:.2f}>P1.ZG={p1_zg:.2f}, gap={gap:.2%}'
                        f'{amp_info}{macd_info}{quality_info}{evo_info}'
-                       f'{sub_level_info}{gravity_info}{sub_info}',
+                       f'{sub_level_info}{gravity_info}{sub_info}{pivot_3buy_filter_info}',
                 recommended_hold_days=hold_days,
                 exit_urgency=urgency,
             ))
