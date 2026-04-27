@@ -1514,13 +1514,16 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
             'trend_strength': trend_str_val,
         })
 
-    # 7. 排序输出
+    # 7. 排序 + 最低分过滤
     t_30min = time.time() - t_30min_start
     elapsed = time.time() - t0
+    MIN_SCORE = 50  # 低于50分胜率<50%、平均收益为负 (全市场4885信号验证)
+    before_filter = len(results)
+    results = [r for r in results if r['total_score'] >= MIN_SCORE]
     results.sort(key=lambda x: x['total_score'], reverse=True)
 
     print(f'\n{"="*90}')
-    print(f'扫描完成 ({elapsed:.0f}s) — {len(results)} 只候选股, 显示Top {top_n}')
+    print(f'扫描完成 ({elapsed:.0f}s) — {len(results)} 只候选股 (过滤{before_filter - len(results)}只<{MIN_SCORE}分), 显示Top {top_n}')
     print(f'  Step5缠论: {t_scan:.0f}s | Step6确认+评分: {t_30min:.0f}s')
     print(f'{"="*90}')
 
