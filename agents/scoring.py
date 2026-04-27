@@ -20,12 +20,12 @@ LEGACY_WEIGHTS = {
 }
 
 DEFAULT_WEIGHTS = {
-    'technical_bull': 0.18,
-    'technical_bear': 0.13,
-    'sentiment': 0.17,
-    'sector_rotation': 0.13,
-    'scanner_base': 0.13,
-    'risk_adjustment': 0.13,
+    'technical_bull': 0.35,
+    'technical_bear': 0.15,
+    'sentiment': 0.15,
+    'sector_rotation': 0.20,
+    'scanner_base': 0.075,
+    'risk_adjustment': 0.075,
     'news_sentiment': 0.08,
     'debate_adjustment': 0.05,
 }
@@ -36,11 +36,11 @@ DEFAULT_WEIGHTS = {
 # ============================================================
 
 DECISION_THRESHOLDS = {
-    'buy_strong': 72,       # composite >= 72 AND risk <= 0.6 → buy (原70, 略提高)
-    'buy_cautious': 60,     # composite >= 60 AND risk <= 0.4 → buy (原55, 更谨慎)
-    'reject_score': 40,     # composite < 40 → reject (原30, 更严格)
+    'buy_strong': 35,       # composite >= 35 AND risk <= 0.6 → buy
+    'buy_cautious': 28,     # composite >= 28 AND risk <= 0.4 → buy
+    'reject_score': 15,     # composite < 15 → reject
     'reject_risk': 0.80,    # risk >= 0.8 → reject
-    'veto_bear_gap': 0.20,  # bear_conf > bull_conf + 0.2 → reject (原0.30, 更敏感)
+    'veto_bear_gap': 0.20,  # bear_conf > bull_conf + 0.2 → reject
 }
 
 VETO_RULES = {
@@ -88,30 +88,32 @@ def calc_composite_score(
     计算综合评分 (0-100)
 
     公式:
-        raw = W_bull * bull + W_sent * max(0,sent) + W_sector * sector
-              + W_scanner * (scan/100) - W_bear * bear
-              + W_news * news - W_debate * debate_adj
+        raw = W_bull * bull + W_sector * sector + W_scanner * (scan/100)
+              - W_bear * bear - W_sent * max(0, sent)
+        sentiment为反向指标(高情绪=追高风险)
         归一化到 [0, 1] 后乘 100，再乘风险调整
     """
     w = weights or DEFAULT_WEIGHTS
 
-    # 正向分 (最大约 0.18 + 0.17 + 0.13 + 0.13 = 0.61)
+    # 正向分: 缠论结构 + 行业 + 扫描器
     positive = (
         w['technical_bull'] * bull_confidence
-        + w['sentiment'] * max(0, sentiment_score)
         + w['sector_rotation'] * sector_score
         + w['scanner_base'] * (scanner_score / 100.0)
     )
 
-    # 负向分 (最大约 0.13)
-    negative = w['technical_bear'] * bear_confidence
+    # 负向分: 熊分析 + 情绪过热(反向指标)
+    negative = (
+        w['technical_bear'] * bear_confidence
+        + w['sentiment'] * max(0, sentiment_score)
+    )
 
     # 净得分归一化
-    max_positive = (w['technical_bull'] + w['sentiment'] + w['sector_rotation']
+    max_positive = (w['technical_bull'] + w['sector_rotation']
                     + w['scanner_base'])
-    max_negative = w['technical_bear']
+    max_negative = (w['technical_bear'] + w['sentiment'])
 
-    raw = (positive - negative) / (max_positive - max_negative) if (max_positive - max_negative) > 0 else 0
+    raw = (positive - negative) / (max_positive + max_negative) if (max_positive + max_negative) > 0 else 0
     raw = max(0, min(1, raw))
 
     # 风险惩罚

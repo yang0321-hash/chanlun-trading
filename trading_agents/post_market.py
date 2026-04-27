@@ -453,7 +453,9 @@ class PostMarketAgent:
                                            f'距止损仅{distance:.1f}%')
 
                     # 行业集中度
-                    sector = self.sector_map.get(code, '未知')
+                    sector_lookup = self.sector_map.get('stock_to_sector', self.sector_map)
+                    bare_code = code.replace('sz', '').replace('sh', '').replace('SZ', '').replace('SH', '')
+                    sector = sector_lookup.get(bare_code, '未知')
                     sectors[sector] = sectors.get(sector, 0) + 1
             except Exception:
                 continue

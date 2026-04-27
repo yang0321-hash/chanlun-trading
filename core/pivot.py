@@ -331,6 +331,7 @@ class PivotDetector:
         kline: KLine,
         strokes: Optional[List[Stroke]] = None,
         level: PivotLevel = PivotLevel.DAY,
+        max_extension_strokes: int = 9,
     ):
         """
         初始化中枢识别器
@@ -339,9 +340,11 @@ class PivotDetector:
             kline: K线对象
             strokes: 笔列表，如果为None则自动生成
             level: 中枢级别
+            max_extension_strokes: 中枢扩展最大笔数(缠论: 9笔以上应升级)
         """
         self.kline = kline
         self.level = level
+        self.max_extension_strokes = max_extension_strokes
 
         if strokes is None:
             from .stroke import StrokeGenerator
@@ -430,8 +433,9 @@ class PivotDetector:
         end_index = s3.end_index
 
         # 尝试扩展中枢（ZG/ZD保持不变，只检查重叠）
+        # 缠论：9笔以上应升级为更高级别，当前级别中枢最多扩展到max_extension_strokes笔
         idx = start_idx + 3
-        while idx < len(self.strokes):
+        while idx < len(self.strokes) and len(pivot_strokes) < self.max_extension_strokes:
             next_stroke = self.strokes[idx]
 
             # 扩展条件：新笔与 [ZD, ZG] 有重叠
@@ -582,6 +586,10 @@ class PivotDetector:
             new_zg = min(p1.zg, p2.zg)
             new_zd = max(p1.zd, p2.zd)
             if new_zg <= new_zd:
+                continue
+
+            # 合并后笔数上限（防止合并出巨无霸）
+            if len(combined) > self.max_extension_strokes * 2:
                 continue
 
             # GG/DD: 组件笔极值（>=5笔时去除极端值）
