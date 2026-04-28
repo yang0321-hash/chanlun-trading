@@ -1182,10 +1182,11 @@ class SignalEngine:
 
     def _compute_area_divergence(self, strokes: List[Dict], macd_hist: pd.Series, n: int,
                                   use_pivots: bool = False):
-        """v13→v15: MACD面积背驰检测, 区分盘整背驰与趋势背驰
+        """v16: 缠论趋势背驰 (a+A+b+B+c) + 盘整背驰
 
-        use_pivots=True 时使用 _detect_pivots(支持扩展/扩张/升级状态)，
-        use_pivots=False 时使用 _detect_zhongshu_from_strokes。
+        趋势背驰(缠论原文): 至少2个同级别中枢形成趋势, 最后中枢B的离开段c
+        比进入段b力度弱(幅度AND MACD), 但价格走得更远.
+        盘整背驰: 连续同向笔MACD面积缩小(保留, 作为补充信号).
 
         Returns:
             buy_divergence: set of signal_idx — 底背驰(1买)位置
@@ -1204,51 +1205,112 @@ class SignalEngine:
         else:
             zhongshu_list = self._detect_zhongshu_from_strokes(strokes)
 
-        # 分类下跌笔和上涨笔
+        # === 1. 趋势背驰: a+A+b+B+c (至少2个中枢) ===
+        if len(zhongshu_list) >= 2 and len(strokes) >= 4:
+            zsA, zsB = zhongshu_list[-2], zhongshu_list[-1]
+            downtrend = zsB['ZD'] < zsA['ZD']
+            uptrend = zsB['ZG'] > zsA['ZG']
+
+            if downtrend:
+                # 底背驰: 找进入段b 和 离开段c
+                # b: A→B之间的连接下笔; 若A/B紧邻, 取A内部最后一笔下笔
+                seg_b = None
+                a_end = strokes[zsA['end_stroke']]['end_idx']
+                b_start = strokes[zsB['start_stroke']]['start_idx']
+                # 先找A→B之间的连接笔
+                for s in strokes:
+                    if (s['start_type'] == 'top' and s['end_type'] == 'bottom'
+                        and s['start_idx'] >= a_end
+                        and s['end_idx'] <= b_start):
+                        seg_b = s
+                # 若无连接笔, 取A中枢内最后一笔下笔作为b
+                if seg_b is None:
+                    for si in range(zsA['end_stroke'], max(zsA['start_stroke'] - 1, -1), -1):
+                        if strokes[si]['start_type'] == 'top' and strokes[si]['end_type'] == 'bottom':
+                            seg_b = strokes[si]
+                            break
+                seg_c = None
+                for s in reversed(strokes):
+                    if (s['start_type'] == 'top' and s['end_type'] == 'bottom'
+                        and s['start_idx'] >= strokes[zsB['start_stroke']]['start_idx']
+                        and s['start_val'] >= zsB['ZD']
+                        and s['end_val'] < zsB['ZD']):
+                        seg_c = s
+                        break
+                if seg_b and seg_c:
+                    amp_b = abs(seg_b['start_val'] - seg_b['end_val'])
+                    amp_c = abs(seg_c['start_val'] - seg_c['end_val'])
+                    area_b = abs(sum(macd_hist.iloc[seg_b['start_idx']:seg_b['end_idx'] + 1].values))
+                    area_c = abs(sum(macd_hist.iloc[seg_c['start_idx']:seg_c['end_idx'] + 1].values))
+                    if (seg_c['end_val'] < seg_b['end_val']
+                        and amp_c < amp_b
+                        and (area_b == 0 or area_c < area_b * 0.7)):
+                        signal_idx = seg_c['end_idx'] + self.bi_confirm_delay
+                        if 0 <= signal_idx < n:
+                            buy_divergence.add(signal_idx)
+                            trend_buy_div.add(signal_idx)
+
+            if uptrend:
+                # 顶背驰: 镜像
+                seg_b = None
+                a_end = strokes[zsA['end_stroke']]['end_idx']
+                b_start = strokes[zsB['start_stroke']]['start_idx']
+                for s in strokes:
+                    if (s['start_type'] == 'bottom' and s['end_type'] == 'top'
+                        and s['start_idx'] >= a_end
+                        and s['end_idx'] <= b_start):
+                        seg_b = s
+                if seg_b is None:
+                    for si in range(zsA['end_stroke'], max(zsA['start_stroke'] - 1, -1), -1):
+                        if strokes[si]['start_type'] == 'bottom' and strokes[si]['end_type'] == 'top':
+                            seg_b = strokes[si]
+                            break
+                seg_c = None
+                for s in reversed(strokes):
+                    if (s['start_type'] == 'bottom' and s['end_type'] == 'top'
+                        and s['start_idx'] >= strokes[zsB['start_stroke']]['start_idx']
+                        and s['start_val'] <= zsB['ZG']
+                        and s['end_val'] > zsB['ZG']):
+                        seg_c = s
+                        break
+                if seg_b and seg_c:
+                    amp_b = abs(seg_b['end_val'] - seg_b['start_val'])
+                    amp_c = abs(seg_c['end_val'] - seg_c['start_val'])
+                    area_b = abs(sum(macd_hist.iloc[seg_b['start_idx']:seg_b['end_idx'] + 1].values))
+                    area_c = abs(sum(macd_hist.iloc[seg_c['start_idx']:seg_c['end_idx'] + 1].values))
+                    if (seg_c['end_val'] > seg_b['end_val']
+                        and amp_c < amp_b
+                        and (area_b == 0 or area_c < area_b * 0.7)):
+                        signal_idx = seg_c['end_idx'] + self.bi_confirm_delay
+                        if 0 <= signal_idx < n:
+                            sell_divergence.add(signal_idx)
+                            trend_sell_div.add(signal_idx)
+
+        # === 2. 盘整背驰: 连续同向笔MACD面积缩小(补充信号) ===
         down_strokes = [s for s in strokes
                         if s['start_type'] == 'top' and s['end_type'] == 'bottom']
         up_strokes = [s for s in strokes
                       if s['start_type'] == 'bottom' and s['end_type'] == 'top']
 
-        def is_in_zhongshu(stroke, zhongshu_list):
-            """检查笔是否在中枢区间内"""
-            for zs in zhongshu_list:
-                if stroke['low'] >= zs['ZD'] - 0.001 and stroke['high'] <= zs['ZG'] + 0.001:
-                    return True
-            return False
-
-        # 底背驰: 连续下跌笔, 价格新低但MACD面积缩小
         for k in range(1, len(down_strokes)):
             prev = down_strokes[k - 1]
             curr = down_strokes[k]
-
             prev_area = abs(sum(macd_hist.iloc[prev['start_idx']:prev['end_idx'] + 1].values))
             curr_area = abs(sum(macd_hist.iloc[curr['start_idx']:curr['end_idx'] + 1].values))
-
-            # 价格创新低 + 面积缩小 = 底背驰
             if curr['end_val'] < prev['end_val'] and curr_area < prev_area:
                 signal_idx = curr['end_idx'] + self.bi_confirm_delay
                 if 0 <= signal_idx < n:
                     buy_divergence.add(signal_idx)
-                    # 趋势背驰: 两笔都不在中枢内(离开中枢后的新低)
-                    if not is_in_zhongshu(prev, zhongshu_list) and not is_in_zhongshu(curr, zhongshu_list):
-                        trend_buy_div.add(signal_idx)
 
-        # 顶背驰: 连续上涨笔, 价格新高但MACD面积缩小
         for k in range(1, len(up_strokes)):
             prev = up_strokes[k - 1]
             curr = up_strokes[k]
-
             prev_area = abs(sum(macd_hist.iloc[prev['start_idx']:prev['end_idx'] + 1].values))
             curr_area = abs(sum(macd_hist.iloc[curr['start_idx']:curr['end_idx'] + 1].values))
-
             if curr['end_val'] > prev['end_val'] and curr_area < prev_area:
                 signal_idx = curr['end_idx'] + self.bi_confirm_delay
                 if 0 <= signal_idx < n:
                     sell_divergence.add(signal_idx)
-                    # 趋势背驰: 两笔都不在中枢内
-                    if not is_in_zhongshu(prev, zhongshu_list) and not is_in_zhongshu(curr, zhongshu_list):
-                        trend_sell_div.add(signal_idx)
 
         return buy_divergence, sell_divergence, trend_buy_div, trend_sell_div
 
