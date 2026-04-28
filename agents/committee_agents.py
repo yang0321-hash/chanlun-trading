@@ -261,7 +261,7 @@ def analyze_chanlun_structure(df: pd.DataFrame, candidate: Dict = None) -> Optio
                         sd = s.to_dict()
                         if (s.is_down
                             and sd['start_index'] >= pA.end_index
-                            and sd['end_index'] <= pB.end_index):
+                            and sd['end_index'] <= pB.start_index):
                             seg_b = s
                     seg_c = None
                     for s in reversed(strokes):
@@ -281,7 +281,8 @@ def analyze_chanlun_structure(df: pd.DataFrame, candidate: Dict = None) -> Optio
                         macd_b = abs(h_b[h_b < 0].sum())
                         macd_c = abs(h_c[h_c < 0].sum())
                         if (sc['end_value'] < sb['end_value']
-                            and (amp_c < amp_b or (macd_b > 0 and macd_c < macd_b * 0.7))):
+                            and amp_c < amp_b
+                            and (macd_b == 0 or macd_c < macd_b * 0.7)):
                             divergence = True
 
                 elif uptrend and last_close > pB.zg:
@@ -291,7 +292,7 @@ def analyze_chanlun_structure(df: pd.DataFrame, candidate: Dict = None) -> Optio
                         sd = s.to_dict()
                         if (not s.is_down
                             and sd['start_index'] >= pA.end_index
-                            and sd['end_index'] <= pB.end_index):
+                            and sd['end_index'] <= pB.start_index):
                             seg_b = s
                     seg_c = None
                     for s in reversed(strokes):
@@ -311,7 +312,8 @@ def analyze_chanlun_structure(df: pd.DataFrame, candidate: Dict = None) -> Optio
                         macd_b = abs(h_b[h_b > 0].sum())
                         macd_c = abs(h_c[h_c > 0].sum())
                         if (sc['end_value'] > sb['end_value']
-                            and (amp_c < amp_b or (macd_b > 0 and macd_c < macd_b * 0.7))):
+                            and amp_c < amp_b
+                            and (macd_b == 0 or macd_c < macd_b * 0.7)):
                             divergence = True
             except Exception:
                 pass
@@ -441,7 +443,7 @@ def analyze_weekly_chanlun(weekly_df: pd.DataFrame) -> Optional[Dict]:
                         sd = s.to_dict()
                         if (s.is_down
                             and sd['start_index'] >= pA.end_index
-                            and sd['end_index'] <= pB.end_index):
+                            and sd['end_index'] <= pB.start_index):
                             seg_b = s
                     seg_c = None
                     for s in reversed(strokes):
@@ -460,7 +462,7 @@ def analyze_weekly_chanlun(weekly_df: pd.DataFrame) -> Optional[Dict]:
                         h_c = hist.iloc[max(0, sc['start_index'] - offset):min(len(hist), sc['end_index'] - offset + 1)]
                         macd_b = abs(h_b[h_b < 0].sum())
                         macd_c = abs(h_c[h_c < 0].sum())
-                        if sc['end_value'] < sb['end_value'] and (amp_c < amp_b or (macd_b > 0 and macd_c < macd_b * 0.7)):
+                        if sc['end_value'] < sb['end_value'] and amp_c < amp_b and (macd_b == 0 or macd_c < macd_b * 0.7):
                             divergence = True
 
                 elif uptrend and last_close > pB.zg:
@@ -469,7 +471,7 @@ def analyze_weekly_chanlun(weekly_df: pd.DataFrame) -> Optional[Dict]:
                         sd = s.to_dict()
                         if (not s.is_down
                             and sd['start_index'] >= pA.end_index
-                            and sd['end_index'] <= pB.end_index):
+                            and sd['end_index'] <= pB.start_index):
                             seg_b = s
                     seg_c = None
                     for s in reversed(strokes):
@@ -488,7 +490,7 @@ def analyze_weekly_chanlun(weekly_df: pd.DataFrame) -> Optional[Dict]:
                         h_c = hist.iloc[max(0, sc['start_index'] - offset):min(len(hist), sc['end_index'] - offset + 1)]
                         macd_b = abs(h_b[h_b > 0].sum())
                         macd_c = abs(h_c[h_c > 0].sum())
-                        if sc['end_value'] > sb['end_value'] and (amp_c < amp_b or (macd_b > 0 and macd_c < macd_b * 0.7)):
+                        if sc['end_value'] > sb['end_value'] and amp_c < amp_b and (macd_b == 0 or macd_c < macd_b * 0.7):
                             divergence = True
             except Exception:
                 pass
