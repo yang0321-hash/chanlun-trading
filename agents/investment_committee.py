@@ -23,7 +23,7 @@ from agents.committee_agents import (
     CommitteeContext, ChanlunInfo, RiskAssessment,
     BullAnalyst, BearAnalyst, SentimentAnalyzer,
     SectorRotation, RiskManager, FundManager,
-    analyze_chanlun_structure,
+    analyze_chanlun_structure, analyze_weekly_chanlun,
 )
 
 try:
@@ -206,6 +206,24 @@ class InvestmentCommittee:
         chanlun = None
         if len(df_daily) >= 60:
             chanlun = analyze_chanlun_structure(df_daily, candidate)
+
+        # 周线缠论分析 (独立的缠论管线)
+        weekly_result = None
+        if chanlun:
+            try:
+                df_weekly = self.hs.get_kline(code, period='weekly')
+                if len(df_weekly) >= 30:
+                    weekly_result = analyze_weekly_chanlun(df_weekly)
+            except Exception:
+                pass
+        if weekly_result and chanlun:
+            chanlun.weekly_trend = weekly_result['trend']
+            chanlun.weekly_zg = weekly_result['zg']
+            chanlun.weekly_zd = weekly_result['zd']
+            chanlun.weekly_stroke_dir = weekly_result['stroke_dir']
+            chanlun.weekly_stroke_phase = weekly_result.get('stroke_phase', '')
+            chanlun.weekly_buy_type = weekly_result['buy_type']
+            chanlun.weekly_divergence = weekly_result['divergence']
 
         # 如果缠论分析失败，从扫描器数据中提取部分信息
         if not chanlun and candidate:

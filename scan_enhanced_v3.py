@@ -248,7 +248,7 @@ def score_technical(df, entry_price, stop_price, rr_ratio):
 def _detect_weekly_trend(code, hs):
     """检测周线趋势方向: bull/bear/range
 
-    周线定方向: 周线多头才做多，周线空头不做
+    周线定方向: 缠论周线分析(笔/中枢/买卖点) + MA/MACD辅助
 
     Returns: (trend, score, weekly_rise_pct)
         weekly_rise_pct: 从周线最低点至今的涨幅百分比 (如 25.3 = 25.3%)
@@ -260,48 +260,127 @@ def _detect_weekly_trend(code, hs):
 
         close = df_w['close']
         low = df_w['low']
-        ma5 = close.rolling(5).mean().iloc[-1]
-        ma10 = close.rolling(10).mean().iloc[-1]
-        ma20 = close.rolling(20).mean().iloc[-1] if len(df_w) >= 20 else ma10
         last = close.iloc[-1]
 
         # === 周线涨幅: 从近期最低点(20周)到现在的涨幅 ===
         recent_low = low.iloc[-20:].min() if len(df_w) >= 20 else low.min()
         weekly_rise_pct = (last / recent_low - 1) * 100 if recent_low > 0 else 0.0
 
-        # 周线MACD
+        # === 缠论周线分析 (核心) ===
+        chanlun_score = _weekly_chanlun_score(df_w)
+
+        # === MA/MACD辅助评分 ===
+        ma5 = close.rolling(5).mean().iloc[-1]
+        ma10 = close.rolling(10).mean().iloc[-1]
+        ma20 = close.rolling(20).mean().iloc[-1] if len(df_w) >= 20 else ma10
+
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
         dif = ema12 - ema26
         dea = dif.ewm(span=9, adjust=False).mean()
         macd_val = (dif - dea).iloc[-1] * 2
 
-        score = 0.0
+        tech_score = 0.0
         if last > ma5 > ma10:
-            score += 0.3
+            tech_score += 0.15
         if last > ma20:
-            score += 0.2
+            tech_score += 0.10
         if macd_val > 0:
-            score += 0.2
-        # 周线趋势: 近5周是否上涨
+            tech_score += 0.10
         if close.iloc[-1] > close.iloc[-5]:
-            score += 0.2
-        # 周线MA斜率
-        if len(df_w) >= 10:
-            ma5_slope = (ma5 - close.rolling(5).mean().iloc[-5]) / close.rolling(5).mean().iloc[-5]
-            if ma5_slope > 0.02:
-                score += 0.1
-            elif ma5_slope < -0.02:
-                score -= 0.1
+            tech_score += 0.10
+
+        # 综合评分: 缠论60% + 传统40%
+        score = chanlun_score * 0.6 + tech_score * 0.4 / 0.45  # 归一化tech到0-1
 
         if score >= 0.5:
             return 'bull', score, weekly_rise_pct
-        elif score <= 0.1:
+        elif score <= 0.15:
             return 'bear', score, weekly_rise_pct
         else:
             return 'range', score, weekly_rise_pct
     except Exception:
         return 'range', 0.3, 0.0
+
+
+def _weekly_chanlun_score(df_w):
+    """周线缠论打分: 笔方向 + 中枢位置 + 买卖点 + 背驰"""
+    try:
+        from core.kline import KLine
+        from core.fractal import detect_fractals
+        from core.stroke import generate_strokes
+        from core.pivot import detect_pivots, PivotLevel
+        from core.buy_sell_points import BuySellPointDetector
+        from indicator.macd import MACD
+
+        kline = KLine.from_dataframe(df_w, strict_mode=False)
+        fractals = detect_fractals(kline)
+        if len(fractals) < 4:
+            return 0.3
+        strokes = generate_strokes(kline, fractals, min_bars=3)
+        if len(strokes) < 3:
+            return 0.3
+
+        pivots = detect_pivots(kline, strokes, level=PivotLevel.WEEK)
+        last_close = float(df_w['close'].iloc[-1])
+
+        score = 0.0
+
+        # 1. 笔方向 (权重最高)
+        if strokes:
+            if not strokes[-1].is_down:
+                score += 0.30  # 向上笔
+            else:
+                score -= 0.10  # 向下笔
+
+        # 2. 中枢位置
+        if pivots:
+            last_p = pivots[-1]
+            if last_close > last_p.zg:
+                score += 0.25  # 中枢上方
+            elif last_close > last_p.zd:
+                score += 0.10  # 中枢内偏上
+            else:
+                score -= 0.10  # 中枢下方
+
+        # 3. 周线买卖点
+        try:
+            macd = MACD(pd.Series([k.close for k in kline]))
+            det = BuySellPointDetector(fractals, strokes, [], pivots, macd=macd)
+            buys, sells = det.detect_all()
+            for bp in reversed(buys):
+                if bp.index >= len(df_w) - 60:
+                    if bp.point_type in ('2buy', '3buy'):
+                        score += 0.20
+                    elif bp.point_type == '1buy':
+                        score += 0.10
+                    if bp.divergence_ratio > 0:
+                        score += 0.10
+                    break
+            # 最近有卖点 → 减分
+            for sp in reversed(sells):
+                if sp.index >= len(df_w) - 20:
+                    score -= 0.10
+                    break
+        except Exception:
+            pass
+
+        # 5. 周线笔阶段 (回测验证: late>mid>early)
+        if len(strokes) >= 2:
+            last_s = strokes[-1]
+            prev_s = strokes[-2]
+            if prev_s.is_down and not last_s.is_down:
+                up_gain = (last_s.end_value - last_s.start_value) / last_s.start_value * 100 if last_s.start_value > 0 else 0
+                if up_gain >= 25:
+                    score += 0.15  # late: 趋势确立, 加分
+                elif up_gain >= 10:
+                    score += 0.05  # mid
+                else:
+                    score -= 0.05  # early: 未确认, 减分
+
+        return max(0, min(1, score))
+    except Exception:
+        return 0.3
 
 
 def _detect_market_regime(index_code='000001'):

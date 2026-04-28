@@ -60,6 +60,12 @@ class ChanlunInfo:
     buy_strength: str = ''              # 买点强度: strong/standard/weak/''
     golden_ratio_pass: bool = False     # 3买黄金分割0.618是否通过
     weekly_trend: str = ''              # 周线趋势: bull/bear/range
+    weekly_zg: float = 0.0             # 周线中枢上沿
+    weekly_zd: float = 0.0             # 周线中枢下沿
+    weekly_stroke_dir: str = ''        # 周线笔方向: up/down
+    weekly_stroke_phase: str = ''      # 周线笔阶段: turning/early/mid/late
+    weekly_buy_type: str = ''          # 周线买点类型
+    weekly_divergence: bool = False    # 周线背驰
 
 
 @dataclass
@@ -262,9 +268,163 @@ def analyze_chanlun_structure(df: pd.DataFrame, candidate: Dict = None) -> Optio
         return None
 
 
-# ============================================================
-# 1. BullAnalyst — 看多分析师
-# ============================================================
+def analyze_weekly_chanlun(weekly_df: pd.DataFrame) -> Optional[Dict]:
+    """
+    周线缠论分析: 分型→笔→中枢→买卖点
+
+    Returns: dict with keys:
+        trend: 'bull'/'bear'/'range'
+        zg, zd: 周线中枢上下沿
+        stroke_dir: 'up'/'down'
+        buy_type: 周线买点类型
+        divergence: 周线背驰
+        score: 周线综合得分 0-1
+        rise_pct: 从20周最低点至今涨幅
+    """
+    if len(weekly_df) < 30:
+        return None
+    try:
+        from core.kline import KLine
+        from core.fractal import detect_fractals
+        from core.stroke import generate_strokes
+        from core.pivot import detect_pivots, PivotLevel
+        from core.buy_sell_points import BuySellPointDetector
+        from indicator.macd import MACD
+
+        kline = KLine.from_dataframe(weekly_df, strict_mode=False)
+        fractals = detect_fractals(kline)
+        if len(fractals) < 4:
+            return None
+        strokes = generate_strokes(kline, fractals, min_bars=3)
+        if len(strokes) < 3:
+            return None
+
+        pivots = detect_pivots(kline, strokes, level=PivotLevel.WEEK)
+        macd = MACD(pd.Series([k.close for k in kline]))
+
+        # 最近中枢
+        zg, zd = 0.0, 0.0
+        if pivots:
+            last_p = pivots[-1]
+            zg, zd = last_p.zg, last_p.zd
+
+        # 最近笔方向
+        stroke_dir = ''
+        if strokes:
+            stroke_dir = 'up' if not strokes[-1].is_down else 'down'
+
+        # 周线买卖点
+        buy_type = ''
+        divergence = False
+        try:
+            det = BuySellPointDetector(fractals, strokes, [], pivots, macd=macd)
+            buys, _ = det.detect_all()
+            # 取最近60根周线内的买点
+            for bp in reversed(buys):
+                if bp.index >= len(weekly_df) - 60:
+                    buy_type = bp.point_type
+                    if bp.divergence_ratio > 0:
+                        divergence = True
+                    break
+        except Exception:
+            pass
+
+        # 周线MACD背驰(手动检测)
+        if not divergence and len(strokes) >= 4:
+            try:
+                hist = macd.get_histogram_series()
+                offset = macd._kline_offset
+                down_strokes = [s for s in strokes if s.is_down]
+                if len(down_strokes) >= 2:
+                    s1, s2 = down_strokes[-2], down_strokes[-1]
+                    s1s, s1e = s1.start_index - offset, s1.end_index - offset
+                    s2s, s2e = s2.start_index - offset, s2.end_index - offset
+                    if (0 <= s1s <= s1e < len(hist) and 0 <= s2s <= s2e < len(hist)):
+                        a1 = abs(hist.iloc[s1s:s1e+1].sum())
+                        a2 = abs(hist.iloc[s2s:s2e+1].sum())
+                        if a1 > 0 and a2 < a1 * 0.7 and s2.end_value < s1.end_value:
+                            divergence = True
+            except Exception:
+                pass
+
+        # 综合评分
+        close = weekly_df['close']
+        last_close = float(close.iloc[-1])
+        ma5 = float(close.rolling(5).mean().iloc[-1])
+        ma10 = float(close.rolling(10).mean().iloc[-1])
+        score = 0.0
+
+        # 笔方向
+        if stroke_dir == 'up':
+            score += 0.25
+        # 价格在中枢上方
+        if zg > 0 and last_close > zg:
+            score += 0.25
+        elif zg > 0 and zd > 0 and last_close >= zd:
+            score += 0.10
+        # MA排列
+        if last_close > ma5 > ma10:
+            score += 0.20
+        # MACD
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        dif = ema12 - ema26
+        dea = dif.ewm(span=9, adjust=False).mean()
+        macd_val = float((dif - dea).iloc[-1] * 2)
+        if macd_val > 0:
+            score += 0.15
+        # 周线买点加分
+        if buy_type in ('2buy', '3buy'):
+            score += 0.15
+        elif buy_type == '1buy' and divergence:
+            score += 0.10
+
+        # 趋势判定
+        trend = 'bull' if score >= 0.5 else ('bear' if score <= 0.15 else 'range')
+
+        # 涨幅
+        low20 = float(weekly_df['low'].iloc[-20:].min()) if len(weekly_df) >= 20 else float(weekly_df['low'].min())
+        rise_pct = (last_close / low20 - 1) * 100 if low20 > 0 else 0.0
+
+        # 周线笔阶段 (从笔序列判断)
+        stroke_phase = ''
+        stroke_gain = 0.0
+        if len(strokes) >= 2:
+            last_s = strokes[-1]
+            prev_s = strokes[-2]
+            up_gain = (last_s.end_value - last_s.start_value) / last_s.start_value * 100 if last_s.start_value > 0 else 0
+            if prev_s.is_down and not last_s.is_down:
+                stroke_gain = up_gain
+                if up_gain < 10:
+                    stroke_phase = 'early'
+                elif up_gain < 25:
+                    stroke_phase = 'mid'
+                else:
+                    stroke_phase = 'late'
+            elif not last_s.is_down:
+                stroke_gain = up_gain
+                if up_gain < 10:
+                    stroke_phase = 'early'
+                elif up_gain < 25:
+                    stroke_phase = 'mid'
+                else:
+                    stroke_phase = 'late'
+
+        return {
+            'trend': trend,
+            'zg': zg, 'zd': zd,
+            'stroke_dir': stroke_dir,
+            'stroke_phase': stroke_phase,
+            'stroke_gain': stroke_gain,
+            'buy_type': buy_type,
+            'divergence': divergence,
+            'score': score,
+            'rise_pct': rise_pct,
+            'strokes_count': len(strokes),
+            'pivots_count': len(pivots) if pivots else 0,
+        }
+    except Exception:
+        return None
 
 class BullAnalyst:
     """增强版看多分析师 — 集成缠论结构分析 + 自适应评分器"""
@@ -287,15 +447,34 @@ class BullAnalyst:
         # === 缠论结构分析（核心优先） ===
         cl = ctx.chanlun
         if cl:
-            # 0. 周线方向检查 (周线定方向)
+            # 0. 周线方向检查 (周线定方向 — 缠论增强)
             if cl.weekly_trend == 'bull':
                 key_points.append('周线多头(方向一致)')
                 confidence += 0.05
                 reasoning_parts.append('周线多头')
+                # 周线缠论增强
+                if cl.weekly_buy_type in ('2buy', '3buy'):
+                    key_points.append(f'周线{cl.weekly_buy_type}确认')
+                    confidence += 0.08
+                    reasoning_parts.append(f'周线{cl.weekly_buy_type}')
+                if cl.weekly_stroke_dir == 'up':
+                    confidence += 0.03
+                # 周线笔阶段: 记录但不改变confidence(避免改变决策边界)
+                if cl.weekly_stroke_phase == 'late':
+                    key_points.append('周线上涨笔确立(>25%)')
+                elif cl.weekly_stroke_phase == 'early':
+                    key_points.append('周线笔刚转折(趋势未确认)')
+                if cl.weekly_zg > 0 and last_close > cl.weekly_zg:
+                    key_points.append('周线中枢上方')
+                    confidence += 0.04
             elif cl.weekly_trend == 'bear':
                 key_points.append('周线空头(逆势)')
                 confidence -= 0.15
                 reasoning_parts.append('周线空头逆势')
+                if cl.weekly_buy_type == '1buy' and cl.weekly_divergence:
+                    key_points.append('周线1买+底背驰(底部反转信号)')
+                    confidence += 0.10
+                    reasoning_parts.append('周线底部反转')
 
             # 1. 买点类型评估 + 强度分类
             # 基础分降低，质量分加大 — 区分度来自质量而非类型
@@ -593,11 +772,23 @@ class BearAnalyst:
         # === 缠论结构风险 ===
         cl = ctx.chanlun
         if cl:
-            # 0. 周线空头 (逆势风险)
+            # 0. 周线空头 (逆势风险 — 缠论增强)
             if cl.weekly_trend == 'bear':
                 key_points.append('周线空头(逆势操作)')
                 confidence += 0.20
                 reasoning_parts.append('周线空头')
+                if cl.weekly_stroke_dir == 'down':
+                    key_points.append('周线笔向下')
+                    confidence += 0.08
+                if cl.weekly_zd > 0 and last_close < cl.weekly_zd:
+                    key_points.append('周线中枢下方')
+                    confidence += 0.10
+            # 周线笔阶段: 记录但不改变confidence
+            if cl.weekly_stroke_phase == 'early':
+                key_points.append('周线笔刚转折(趋势未确认)')
+            elif cl.weekly_trend == 'bull' and cl.weekly_stroke_dir == 'up':
+                # 周线多头但笔向下(回调中) — 风险适中
+                pass
 
             # 0.5 买点强度弱
             if cl.buy_strength == 'weak':
@@ -1292,6 +1483,18 @@ class FundManager:
         if news_arg and news_arg.key_points:
             key_factors.extend(news_arg.key_points[:1])
         key_factors = key_factors[:5]
+
+        # 周线笔阶段仓位调整 (不改决策, 只改仓位)
+        weekly_phase_mult = 1.0
+        if ctx.chanlun and decision == 'buy':
+            phase = ctx.chanlun.weekly_stroke_phase
+            if phase == 'late':
+                weekly_phase_mult = 1.2  # 趋势确立, 加仓20%
+            elif phase == 'mid':
+                weekly_phase_mult = 1.0
+            elif phase == 'early':
+                weekly_phase_mult = 0.6  # 未确认, 减仓40%
+            risk.position_pct *= weekly_phase_mult
 
         # 生成摘要
         decision_cn = {'buy': '买入', 'hold': '观望', 'reject': '否决'}

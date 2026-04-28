@@ -27,6 +27,8 @@
 
 import os
 import struct
+import urllib.request
+import json
 import pandas as pd
 from typing import List, Optional
 from datetime import datetime, time as dtime
@@ -59,6 +61,7 @@ class HybridSource(DataSource):
         self.sina = SinaSource()
         self.tdx_path = tdx_path or self._find_tdx_path()
         self._tdx_available = self.tdx_path is not None and os.path.exists(self.tdx_path)
+        self._sina_available = True  # Sina始终可用（网络请求）
 
     def _find_tdx_path(self) -> Optional[str]:
         """自动搜索TDX数据路径"""
@@ -94,7 +97,13 @@ class HybridSource(DataSource):
             return 'sz', 'SZ', code
 
     def _read_tdx_day(self, symbol: str) -> pd.DataFrame:
-        """从TDX本地读取日线 .day 文件（自动前复权，向量化解析）"""
+        """从TDX本地读取日线 .day 文件（自动前复权，向量化解析）
+
+        自动检测OHLC格式:
+        - int×100格式: 老数据, 价格字段如 170000 → 1700.00元
+        - float格式: 新下载数据, 价格字段如 39.58 → 39.58元
+        检测: 第一个open字段尝试int×100和float两种解读, 取价格合理的版本
+        """
         import numpy as np
         market_dir, market_tag, code = self._parse_code(symbol)
         filepath = os.path.join(self.tdx_path, market_dir, 'lday', f'{market_dir}{code}.day')
@@ -109,21 +118,40 @@ class HybridSource(DataSource):
             if n == 0:
                 return pd.DataFrame()
 
-            arr = np.frombuffer(data[:n * record_size], dtype='<u4').reshape(n, 8)
-            dates = arr[:, 0]
+            # 自动检测OHLC格式:
+            # - int×100格式: 老数据, uint32值如 170000 → 1700.00元
+            # - float格式: 新数据, uint32值如 1109283308 → float32解读=39.58元
+            # 判定: float32解读(open_f[0])在0.01~10000之间 → float格式; 否则 → int×100格式
+            arr_int = np.frombuffer(data[:n * record_size], dtype='<u4').reshape(n, 8)
+            dates = arr_int[:, 0]
             valid = dates >= 19900101
-            arr = arr[valid]
-            dates = dates[valid]
-
-            if len(arr) == 0:
+            if valid.sum() == 0:
                 return pd.DataFrame()
 
+            # 先截取有效行
+            dates = dates[valid]
+            close_u4 = arr_int[valid, 4]   # 收盘, uint32
+            open_u4 = arr_int[valid, 1]
+
+            # float32解读
+            open_f = open_u4.view('<f4')
+            close_f = close_u4.view('<f4')
+
+            # 用收盘价的float32解读判断格式 (更稳定)
+            # float格式: close_f应在0.01~10000; int×100格式: close_f解读会超出范围
+            if 0.01 <= close_f[0] <= 10000:
+                # float32格式, divisor=1.0
+                divisor = 1.0
+            else:
+                # int×100格式, divisor=100.0
+                divisor = 100.0
+
             df = pd.DataFrame({
-                'open': arr[:, 1] / 100.0,
-                'high': arr[:, 2] / 100.0,
-                'low': arr[:, 3] / 100.0,
-                'close': arr[:, 4] / 100.0,
-                'volume': arr[:, 6].astype(np.int64),
+                'open': open_u4 / divisor,
+                'high': arr_int[valid, 2] / divisor,
+                'low': arr_int[valid, 3] / divisor,
+                'close': close_u4 / divisor,
+                'volume': arr_int[valid, 6].astype(np.int64),
             }, index=pd.to_datetime(dates.astype(str), format='%Y%m%d'))
             df.index.name = 'datetime'
             df = df.sort_index()
@@ -139,6 +167,49 @@ class HybridSource(DataSource):
             return df
         except Exception:
             return pd.DataFrame()
+
+    def _fetch_sina_daily(self, symbol: str) -> pd.DataFrame:
+        """通过新浪接口获取日线历史（urllib直连，绕过requests代理问题）"""
+        import urllib.request, json
+
+        # 解析代码
+        sina_code = self.sina._normalize_code(symbol)
+        url = (
+            'https://money.finance.sina.com.cn/quotes_service/api/json_v2.php'
+            '/CN_MarketData.getKLineData'
+        )
+        params_str = f"symbol={sina_code}&scale=240&ma=no&datalen=500"
+        try:
+            req = urllib.request.Request(
+                f"{url}?{params_str}",
+                headers={'User-Agent': 'Mozilla/5.0'},
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+        except Exception:
+            return pd.DataFrame()
+
+        if not data or not isinstance(data, list) or len(data) == 0:
+            return pd.DataFrame()
+
+        rows = []
+        for k in data:
+            try:
+                rows.append({
+                    'datetime': pd.Timestamp(k['day']),
+                    'open': float(k['open']),
+                    'high': float(k['high']),
+                    'low': float(k['low']),
+                    'close': float(k['close']),
+                    'volume': float(k.get('volume', 0)),
+                })
+            except (KeyError, ValueError):
+                continue
+
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows).set_index('datetime').sort_index()
+        return df.tail(500)
 
     def load_all_daily(self, codes: list, min_price: float = 3.0,
                        max_price: float = 200.0, min_bars: int = 200,
@@ -318,6 +389,26 @@ class HybridSource(DataSource):
         except Exception:
             return pd.DataFrame()
 
+    def _resample_to_weekly(self, df: pd.DataFrame) -> pd.DataFrame:
+        """日线→周线resample"""
+        if len(df) < 5:
+            return df
+        weekly = df.resample('W').agg({
+            'open': 'first', 'high': 'max', 'low': 'min',
+            'close': 'last', 'volume': 'sum',
+        }).dropna()
+        return weekly
+
+    def _resample_to_monthly(self, df: pd.DataFrame) -> pd.DataFrame:
+        """日线→月线resample"""
+        if len(df) < 20:
+            return df
+        monthly = df.resample('M').agg({
+            'open': 'first', 'high': 'max', 'low': 'min',
+            'close': 'last', 'volume': 'sum',
+        }).dropna()
+        return monthly
+
     def _resample_to_30min(self, df: pd.DataFrame) -> pd.DataFrame:
         """将1分钟或5分钟数据合成为30分钟K线"""
         if df.empty:
@@ -350,18 +441,29 @@ class HybridSource(DataSource):
         Returns:
             DataFrame: OHLCV数据
         """
-        if period == 'daily' or period == 'weekly' or period == 'monthly':
-            # 日线优先用TDX本地
+        if period in ('daily', 'weekly', 'monthly'):
+            # 日线: 优先TDX本地，失败则用Sina历史接口
+            df = pd.DataFrame()
             if self._tdx_available:
                 df = self._read_tdx_day(symbol)
-                if len(df) > 0:
-                    if start_date:
-                        df = df[df.index >= pd.Timestamp(start_date)]
-                    if end_date:
-                        df = df[df.index <= pd.Timestamp(end_date)]
-                    return df
-            # TDX不可用，回退到mootdx/新浪不支持日线，返回空
-            return pd.DataFrame()
+                if not (len(df) > 0
+                        and df['close'].iloc[-1] > 0.01
+                        and df['close'].iloc[-1] < 10000):
+                    df = pd.DataFrame()
+            if df.empty and self._sina_available:
+                sina_df = self._fetch_sina_daily(symbol)
+                df = sina_df if sina_df is not None and len(sina_df) > 0 else pd.DataFrame()
+            if df.empty:
+                return df
+            if start_date:
+                df = df[df.index >= pd.Timestamp(start_date)]
+            if end_date:
+                df = df[df.index <= pd.Timestamp(end_date)]
+            if period == 'weekly':
+                df = self._resample_to_weekly(df)
+            elif period == 'monthly':
+                df = self._resample_to_monthly(df)
+            return df
 
         elif period in ('30min', '5min', '15min', '1min', '60min'):
             # 分钟线: TDX本地历史 + 新浪盘中实时
