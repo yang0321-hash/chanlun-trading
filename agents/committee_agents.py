@@ -238,66 +238,83 @@ def analyze_chanlun_structure(df: pd.DataFrame, candidate: Dict = None) -> Optio
         if best_buy and best_buy.stop_loss > 0:
             stop_by_structure = max(stop_by_structure, best_buy.stop_loss)
 
-        # 缠论背驰检测: 中枢的进入段 vs 离开段
-        # 背驰定义: 围绕同一中枢, 离开段力度(价格幅度) < 进入段力度,
-        # 但价格走得更远, MACD面积缩小作为辅助确认
+        # 缠论趋势背驰检测 (缠论原文: a+A+b+B+c 结构)
+        # 趋势 = 至少2个同级别中枢; 背驰 = 最后一个中枢B的离开段c
+        # 比进入段b力度弱, 但价格走得更远. MACD面积是辅助确认.
         divergence = False
         if best_buy and best_buy.divergence_ratio > 0:
             divergence = True
-        elif pivots and len(strokes) >= 4:
-            hist_series = macd.get_histogram_series()
-            offset = macd._kline_offset
-            # 找价格在中枢下方的中枢(底背驰) 或 上方的中枢(顶背驰)
-            last_close = float(df['close'].iloc[-1])
-            for pivot in reversed(pivots):
-                # 底背驰: 价格在中枢下方, 找离开中枢向下的段
-                if last_close < pivot.zd:
-                    # 找跨越中枢下沿(ZD)的下笔作为离开段
-                    leaving = []  # 离开中枢向下的笔
+        elif len(pivots) >= 2 and len(strokes) >= 4:
+            try:
+                hist_series = macd.get_histogram_series()
+                offset = macd._kline_offset
+                last_close = float(df['close'].iloc[-1])
+                # a+A+b+B+c: A=倒数第二中枢, B=最后中枢
+                pA, pB = pivots[-2], pivots[-1]
+                downtrend = pB.zd < pA.zd  # 中枢下移 = 下跌趋势
+                uptrend = pB.zg > pA.zg    # 中枢上移 = 上涨趋势
+
+                if downtrend and last_close < pB.zd:
+                    # 底背驰: 进入段b(A→B连接) vs 离开段c(从B向下离开)
+                    seg_b = None
                     for s in strokes:
                         sd = s.to_dict()
-                        if s.is_down and sd['start_index'] >= pivot.start_index:
-                            # 笔的起点在中枢ZD以上, 终点在中枢ZD以下 = 离开段
-                            if sd['start_value'] >= pivot.zd and sd['end_value'] < pivot.zd:
-                                leaving.append(s)
-                    if len(leaving) >= 2:
-                        s1, s2 = leaving[-2], leaving[-1]
-                        sd1, sd2 = s1.to_dict(), s2.to_dict()
-                        # 价格幅度比较: 离开段2的幅度 < 离开段1
-                        amp1 = abs(sd1['start_value'] - sd1['end_value'])
-                        amp2 = abs(sd2['start_value'] - sd2['end_value'])
-                        # MACD辅助: 只取绿柱面积
-                        h1 = hist_series.iloc[max(0, sd1['start_index'] - offset):min(len(hist_series), sd2['end_index'] - offset + 1)]
-                        h1_seg = hist_series.iloc[max(0, sd1['start_index'] - offset):min(len(hist_series), sd1['end_index'] - offset + 1)]
-                        h2_seg = hist_series.iloc[max(0, sd2['start_index'] - offset):min(len(hist_series), sd2['end_index'] - offset + 1)]
-                        macd1 = abs(h1_seg[h1_seg < 0].sum())
-                        macd2 = abs(h2_seg[h2_seg < 0].sum())
-                        # 背驰条件: 价格走得更远(新低) + 力度减弱(幅度或MACD)
-                        if (sd2['end_value'] < sd1['end_value']  # 创新低
-                            and (amp2 < amp1 or (macd1 > 0 and macd2 < macd1 * 0.7))):
+                        if (s.is_down
+                            and sd['start_index'] >= pA.end_index
+                            and sd['end_index'] <= pB.end_index):
+                            seg_b = s
+                    seg_c = None
+                    for s in reversed(strokes):
+                        sd = s.to_dict()
+                        if (s.is_down
+                            and sd['start_index'] >= pB.start_index
+                            and sd['start_value'] >= pB.zd
+                            and sd['end_value'] < pB.zd):
+                            seg_c = s
+                            break
+                    if seg_b and seg_c:
+                        sb, sc = seg_b.to_dict(), seg_c.to_dict()
+                        amp_b = abs(sb['start_value'] - sb['end_value'])
+                        amp_c = abs(sc['start_value'] - sc['end_value'])
+                        h_b = hist_series.iloc[max(0, sb['start_index'] - offset):min(len(hist_series), sb['end_index'] - offset + 1)]
+                        h_c = hist_series.iloc[max(0, sc['start_index'] - offset):min(len(hist_series), sc['end_index'] - offset + 1)]
+                        macd_b = abs(h_b[h_b < 0].sum())
+                        macd_c = abs(h_c[h_c < 0].sum())
+                        if (sc['end_value'] < sb['end_value']
+                            and (amp_c < amp_b or (macd_b > 0 and macd_c < macd_b * 0.7))):
                             divergence = True
-                    break  # 只检查最近的中枢
-                # 顶背驰: 价格在中枢上方
-                elif last_close > pivot.zg:
-                    entering = []
+
+                elif uptrend and last_close > pB.zg:
+                    # 顶背驰: 镜像
+                    seg_b = None
                     for s in strokes:
                         sd = s.to_dict()
-                        if not s.is_down and sd['start_index'] >= pivot.start_index:
-                            if sd['start_value'] <= pivot.zg and sd['end_value'] > pivot.zg:
-                                entering.append(s)
-                    if len(entering) >= 2:
-                        s1, s2 = entering[-2], entering[-1]
-                        sd1, sd2 = s1.to_dict(), s2.to_dict()
-                        amp1 = abs(sd1['end_value'] - sd1['start_value'])
-                        amp2 = abs(sd2['end_value'] - sd2['start_value'])
-                        h1_seg = hist_series.iloc[max(0, sd1['start_index'] - offset):min(len(hist_series), sd1['end_index'] - offset + 1)]
-                        h2_seg = hist_series.iloc[max(0, sd2['start_index'] - offset):min(len(hist_series), sd2['end_index'] - offset + 1)]
-                        macd1 = abs(h1_seg[h1_seg > 0].sum())
-                        macd2 = abs(h2_seg[h2_seg > 0].sum())
-                        if (sd2['end_value'] > sd1['end_value']
-                            and (amp2 < amp1 or (macd1 > 0 and macd2 < macd1 * 0.7))):
+                        if (not s.is_down
+                            and sd['start_index'] >= pA.end_index
+                            and sd['end_index'] <= pB.end_index):
+                            seg_b = s
+                    seg_c = None
+                    for s in reversed(strokes):
+                        sd = s.to_dict()
+                        if (not s.is_down
+                            and sd['start_index'] >= pB.start_index
+                            and sd['start_value'] <= pB.zg
+                            and sd['end_value'] > pB.zg):
+                            seg_c = s
+                            break
+                    if seg_b and seg_c:
+                        sb, sc = seg_b.to_dict(), seg_c.to_dict()
+                        amp_b = abs(sb['end_value'] - sb['start_value'])
+                        amp_c = abs(sc['end_value'] - sc['start_value'])
+                        h_b = hist_series.iloc[max(0, sb['start_index'] - offset):min(len(hist_series), sb['end_index'] - offset + 1)]
+                        h_c = hist_series.iloc[max(0, sc['start_index'] - offset):min(len(hist_series), sc['end_index'] - offset + 1)]
+                        macd_b = abs(h_b[h_b > 0].sum())
+                        macd_c = abs(h_c[h_c > 0].sum())
+                        if (sc['end_value'] > sb['end_value']
+                            and (amp_c < amp_b or (macd_b > 0 and macd_c < macd_b * 0.7))):
                             divergence = True
-                    break
+            except Exception:
+                pass
 
         # 日线最新分型是否为顶分型
         daily_top_fractal = False
@@ -408,45 +425,71 @@ def analyze_weekly_chanlun(weekly_df: pd.DataFrame) -> Optional[Dict]:
         except Exception:
             pass
 
-        # 周线缠论背驰(手动检测): 中枢进入段/离开段比较
-        if not divergence and pivots and len(strokes) >= 4:
+        # 周线趋势背驰 (a+A+b+B+c): 至少2个中枢形成趋势
+        if not divergence and len(pivots) >= 2 and len(strokes) >= 4:
             try:
                 hist = macd.get_histogram_series()
                 offset = macd._kline_offset
                 last_close = float(weekly_df['close'].iloc[-1])
-                for pivot in reversed(pivots):
-                    if last_close < pivot.zd:
-                        leaving = [s for s in strokes if s.is_down
-                                   and s.to_dict()['start_index'] >= pivot.start_index
-                                   and s.to_dict()['start_value'] >= pivot.zd
-                                   and s.to_dict()['end_value'] < pivot.zd]
-                        if len(leaving) >= 2:
-                            s1, s2 = leaving[-2], leaving[-1]
-                            sd1, sd2 = s1.to_dict(), s2.to_dict()
-                            amp1 = abs(sd1['start_value'] - sd1['end_value'])
-                            amp2 = abs(sd2['start_value'] - sd2['end_value'])
-                            h1 = hist.iloc[max(0, sd1['start_index'] - offset):min(len(hist), sd1['end_index'] - offset + 1)]
-                            h2 = hist.iloc[max(0, sd2['start_index'] - offset):min(len(hist), sd2['end_index'] - offset + 1)]
-                            m1, m2 = abs(h1[h1 < 0].sum()), abs(h2[h2 < 0].sum())
-                            if sd2['end_value'] < sd1['end_value'] and (amp2 < amp1 or (m1 > 0 and m2 < m1 * 0.7)):
-                                divergence = True
-                        break
-                    elif last_close > pivot.zg:
-                        entering = [s for s in strokes if not s.is_down
-                                    and s.to_dict()['start_index'] >= pivot.start_index
-                                    and s.to_dict()['start_value'] <= pivot.zg
-                                    and s.to_dict()['end_value'] > pivot.zg]
-                        if len(entering) >= 2:
-                            s1, s2 = entering[-2], entering[-1]
-                            sd1, sd2 = s1.to_dict(), s2.to_dict()
-                            amp1 = abs(sd1['end_value'] - sd1['start_value'])
-                            amp2 = abs(sd2['end_value'] - sd2['start_value'])
-                            h1 = hist.iloc[max(0, sd1['start_index'] - offset):min(len(hist), sd1['end_index'] - offset + 1)]
-                            h2 = hist.iloc[max(0, sd2['start_index'] - offset):min(len(hist), sd2['end_index'] - offset + 1)]
-                            m1, m2 = abs(h1[h1 > 0].sum()), abs(h2[h2 > 0].sum())
-                            if sd2['end_value'] > sd1['end_value'] and (amp2 < amp1 or (m1 > 0 and m2 < m1 * 0.7)):
-                                divergence = True
-                        break
+                pA, pB = pivots[-2], pivots[-1]
+                downtrend = pB.zd < pA.zd
+                uptrend = pB.zg > pA.zg
+
+                if downtrend and last_close < pB.zd:
+                    seg_b = None
+                    for s in strokes:
+                        sd = s.to_dict()
+                        if (s.is_down
+                            and sd['start_index'] >= pA.end_index
+                            and sd['end_index'] <= pB.end_index):
+                            seg_b = s
+                    seg_c = None
+                    for s in reversed(strokes):
+                        sd = s.to_dict()
+                        if (s.is_down
+                            and sd['start_index'] >= pB.start_index
+                            and sd['start_value'] >= pB.zd
+                            and sd['end_value'] < pB.zd):
+                            seg_c = s
+                            break
+                    if seg_b and seg_c:
+                        sb, sc = seg_b.to_dict(), seg_c.to_dict()
+                        amp_b = abs(sb['start_value'] - sb['end_value'])
+                        amp_c = abs(sc['start_value'] - sc['end_value'])
+                        h_b = hist.iloc[max(0, sb['start_index'] - offset):min(len(hist), sb['end_index'] - offset + 1)]
+                        h_c = hist.iloc[max(0, sc['start_index'] - offset):min(len(hist), sc['end_index'] - offset + 1)]
+                        macd_b = abs(h_b[h_b < 0].sum())
+                        macd_c = abs(h_c[h_c < 0].sum())
+                        if sc['end_value'] < sb['end_value'] and (amp_c < amp_b or (macd_b > 0 and macd_c < macd_b * 0.7)):
+                            divergence = True
+
+                elif uptrend and last_close > pB.zg:
+                    seg_b = None
+                    for s in strokes:
+                        sd = s.to_dict()
+                        if (not s.is_down
+                            and sd['start_index'] >= pA.end_index
+                            and sd['end_index'] <= pB.end_index):
+                            seg_b = s
+                    seg_c = None
+                    for s in reversed(strokes):
+                        sd = s.to_dict()
+                        if (not s.is_down
+                            and sd['start_index'] >= pB.start_index
+                            and sd['start_value'] <= pB.zg
+                            and sd['end_value'] > pB.zg):
+                            seg_c = s
+                            break
+                    if seg_b and seg_c:
+                        sb, sc = seg_b.to_dict(), seg_c.to_dict()
+                        amp_b = abs(sb['end_value'] - sb['start_value'])
+                        amp_c = abs(sc['end_value'] - sc['start_value'])
+                        h_b = hist.iloc[max(0, sb['start_index'] - offset):min(len(hist), sb['end_index'] - offset + 1)]
+                        h_c = hist.iloc[max(0, sc['start_index'] - offset):min(len(hist), sc['end_index'] - offset + 1)]
+                        macd_b = abs(h_b[h_b > 0].sum())
+                        macd_c = abs(h_c[h_c > 0].sum())
+                        if sc['end_value'] > sb['end_value'] and (amp_c < amp_b or (macd_b > 0 and macd_c < macd_b * 0.7)):
+                            divergence = True
             except Exception:
                 pass
 
