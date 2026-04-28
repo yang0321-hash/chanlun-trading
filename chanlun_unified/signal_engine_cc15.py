@@ -80,7 +80,7 @@ class SignalEngine:
         self.trailing_start = 0.03       # 盈利3%即启动移动止损(比v8的6%更早保本)
         self.trailing_tight = 0.03       # 盈利3-6%: 回撤3%平仓(保本区)
         self.trailing_medium = 0.05      # 盈利6-15%: 回撤5%平仓(正常区)
-        self.trailing_wide = 0.07        # 盈利>15%: 回撤7%平仓(让大趋势跑完,比8%更保守)
+        self.trailing_wide = 0.08        # 盈利>15%: 回撤8%平仓(让大趋势跑完)
         self.trailing_tier1 = 0.06       # 分界线1
         self.trailing_tier2 = 0.15       # 分界线2
 
@@ -128,7 +128,7 @@ class SignalEngine:
         self.third_buy_tier1 = 0.03       # 盈利3%启动(和普通一致)
         self.third_buy_tight = 0.03       # 3-8%: 回撤3%(和普通完全一致)
         self.third_buy_medium = 0.06     # 8-15%: 回撤6%(vs普通5%, +1%)
-        self.third_buy_wide = 0.08       # >15%: 回撤8%(vs普通7%, +1%)
+        self.third_buy_wide = 0.09       # >15%: 回撤9%(vs普通8%, +1%让3买多跑)
 
         # ===== v12: 动态月度轮换池 =====
         self.dynamic_pool_enabled = True  # 启用动态轮换
@@ -557,6 +557,15 @@ class SignalEngine:
         buy_divergence_set = buy_div_set | seg_buy_div
         sell_divergence_set = sell_div_set | seg_sell_div
 
+        # v3: 预计算中枢(v3买点检测需要)
+        zhongshu_list = self._detect_zhongshu_from_strokes(strokes)
+
+        # v3: 扩展买点检测(sub1buy/quasi2buy/2b3bbuy/xzd1buy)
+        sub1buy_set = self._detect_sub1buy(strokes, buy_divergence_set, trend_buy_div, n)
+        quasi2buy_set = self._detect_quasi2buy(strokes, zhongshu_list, n)
+        two_bthree_b_set = self._detect_2b3bbuy(strokes, buy_divergence_set, zhongshu_list, n)
+        xzd1buy_set = self._detect_xzd1buy(strokes, macd_hist, buy_divergence_set, n)
+
         # ATR [v8新增]
         tr = pd.concat([
             high - low,
@@ -585,6 +594,9 @@ class SignalEngine:
         trailing_activated = False
         reduced = False  # [v8] 是否已减仓
         is_3buy_trade = False  # [v11.1] 当前持仓是否为3买入场
+
+        # v16: 预计算中枢列表（DIF零轴穿越中枢级别判断）
+        zhongshu_list = self._detect_zhongshu(strokes)
 
         for i in range(120, n):
             price = close.iloc[i]
@@ -626,6 +638,8 @@ class SignalEngine:
                     self._close_position(code)
                     position = 0.0; original_position = 0.0; has_added = False
                     trailing_activated = False; reduced = False; is_3buy_trade = False
+                    macd_reload_done = False; partial_tp3_done = False; partial_tp5_done = False
+                    macd_reload_done = False; partial_tp3_done = False; partial_tp5_done = False
                     continue
 
                 # 1. 结构止损
@@ -640,6 +654,7 @@ class SignalEngine:
                     self._close_position(code)
                     position = 0.0; original_position = 0.0; has_added = False
                     trailing_activated = False; reduced = False; is_3buy_trade = False
+                    macd_reload_done = False; partial_tp3_done = False; partial_tp5_done = False
                     continue
 
                 # 2. 分阶段移动止损 [v9] + [v11.1 3买更宽tier]
@@ -678,7 +693,8 @@ class SignalEngine:
                         self._close_position(code)
                         position = 0.0; original_position = 0.0; has_added = False
                         trailing_activated = False; reduced = False; is_3buy_trade = False
-                        continue
+                        macd_reload_done = False; partial_tp3_done = False; partial_tp5_done = False
+                    continue
 
                 # 3. 顶背驰卖出 [v8新增]
                 # 1卖信号: 顶背驰 + 盈利 > 5% [v9 P1.2: 从3%提高到5%]
@@ -692,6 +708,7 @@ class SignalEngine:
                     self._close_position(code)
                     position = 0.0; original_position = 0.0; has_added = False
                     trailing_activated = False; reduced = False; is_3buy_trade = False
+                    macd_reload_done = False; partial_tp3_done = False; partial_tp5_done = False
                     continue
 
                 # 3.5. 2卖出局 [v14: 缠论标准2卖, 反弹不过前高]
@@ -707,6 +724,7 @@ class SignalEngine:
                     self._close_position(code)
                     position = 0.0; original_position = 0.0; has_added = False
                     trailing_activated = False; reduced = False; is_3buy_trade = False
+                    macd_reload_done = False; partial_tp3_done = False; partial_tp5_done = False
                     continue
 
                 # 4. bi_sell+盈利卖出(旧2卖替代, 保留作为兜底)
@@ -720,6 +738,7 @@ class SignalEngine:
                     self._close_position(code)
                     position = 0.0; original_position = 0.0; has_added = False
                     trailing_activated = False; reduced = False; is_3buy_trade = False
+                    macd_reload_done = False; partial_tp3_done = False; partial_tp5_done = False
                     continue
 
                 # 5. 时间止损
@@ -731,8 +750,47 @@ class SignalEngine:
                     self._close_position(code)
                     position = 0.0; original_position = 0.0; has_added = False
                     trailing_activated = False; reduced = False; is_3buy_trade = False
+                    macd_reload_done = False; partial_tp3_done = False; partial_tp5_done = False
                     continue
 
+                # v17 ExitSystem: 分批止盈
+                # +3%: 卖1/3（锁定部分利润）
+                if (not partial_tp3_done
+                        and profit_pct >= 0.03):
+                    sold = position / 3.0
+                    signals.iloc[i] = position - sold
+                    position -= sold
+                    partial_tp3_done = True
+                    # 止损位上移到成本价
+                    stop_loss = max(stop_loss, entry_price)
+                    if position <= 0.001:
+                        if profit_pct < 0:
+                            self._last_loss_codes[code] = (i, profit_pct)
+                        self._update_loss_streak(profit_pct, i)
+                        self._close_position(code)
+                        position = 0.0; original_position = 0.0; has_added = False
+                        trailing_activated = False; reduced = False; is_3buy_trade = False
+                        macd_reload_done = False; partial_tp3_done = False; partial_tp5_done = False
+                        continue
+                # +5%: 再卖1/3（累计已卖2/3，剩余1/3跟移动止损）
+                if (not partial_tp5_done
+                        and profit_pct >= 0.05
+                        and partial_tp3_done):
+                    sold = position / 2.0  # 卖剩余的一半
+                    signals.iloc[i] = position - sold
+                    position -= sold
+                    partial_tp5_done = True
+                    # 止损位上移到+3%位置
+                    stop_loss = max(stop_loss, entry_price * 1.03)
+                    if position <= 0.001:
+                        if profit_pct < 0:
+                            self._last_loss_codes[code] = (i, profit_pct)
+                        self._update_loss_streak(profit_pct, i)
+                        self._close_position(code)
+                        position = 0.0; original_position = 0.0; has_added = False
+                        trailing_activated = False; reduced = False; is_3buy_trade = False
+                        macd_reload_done = False; partial_tp3_done = False; partial_tp5_done = False
+                    continue
                 # 6. 减仓机制 [v8新增]
                 # 条件: 盈利>reduce_start + bi_sell + 未减仓过
                 # 效果: 锁定一半利润，保留底仓等移动止损
@@ -764,6 +822,27 @@ class SignalEngine:
                         signals.iloc[i] = new_position
                         position = new_position
                         has_added = True
+                        continue
+
+                # v17 ExitSystem: MACDreload
+                # DIF由负转正时加仓（持仓盈利中）
+                # 注意: has_added防止重复加仓, macd_reload_done二次确认
+                if (not macd_reload_done
+                        and not has_added
+                        and profit_pct > 0.0          # 持仓盈利
+                        and i > 0
+                        and dif.iloc[i-1] <= 0        # 前一根DIF<=0
+                        and dif.iloc[i] > 0           # 当前DIF>0（穿越零轴）
+                        and self._active_positions <= self.max_positions):
+                    add_size = original_position * 0.2  # 原始仓位×20%
+                    new_position = min(position + add_size, self.max_position)
+                    actual_add = new_position - position
+                    if actual_add > 0.001:
+                        entry_price = (entry_price * position + price * actual_add) / new_position
+                        stop_loss = max(stop_loss, entry_price * (1 - self.max_stop_pct))
+                        signals.iloc[i] = new_position
+                        position = new_position
+                        macd_reload_done = True  # 限制一次
                         continue
 
                 # 继续持仓
@@ -800,7 +879,13 @@ class SignalEngine:
                     continue
 
                 if not bi_buy.iloc[i] and not third_buy.iloc[i] and not is_2buy and not is_trend_buy:
-                    continue
+                    # v3: 扩展买点入口
+                    idx_in_sub1buy = i in sub1buy_set
+                    idx_in_quasi2buy = i in quasi2buy_set
+                    idx_in_2b3b = i in two_bthree_b_set
+                    idx_in_xzd1 = i in xzd1buy_set
+                    if not (idx_in_sub1buy or idx_in_quasi2buy or idx_in_2b3b or idx_in_xzd1):
+                        continue
 
                 # ===== v12: 动态池过滤 =====
                 # 不在当月池中的股票不允许新开仓(已持仓的止损/止盈不受影响)
@@ -830,6 +915,11 @@ class SignalEngine:
 
                 if has_buy_divergence:
                     macd_factor = 0.05
+
+                # v16: DIF零轴穿越中枢级别判断 → 买入增强
+                zs_cross = self._check_dif_crosses_zero(i, dif, strokes, zhongshu_list, price)
+                if zs_cross['crossover_in_zs'] and zs_cross['strength'] > 0:
+                    macd_factor += zs_cross['strength']
 
                 # 量能因子
                 vol_factor = 0.0
@@ -943,6 +1033,9 @@ class SignalEngine:
                 entry_price = price
                 stop_loss = stop
                 highest = price
+                macd_reload_done = False  # v17: MACDreload次数限制
+                partial_tp3_done = False   # v17: 分批止盈3%标志
+                partial_tp5_done = False   # v17: 分批止盈5%标志
                 self._active_positions += 1
                 # v12.2: 更新行业计数
                 industry = self._industry_map.get(code, '')
@@ -1400,6 +1493,304 @@ class SignalEngine:
 
         return buy_2
 
+    def _detect_sub1buy(self, strokes: List[Dict], buy_divergence: set,
+                        trend_buy_div: set, n: int) -> set:
+        """v3: 盘整背驰1买 (sub1buy)
+
+        盘整背驰 = 底背驰但至少有一笔在中枢内
+        即: buy_divergence 中去掉 trend_buy_div
+
+        与标准1买(trend_buy_div)的区别:
+        - 不要求两笔都在中枢外
+        - 发生在中枢震荡中，力度较弱
+        - 仓位权重应低于趋势1买
+
+        Returns:
+            set of signal_idx — sub1buy 位置
+        """
+        # sub1buy = buy_divergence 但不在 trend_buy_div 中
+        sub1 = buy_divergence - trend_buy_div
+        # 额外过滤：确保至少有在中枢内的
+        # (buy_divergence - trend_buy_div 本身就保证了这点)
+        return sub1
+
+    def _detect_quasi2buy(self, strokes: List[Dict],
+                          zhongshu_list: List[Dict], n: int) -> set:
+        """v3: 类2买 (quasi2buy)
+
+        类2买 = 中枢内回调不破前低
+        - 向下笔在中枢范围内
+        - 当前向下笔终点 > 前一个向下笔终点（不破前低）
+        - 不要求前面有标准1买
+
+        Returns:
+            set of signal_idx — quasi2buy 位置
+        """
+        quasi2 = set()
+
+        down_strokes = [s for s in strokes
+                        if s['start_type'] == 'top' and s['end_type'] == 'bottom']
+        if len(down_strokes) < 2:
+            return quasi2
+
+        def in_pivot_zone(stroke, zhongshu_list):
+            """检查笔是否在中枢范围内（允许少量突破）"""
+            for zs in zhongshu_list:
+                zd = zs.get('ZD', 0)
+                zg = zs.get('ZG', 0)
+                if zd <= 0 or zg <= 0:
+                    continue
+                # 笔的终点在中枢附近（中枢内或中枢上沿/下沿1%范围内）
+                end_v = stroke['end_val']
+                if end_v >= zd * 0.98 and end_v <= zg * 1.02:
+                    return True
+            return False
+
+        for k in range(1, len(down_strokes)):
+            prev_d = down_strokes[k - 1]
+            curr_d = down_strokes[k]
+
+            # 当前向下笔应在中枢范围内
+            if not in_pivot_zone(curr_d, zhongshu_list):
+                continue
+
+            # 盘整回调不破前低 = 当前底部高于前低
+            if curr_d['end_val'] < prev_d['end_val']:
+                continue  # 破前低，不是类2买
+
+            # 额外：当前向下笔不能太低（至少在中枢附近）
+            if curr_d['end_val'] > prev_d['end_val'] * 1.03:
+                continue  # 回调太浅，意义不大
+
+            signal_idx = curr_d['end_idx'] + self.bi_confirm_delay
+            if 0 <= signal_idx < n:
+                quasi2.add(signal_idx)
+
+        return quasi2
+
+    def _detect_2b3bbuy(self, strokes: List[Dict], buy_divergence: set,
+                         zhongshu_list: List[Dict], n: int) -> set:
+        """v3: 2买3买重叠 (2b3bbuy)
+
+        2b3bbuy = 2买的同时价格在中枢上沿之上（重叠了3买区域）
+        - 价格回踩后在中枢上沿(ZG)上方止跌
+        - 是2买和3买的重叠区域，最强势
+
+        Returns:
+            set of signal_idx — 2b3bbuy 位置
+        """
+        two_bthree_b = set()
+
+        down_strokes = [s for s in strokes
+                        if s['start_type'] == 'top' and s['end_type'] == 'bottom']
+        up_strokes = [s for s in strokes
+                      if s['start_type'] == 'bottom' and s['end_type'] == 'top']
+
+        for ds in down_strokes:
+            signal_1buy = ds['end_idx'] + self.bi_confirm_delay
+            # 标准2买：回调不破1买低点
+            if signal_1buy not in buy_divergence:
+                continue
+
+            low_1buy = ds['end_val']
+
+            # 找反弹后的回调
+            bounce = None
+            for us in up_strokes:
+                if us['start_idx'] > ds['end_idx']:
+                    bounce = us
+                    break
+            if bounce is None:
+                continue
+
+            pullback = None
+            for ds2 in down_strokes:
+                if ds2['start_idx'] > bounce['end_idx']:
+                    pullback = ds2
+                    break
+            if pullback is None:
+                continue
+
+            # 回调不破1买低点（标准2买）
+            if pullback['end_val'] < low_1buy:
+                continue
+
+            # 找最近的中枢
+            for zs in reversed(zhongshu_list):
+                zg = zs.get('ZG', 0)
+                if zg <= 0:
+                    continue
+                # 回调终点在中枢上沿之上 = 2b3bbuy
+                if pullback['end_val'] > zg:
+                    signal_idx = pullback['end_idx'] + self.bi_confirm_delay
+                    if 0 <= signal_idx < n:
+                        two_bthree_b.add(signal_idx)
+                break  # 只看最近的中枢
+
+        return two_bthree_b
+
+    def _detect_xzd1buy(self, strokes: List[Dict], macd_hist: pd.Series,
+                         buy_divergence: set, n: int) -> set:
+        """v3: 小转大1买 (xzd1buy)
+
+        小转大 = 快速下跌后在1买区域发生动能反转
+        特征：
+        - 向下笔动能衰竭（最后一段下跌速度快）
+        - 价格创阶段新低
+        - 随后快速反弹
+
+        检测方法：
+        - 本周期最后一笔下跌创阶段新低
+        - 但该笔的MACD柱子面积明显缩小（背驰）
+        - 且随后1-2根K线快速反弹超过该笔的50%
+
+        Returns:
+            set of signal_idx — xzd1buy 位置
+        """
+        xzd1 = set()
+
+        down_strokes = [s for s in strokes
+                        if s['start_type'] == 'top' and s['end_type'] == 'bottom']
+        if len(down_strokes) < 2:
+            return xzd1
+
+        for k in range(len(down_strokes)):
+            curr_d = down_strokes[k]
+
+            # 价格应创阶段新低（至少有前一笔记低）
+            if k > 0:
+                prev_d = down_strokes[k - 1]
+                if curr_d['end_val'] >= prev_d['end_val']:
+                    continue  # 不创新低，跳过
+
+            # 计算该笔的MACD面积
+            start_i = max(0, curr_d['start_idx'])
+            end_i = min(n - 1, curr_d['end_idx'] + 1)
+            if end_i <= start_i:
+                continue
+
+            area = abs(sum(macd_hist.iloc[start_i:end_i].values))
+            if area <= 0:
+                continue
+
+            # MACD面积较小（至少比前一笔记小40%）= 动能衰竭
+            if k > 0:
+                prev_d = down_strokes[k - 1]
+                prev_start = max(0, prev_d['start_idx'])
+                prev_end = min(n - 1, prev_d['end_idx'] + 1)
+                if prev_end > prev_start:
+                    prev_area = abs(sum(macd_hist.iloc[prev_start:prev_end].values))
+                    if prev_area > 0 and area >= prev_area * 0.6:
+                        continue  # 面积没有明显缩小
+
+            signal_idx = curr_d['end_idx'] + self.bi_confirm_delay
+            if 0 <= signal_idx < n and signal_idx not in buy_divergence:
+                xzd1.add(signal_idx)
+
+        return xzd1
+
+
+    def _check_dif_crosses_zero(self, i: int, dif: pd.Series,
+                                 strokes: List[Dict],
+                                 zhongshu_list: List[Dict],
+                                 price: float) -> Dict:
+        """v16: DIF/DEA 0轴 crossover 中枢级别判断
+
+        买入增强逻辑：
+        - DIF 在中枢内穿越零轴 → 底背驰+中枢确认，最强信号(+0.05仓位)
+        - DIF 在中枢上沿穿越零轴 → 突破型3买，强势(+0.04)
+        - DIF 在中枢下沿穿越零轴 → 反弹型，关注(+0.03)
+        - DIF 远离中枢穿越零轴 → 普通信号(+0.01)
+
+        Args:
+            i: 当前K线索引
+            dif: DIF序列
+            strokes: 笔列表
+            zhongshu_list: 中枢列表
+            price: 当前价格
+
+        Returns:
+            dict: {
+                crossed: bool,           # 是否穿越零轴
+                direction: str,          # up/down/None
+                level: str,              # in_zs/at_zg/at_zd/no_zs/above_zs/below_zs
+                zs_idx: int,             # 关联中枢索引，-1=无
+                crossover_in_zs: bool,   # 中枢内穿越（最强）
+                dif_value: float,        # 当前DIF值
+                strength: float,          # 信号强度系数(0~0.05)
+            }
+        """
+        result = {
+            'crossed': False, 'direction': None, 'level': 'no_zs',
+            'zs_idx': -1, 'crossover_in_zs': False,
+            'dif_value': dif.iloc[i] if i < len(dif) else 0.0,
+            'strength': 0.0
+        }
+
+        if i < 1 or i >= len(dif):
+            return result
+
+        prev_dif = dif.iloc[i - 1]
+        curr_dif = dif.iloc[i]
+
+        # 判断是否穿越零轴
+        if prev_dif <= 0 < curr_dif:
+            result['crossed'] = True
+            result['direction'] = 'up'
+        elif prev_dif >= 0 > curr_dif:
+            result['crossed'] = True
+            result['direction'] = 'down'
+
+        if not result['crossed']:
+            return result
+
+        # 找到当前笔（包含i的笔）
+        # 中枢判断：找 crossover 之前形成的中枢（end_bar < i）
+        cross_zs = None
+        for idx, zs in enumerate(zhongshu_list):
+            end_stroke_idx = zs.get('end_stroke', -1)
+            if end_stroke_idx < 0 or end_stroke_idx >= len(strokes):
+                continue
+            end_bar_idx = strokes[end_stroke_idx].get('end_idx', -1)
+            # 中枢必须在 crossover 之前形成
+            if end_bar_idx < i:
+                if cross_zs is None or end_bar_idx > cross_zs.get('end_bar', -1):
+                    cross_zs = {**zs, 'zs_idx': idx, 'end_bar': end_bar_idx}
+
+        if cross_zs is None:
+            result['level'] = 'no_zs'
+            result['strength'] = 0.01
+            return result
+
+        zg = cross_zs.get('ZG', 0)
+        zd = cross_zs.get('ZD', 0)
+        result['zs_idx'] = cross_zs.get('zs_idx', -1)
+
+        # 判断价格相对于中枢的位置
+        if zd < price < zg:
+            result['level'] = 'in_zs'
+            result['crossover_in_zs'] = True
+            result['strength'] = 0.05
+        elif zg > 0 and abs(price - zg) / zg < 0.01:
+            result['level'] = 'at_zg'
+            result['strength'] = 0.04
+        elif zd > 0 and abs(price - zd) / zd < 0.01:
+            result['level'] = 'at_zd'
+            result['strength'] = 0.03
+        else:
+            if result['direction'] == 'up' and price > zg:
+                result['level'] = 'above_zs'
+                result['strength'] = 0.03
+            elif result['direction'] == 'down' and price < zd:
+                result['level'] = 'below_zs'
+                result['strength'] = 0.01
+            else:
+                result['level'] = 'no_zs'
+                result['strength'] = 0.01
+
+        return result
+
+
     def _detect_segments(self, strokes: List[Dict]) -> List[Dict]:
         """v14: 线段检测
 
@@ -1609,6 +2000,67 @@ class SignalEngine:
 
         return sell_2
 
+    def _detect_zhongshu(self, strokes: List[Dict]) -> List[Dict]:
+        """v16: 中枢检测（含9段升级）
+
+        中枢定义: >=3笔连续重叠区间，ZG=min(各笔高点)，ZD=max(各笔低点)，ZG>ZD
+        九段升级: 中枢延伸达到9笔时，取前后两段中枢的并集作为升级中枢
+
+        Returns:
+            List[Dict]: 中枢列表，每个中枢含 ZG/ZD/end_stroke/stroke_count/upgraded
+        """
+        zhongshu_list = []
+        if len(strokes) < 3:
+            return zhongshu_list
+        j = 0
+        while j <= len(strokes) - 3:
+            s1, s2, s3 = strokes[j], strokes[j + 1], strokes[j + 2]
+            zg = min(s1['high'], s2['high'], s3['high'])
+            zd = max(s1['low'], s2['low'], s3['low'])
+
+            if zg > zd:
+                # 尝试向后延伸
+                k = j + 3
+                stroke_count = 3
+                while k < len(strokes):
+                    sk = strokes[k]
+                    new_zg = min(zg, sk['high'])
+                    new_zd = max(zd, sk['low'])
+                    if new_zg > new_zd:
+                        zg, zd = new_zg, new_zd
+                        k += 1
+                        stroke_count += 1
+                    else:
+                        break
+                # 9段升级检测
+                upgraded = False
+                if stroke_count >= 9:
+                    seg1_end = min(j + 6, k)
+                    seg2_start = j + 3
+                    if seg2_start < k:
+                        zs_strokes_1 = strokes[j:min(j + 6, k)]
+                        zg1 = min(s['high'] for s in zs_strokes_1)
+                        zd1 = max(s['low'] for s in zs_strokes_1)
+                        zs_strokes_2 = strokes[j + 3:k]
+                        zg2 = min(s['high'] for s in zs_strokes_2)
+                        zd2 = max(s['low'] for s in zs_strokes_2)
+                        up_zg = min(zg1, zg2)
+                        up_zd = max(zd1, zd2)
+                        if up_zg > up_zd:
+                            zg, zd = up_zg, up_zd
+                            upgraded = True
+                zhongshu_list.append({
+                    'end_stroke': k - 1,
+                    'ZG': zg,
+                    'ZD': zd,
+                    'stroke_count': stroke_count,
+                    'upgraded': upgraded,
+                })
+                j = k
+            else:
+                j += 1
+        return zhongshu_list
+
     def _detect_3buy_context(self, filtered_fractals: List[Dict], df: pd.DataFrame) -> pd.Series:
         """检测3买信号上下文 [v11]
 
@@ -1643,65 +2095,8 @@ class SignalEngine:
         if len(strokes) < 3:
             return third_buy
 
-        # Step 1: 检测中枢(Zhongshu) — 含9段升级
-        # 中枢: >=3笔连续重叠, ZG = min(各笔高点), ZD = max(各笔低点), ZG > ZD
-        # 九段升级: 中枢内达到9笔时, 中枢级别扩大(扩展), 更大范围的ZG/ZD
-        zhongshu_list = []
-        j = 0
-        while j <= len(strokes) - 3:
-            s1, s2, s3 = strokes[j], strokes[j + 1], strokes[j + 2]
-            zg = min(s1['high'], s2['high'], s3['high'])
-            zd = max(s1['low'], s2['low'], s3['low'])
-
-            if zg > zd:
-                # 中枢存在, 尝试向后延伸
-                k = j + 3
-                stroke_count = 3
-                while k < len(strokes):
-                    sk = strokes[k]
-                    new_zg = min(zg, sk['high'])
-                    new_zd = max(zd, sk['low'])
-                    if new_zg > new_zd:
-                        zg, zd = new_zg, new_zd
-                        k += 1
-                        stroke_count += 1
-                    else:
-                        break
-
-                # [v15新增] 9段升级检测
-                # 如果中枢延伸达到9笔, 检查是否形成更大级别的中枢
-                upgraded = False
-                if stroke_count >= 9:
-                    # 九段升级: 用整个中枢区间内的所有笔重新计算更大范围
-                    # 方法: 取前3笔的中枢 和 后6笔的中枢, 合并为升级中枢
-                    seg1_end = min(j + 6, k)  # 前6笔(含进入段)
-                    seg2_start = j + 3  # 后段起始
-                    if seg2_start < k:
-                        # 前半中枢
-                        zs_strokes_1 = strokes[j:min(j+6, k)]
-                        zg1 = min(s['high'] for s in zs_strokes_1)
-                        zd1 = max(s['low'] for s in zs_strokes_1)
-                        # 后半中枢
-                        zs_strokes_2 = strokes[j+3:k]
-                        zg2 = min(s['high'] for s in zs_strokes_2)
-                        zd2 = max(s['low'] for s in zs_strokes_2)
-                        # 升级后: 取并集(更大范围)
-                        up_zg = min(zg1, zg2)
-                        up_zd = max(zd1, zd2)
-                        if up_zg > up_zd:
-                            zg, zd = up_zg, up_zd
-                            upgraded = True
-
-                zhongshu_list.append({
-                    'end_stroke': k - 1,
-                    'ZG': zg,
-                    'ZD': zd,
-                    'stroke_count': stroke_count,
-                    'upgraded': upgraded,
-                })
-                j = k  # 跳过已属于该中枢的笔
-            else:
-                j += 1
+        # Step 1: 检测中枢 — 调用统一的_detect_zhongshu
+        zhongshu_list = self._detect_zhongshu(strokes)
 
         # Step 2: 检测3买 — 中枢后向上突破 + 回踩不破ZG
         for zs in zhongshu_list:

@@ -180,6 +180,46 @@ class SinaSource(DataSource):
         df = df.set_index('datetime').sort_index()
         return df
 
+    def get_daily(self, symbol: str, lookback: int = 250) -> pd.DataFrame:
+        """获取日线历史数据（通过新浪行情接口）
+
+        新浪日线接口: scale=240 → 日K线（不是月度！）
+        Returns: DataFrame with index=datetime, columns=[open, high, low, close, volume]
+        """
+        sina_code = self._normalize_code(symbol)
+        url = (
+            'https://money.finance.sina.com.cn/quotes_service/api/json_v2.php'
+            '/CN_MarketData.getKLineData'
+        )
+        params = {
+            'symbol': sina_code,
+            'scale': '240',   # 240 = 日K线（新浪约定）
+            'ma': 'no',
+            'datalen': str(min(lookback, 500)),
+        }
+        data = self._request(url, params)
+        if not data or not isinstance(data, list) or len(data) == 0:
+            return pd.DataFrame()
+
+        rows = []
+        for k in data:
+            try:
+                rows.append({
+                    'datetime': pd.Timestamp(k['day']),
+                    'open': float(k['open']),
+                    'high': float(k['high']),
+                    'low': float(k['low']),
+                    'close': float(k['close']),
+                    'volume': float(k.get('volume', 0)),
+                })
+            except (KeyError, ValueError):
+                continue
+
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows).set_index('datetime').sort_index()
+        return df.tail(lookback)
+
     def get_stock_list(self) -> pd.DataFrame:
         """获取股票列表(简化版，返回代码和名称)"""
         # 新浪没有直接的股票列表API，返回空DataFrame
