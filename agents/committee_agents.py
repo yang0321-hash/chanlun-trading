@@ -637,12 +637,12 @@ class BullAnalyst:
                     reasoning_parts.append('背驰确认')
             elif cl.buy_type == '2buy':
                 key_points.append('2买信号(回调不破前低)')
-                confidence += 0.10
+                confidence += 0.15  # 缠论最佳入场点, 高于3买
                 reasoning_parts.append('2买确认')
-                # 2买核心区分: 强度三档 (差异拉大)
+                # 2买核心区分: 强度三档
                 if cl.buy_strength == 'strong':
                     key_points.append('强2买(2买3买重叠)')
-                    confidence += 0.25
+                    confidence += 0.30  # 缠论最强形态
                     reasoning_parts.append('2买3买重叠')
                 elif cl.buy_strength == 'medium':
                     key_points.append('类2买(中枢内)')
