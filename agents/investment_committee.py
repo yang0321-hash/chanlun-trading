@@ -224,6 +224,17 @@ class InvestmentCommittee:
             chanlun.weekly_stroke_phase = weekly_result.get('stroke_phase', '')
             chanlun.weekly_buy_type = weekly_result['buy_type']
             chanlun.weekly_divergence = weekly_result['divergence']
+            # 用周线数据更新支撑位: 强支撑取日线ZD和周线ZD的较高者
+            if weekly_result['zd'] > 0:
+                chanlun.support_strong = max(chanlun.support_strong, weekly_result['zd'])
+            # 周线中轨作为中支撑参考
+            w_mid = (weekly_result['zg'] + weekly_result['zd']) / 2
+            if w_mid > 0:
+                chanlun.support_medium = max(chanlun.support_medium, w_mid)
+            # 入场区间: 中支撑以下到强支撑以上
+            last_close = float(df_daily['close'].iloc[-1]) if len(df_daily) > 0 else 0
+            chanlun.entry_zone_high = chanlun.support_medium
+            chanlun.entry_zone_low = chanlun.support_strong
 
         # 如果缠论分析失败，从扫描器数据中提取部分信息
         if not chanlun and candidate:

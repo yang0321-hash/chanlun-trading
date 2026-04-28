@@ -66,6 +66,14 @@ class ChanlunInfo:
     weekly_stroke_phase: str = ''      # 周线笔阶段: turning/early/mid/late
     weekly_buy_type: str = ''          # 周线买点类型
     weekly_divergence: bool = False    # 周线背驰
+    # 入场结构
+    daily_top_fractal: bool = False    # 日线最新分型是否为顶分型
+    daily_top_fractal_idx: int = 0     # 日线顶分型索引
+    daily_top_fractal_price: float = 0.0  # 日线顶分型价格
+    support_strong: float = 0.0        # 强支撑 (日线ZD/周线ZD)
+    support_medium: float = 0.0        # 中支撑 (周线中轨/日线前底分型)
+    entry_zone_high: float = 0.0       # 入场区间上沿 (中支撑)
+    entry_zone_low: float = 0.0        # 入场区间下沿 (强支撑)
 
 
 @dataclass
@@ -230,24 +238,90 @@ def analyze_chanlun_structure(df: pd.DataFrame, candidate: Dict = None) -> Optio
         if best_buy and best_buy.stop_loss > 0:
             stop_by_structure = max(stop_by_structure, best_buy.stop_loss)
 
-        # MACD背驰检测（从买点中获取，更精确）
+        # 缠论背驰检测: 中枢的进入段 vs 离开段
+        # 背驰定义: 围绕同一中枢, 离开段力度(价格幅度) < 进入段力度,
+        # 但价格走得更远, MACD面积缩小作为辅助确认
         divergence = False
         if best_buy and best_buy.divergence_ratio > 0:
             divergence = True
-        elif len(strokes) >= 4:
-            # 手动计算MACD用于背驰检测
+        elif pivots and len(strokes) >= 4:
             hist_series = macd.get_histogram_series()
             offset = macd._kline_offset
-            down_strokes = [s for s in strokes if s.is_down]
-            if len(down_strokes) >= 2:
-                s1, s2 = down_strokes[-2], down_strokes[-1]
-                s1s, s1e = s1.start_index - offset, s1.end_index - offset
-                s2s, s2e = s2.start_index - offset, s2.end_index - offset
-                if 0 <= s1s <= s1e < len(hist_series) and 0 <= s2s <= s2e < len(hist_series):
-                    area1 = abs(hist_series.iloc[s1s:s1e+1].sum())
-                    area2 = abs(hist_series.iloc[s2s:s2e+1].sum())
-                    if area1 > 0 and area2 < area1 * 0.7 and s2.end_value < s1.end_value:
-                        divergence = True
+            # 找价格在中枢下方的中枢(底背驰) 或 上方的中枢(顶背驰)
+            last_close = float(df['close'].iloc[-1])
+            for pivot in reversed(pivots):
+                # 底背驰: 价格在中枢下方, 找离开中枢向下的段
+                if last_close < pivot.zd:
+                    # 找跨越中枢下沿(ZD)的下笔作为离开段
+                    leaving = []  # 离开中枢向下的笔
+                    for s in strokes:
+                        sd = s.to_dict()
+                        if s.is_down and sd['start_index'] >= pivot.start_index:
+                            # 笔的起点在中枢ZD以上, 终点在中枢ZD以下 = 离开段
+                            if sd['start_value'] >= pivot.zd and sd['end_value'] < pivot.zd:
+                                leaving.append(s)
+                    if len(leaving) >= 2:
+                        s1, s2 = leaving[-2], leaving[-1]
+                        sd1, sd2 = s1.to_dict(), s2.to_dict()
+                        # 价格幅度比较: 离开段2的幅度 < 离开段1
+                        amp1 = abs(sd1['start_value'] - sd1['end_value'])
+                        amp2 = abs(sd2['start_value'] - sd2['end_value'])
+                        # MACD辅助: 只取绿柱面积
+                        h1 = hist_series.iloc[max(0, sd1['start_index'] - offset):min(len(hist_series), sd2['end_index'] - offset + 1)]
+                        h1_seg = hist_series.iloc[max(0, sd1['start_index'] - offset):min(len(hist_series), sd1['end_index'] - offset + 1)]
+                        h2_seg = hist_series.iloc[max(0, sd2['start_index'] - offset):min(len(hist_series), sd2['end_index'] - offset + 1)]
+                        macd1 = abs(h1_seg[h1_seg < 0].sum())
+                        macd2 = abs(h2_seg[h2_seg < 0].sum())
+                        # 背驰条件: 价格走得更远(新低) + 力度减弱(幅度或MACD)
+                        if (sd2['end_value'] < sd1['end_value']  # 创新低
+                            and (amp2 < amp1 or (macd1 > 0 and macd2 < macd1 * 0.7))):
+                            divergence = True
+                    break  # 只检查最近的中枢
+                # 顶背驰: 价格在中枢上方
+                elif last_close > pivot.zg:
+                    entering = []
+                    for s in strokes:
+                        sd = s.to_dict()
+                        if not s.is_down and sd['start_index'] >= pivot.start_index:
+                            if sd['start_value'] <= pivot.zg and sd['end_value'] > pivot.zg:
+                                entering.append(s)
+                    if len(entering) >= 2:
+                        s1, s2 = entering[-2], entering[-1]
+                        sd1, sd2 = s1.to_dict(), s2.to_dict()
+                        amp1 = abs(sd1['end_value'] - sd1['start_value'])
+                        amp2 = abs(sd2['end_value'] - sd2['start_value'])
+                        h1_seg = hist_series.iloc[max(0, sd1['start_index'] - offset):min(len(hist_series), sd1['end_index'] - offset + 1)]
+                        h2_seg = hist_series.iloc[max(0, sd2['start_index'] - offset):min(len(hist_series), sd2['end_index'] - offset + 1)]
+                        macd1 = abs(h1_seg[h1_seg > 0].sum())
+                        macd2 = abs(h2_seg[h2_seg > 0].sum())
+                        if (sd2['end_value'] > sd1['end_value']
+                            and (amp2 < amp1 or (macd1 > 0 and macd2 < macd1 * 0.7))):
+                            divergence = True
+                    break
+
+        # 日线最新分型是否为顶分型
+        daily_top_fractal = False
+        daily_top_fractal_idx = 0
+        daily_top_fractal_price = 0.0
+        if fractals:
+            last_f = fractals[-1]
+            if last_f.type.name == 'TOP':
+                daily_top_fractal = True
+                daily_top_fractal_idx = last_f.index
+                daily_top_fractal_price = float(df['high'].iloc[
+                    min(last_f.index, len(df) - 1)
+                ])
+
+        # 结构化支撑位
+        support_strong = last_pivot.zd
+        # 强支撑: 取日线ZD和最近下笔低点的较高者
+        if len(strokes) >= 2:
+            for s in reversed(strokes):
+                if s.is_down:
+                    support_strong = max(support_strong, s.end_value)
+                    break
+        # 中支撑: 日线中枢中轨
+        support_medium = (last_pivot.zg + last_pivot.zd) / 2
 
         info = ChanlunInfo(
             pivot_zg=last_pivot.zg,
@@ -261,6 +335,11 @@ def analyze_chanlun_structure(df: pd.DataFrame, candidate: Dict = None) -> Optio
             price_vs_pivot=price_pos,
             divergence_detected=divergence,
             stop_by_structure=stop_by_structure,
+            daily_top_fractal=daily_top_fractal,
+            daily_top_fractal_idx=daily_top_fractal_idx,
+            daily_top_fractal_price=daily_top_fractal_price,
+            support_strong=support_strong,
+            support_medium=support_medium,
         )
         return info
 
@@ -329,21 +408,45 @@ def analyze_weekly_chanlun(weekly_df: pd.DataFrame) -> Optional[Dict]:
         except Exception:
             pass
 
-        # 周线MACD背驰(手动检测)
-        if not divergence and len(strokes) >= 4:
+        # 周线缠论背驰(手动检测): 中枢进入段/离开段比较
+        if not divergence and pivots and len(strokes) >= 4:
             try:
                 hist = macd.get_histogram_series()
                 offset = macd._kline_offset
-                down_strokes = [s for s in strokes if s.is_down]
-                if len(down_strokes) >= 2:
-                    s1, s2 = down_strokes[-2], down_strokes[-1]
-                    s1s, s1e = s1.start_index - offset, s1.end_index - offset
-                    s2s, s2e = s2.start_index - offset, s2.end_index - offset
-                    if (0 <= s1s <= s1e < len(hist) and 0 <= s2s <= s2e < len(hist)):
-                        a1 = abs(hist.iloc[s1s:s1e+1].sum())
-                        a2 = abs(hist.iloc[s2s:s2e+1].sum())
-                        if a1 > 0 and a2 < a1 * 0.7 and s2.end_value < s1.end_value:
-                            divergence = True
+                last_close = float(weekly_df['close'].iloc[-1])
+                for pivot in reversed(pivots):
+                    if last_close < pivot.zd:
+                        leaving = [s for s in strokes if s.is_down
+                                   and s.to_dict()['start_index'] >= pivot.start_index
+                                   and s.to_dict()['start_value'] >= pivot.zd
+                                   and s.to_dict()['end_value'] < pivot.zd]
+                        if len(leaving) >= 2:
+                            s1, s2 = leaving[-2], leaving[-1]
+                            sd1, sd2 = s1.to_dict(), s2.to_dict()
+                            amp1 = abs(sd1['start_value'] - sd1['end_value'])
+                            amp2 = abs(sd2['start_value'] - sd2['end_value'])
+                            h1 = hist.iloc[max(0, sd1['start_index'] - offset):min(len(hist), sd1['end_index'] - offset + 1)]
+                            h2 = hist.iloc[max(0, sd2['start_index'] - offset):min(len(hist), sd2['end_index'] - offset + 1)]
+                            m1, m2 = abs(h1[h1 < 0].sum()), abs(h2[h2 < 0].sum())
+                            if sd2['end_value'] < sd1['end_value'] and (amp2 < amp1 or (m1 > 0 and m2 < m1 * 0.7)):
+                                divergence = True
+                        break
+                    elif last_close > pivot.zg:
+                        entering = [s for s in strokes if not s.is_down
+                                    and s.to_dict()['start_index'] >= pivot.start_index
+                                    and s.to_dict()['start_value'] <= pivot.zg
+                                    and s.to_dict()['end_value'] > pivot.zg]
+                        if len(entering) >= 2:
+                            s1, s2 = entering[-2], entering[-1]
+                            sd1, sd2 = s1.to_dict(), s2.to_dict()
+                            amp1 = abs(sd1['end_value'] - sd1['start_value'])
+                            amp2 = abs(sd2['end_value'] - sd2['start_value'])
+                            h1 = hist.iloc[max(0, sd1['start_index'] - offset):min(len(hist), sd1['end_index'] - offset + 1)]
+                            h2 = hist.iloc[max(0, sd2['start_index'] - offset):min(len(hist), sd2['end_index'] - offset + 1)]
+                            m1, m2 = abs(h1[h1 > 0].sum()), abs(h2[h2 > 0].sum())
+                            if sd2['end_value'] > sd1['end_value'] and (amp2 < amp1 or (m1 > 0 and m2 < m1 * 0.7)):
+                                divergence = True
+                        break
             except Exception:
                 pass
 
@@ -1496,6 +1599,60 @@ class FundManager:
                 weekly_phase_mult = 0.6  # 未确认, 减仓40%
             risk.position_pct *= weekly_phase_mult
 
+        # === 入场结构化: 顶分型检查 + 入场区间 + 30分钟确认 ===
+        # 回测验证: 入场条件只影响仓位大小和30min精确入场,
+        # 不阻止买入 (等回调反而错过好行情)
+        entry_zone = None
+        entry_condition = 'immediate'
+        top_fractal_warning = ''
+        if ctx.chanlun and decision == 'buy':
+            cl = ctx.chanlun
+            last_close = float(ctx.df_daily['close'].iloc[-1]) if len(ctx.df_daily) > 0 else 0
+
+            # 1. 入场区间 (结构化支撑)
+            if cl.support_strong > 0 and cl.support_medium > 0:
+                entry_zone = {
+                    'high': round(cl.support_medium, 2),
+                    'low': round(cl.support_strong, 2),
+                    'current_price': round(last_close, 2),
+                }
+                if last_close > cl.support_medium * 1.02:
+                    entry_condition = 'wait_pullback'
+                    risk.position_pct *= 0.8
+                    key_factors.append(
+                        f'偏高区(>{cl.support_medium:.2f}), 建议等30min底分型精确入场'
+                    )
+                else:
+                    entry_condition = 'in_zone'
+
+            # 2. 日线顶分型检查 (缠论确认 + 原始K线预判)
+            has_top_fractal = cl.daily_top_fractal
+            top_price = cl.daily_top_fractal_price
+            if not has_top_fractal and len(ctx.df_daily) >= 3:
+                d = ctx.df_daily
+                h1, h2, h3 = float(d['high'].iloc[-3]), float(d['high'].iloc[-2]), float(d['high'].iloc[-1])
+                l1, l2, l3 = float(d['low'].iloc[-3]), float(d['low'].iloc[-2]), float(d['low'].iloc[-1])
+                if h2 > h1 and h2 > h3 and l2 > l1 and l2 > l3:
+                    has_top_fractal = True
+                    top_price = h2
+            if has_top_fractal:
+                top_fractal_warning = (
+                    f'日线顶分型@{top_price:.2f}, 需30min底分型确认入场'
+                )
+                risk.position_pct *= 0.7
+                entry_condition = 'wait_30min_bottom_fractal'
+                key_factors.append(top_fractal_warning)
+                risk.warnings.append(top_fractal_warning)
+
+            # 3. 周线中枢位置检查 (中轨以上减仓)
+            if cl.weekly_zg > 0 and cl.weekly_zd > 0 and last_close > 0:
+                pos_pct = (last_close - cl.weekly_zd) / (cl.weekly_zg - cl.weekly_zd)
+                if pos_pct > 0.7:
+                    risk.position_pct *= 0.8
+                    risk.warnings.append(
+                        f'周线中枢{pos_pct:.0%}位(偏高), 减仓20%'
+                    )
+
         # 生成摘要
         decision_cn = {'buy': '买入', 'hold': '观望', 'reject': '否决'}
         news_str = f' | 新闻{news_score:+.2f}' if news_arg and news_arg.confidence > 0 else ''
@@ -1529,6 +1686,12 @@ class FundManager:
             'debate_summary': summary,
             'warnings': risk.warnings,
         }
+
+        if decision == 'buy':
+            result['entry_zone'] = entry_zone
+            result['entry_condition'] = entry_condition
+            if top_fractal_warning:
+                result['top_fractal_warning'] = top_fractal_warning
 
         if news_arg:
             result['news_sentiment'] = float(news_score)
