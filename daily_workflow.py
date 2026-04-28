@@ -38,7 +38,9 @@ POOL_FILE = 'chanlun_system/csi500_pool_all_a.json'
 SECTOR_FILE = 'chanlun_system/full_sector_map.json'
 POSITIONS_FILE = 'signals/positions.json'
 DAILY_LOG_FILE = 'signals/daily_log.json'
+WATCH_POOL_FILE = 'signals/watch_pool.json'
 TOP_N = 15
+ENTRY_ZONE_MAX_DEVIATION = 0.05  # 偏离入场区间上沿>5%则放入选股池
 
 
 # ==================== 工具函数 ====================
@@ -318,6 +320,15 @@ def run_committee(candidates: List[dict], hs: HybridSource,
         # 行业去相关: 标记同行业过多推荐的警告
         results = _diversify_results(results, sector_map)
 
+        # 买点偏离过滤: 远离入场区间的放入选股池
+        results, pool_stocks = _filter_by_entry_zone(results)
+        if pool_stocks:
+            _save_watch_pool(pool_stocks)
+            for s in pool_stocks:
+                code = s.get('symbol', '') or s.get('code', '')
+                print(f'  [选股池] {code_to_prefix(code)} ({s.get("name", "")}) '
+                      f'评分:{s.get("composite_score", 0):.0f} {s.get("pool_reason", "")}')
+
         # 每日BUY上限: 最多保留评分最高的3只BUY推荐
         buy_results = [r for r in results if r.get('decision') == 'buy']
         if len(buy_results) > 3:
@@ -364,6 +375,77 @@ def _diversify_results(results: List[dict], sector_map: Dict[str, str]) -> List[
     return results
 
 
+def _filter_by_entry_zone(results: List[dict]) -> Tuple[List[dict], List[dict]]:
+    """买点偏离过滤: 价格远离入场区间的BUY降为选股池观察
+
+    Returns:
+        (filtered_results, pool_stocks) — 过滤后的结果列表 + 选股池股票
+    """
+    pool_stocks = []
+    for r in results:
+        if r.get('decision') != 'buy':
+            continue
+        zone = r.get('entry_zone')
+        if not zone:
+            continue
+
+        current = zone.get('current_price', 0)
+        zone_high = zone.get('high', 0)
+        if current <= 0 or zone_high <= 0:
+            continue
+
+        deviation = (current - zone_high) / zone_high
+        if deviation > ENTRY_ZONE_MAX_DEVIATION:
+            code = r.get('symbol', '') or r.get('code', '')
+            r['decision'] = 'pool'
+            r['pool_reason'] = f'偏离买点{deviation:+.1%}(现价{current:.2f} vs 区间{zone["low"]:.2f}-{zone_high:.2f})'
+            pool_stocks.append(r)
+
+    return results, pool_stocks
+
+
+def _save_watch_pool(pool_stocks: List[dict]):
+    """保存选股池, 保留最近7天"""
+    existing = []
+    if os.path.exists(WATCH_POOL_FILE):
+        try:
+            with open(WATCH_POOL_FILE, 'r', encoding='utf-8') as f:
+                existing = json.load(f)
+        except Exception:
+            pass
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    # 去掉7天前的旧记录
+    existing = [s for s in existing if s.get('date', '') >=
+                (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')]
+
+    # 去重: 同一代码只保留最新
+    code_date = {s.get('code', ''): s.get('date', '') for s in existing}
+    new_entries = []
+    for s in pool_stocks:
+        code = s.get('symbol', '') or s.get('code', '')
+        prefix_code = code_to_prefix(code)
+        # 移除旧的同代码记录
+        existing = [e for e in existing if code_to_prefix(e.get('code', '')) != prefix_code]
+        new_entries.append({
+            'code': prefix_code,
+            'name': s.get('name', ''),
+            'sector': s.get('sector', ''),
+            'score': round(s.get('composite_score', 0), 1),
+            'entry_zone': s.get('entry_zone'),
+            'stop_loss': s.get('stop_loss', 0),
+            'entry_condition': s.get('entry_condition', ''),
+            'date': today,
+            'reason': s.get('pool_reason', ''),
+        })
+
+    existing.extend(new_entries)
+
+    with open(WATCH_POOL_FILE, 'w', encoding='utf-8') as f:
+        json.dump(existing, f, ensure_ascii=False, indent=2)
+    print(f'  选股池更新: +{len(new_entries)}只, 共{len(existing)}只 (保留7天)')
+
+
 # ==================== 报告格式化 ====================
 
 def format_report_text(committee_results: List[dict],
@@ -377,6 +459,7 @@ def format_report_text(committee_results: List[dict],
     buy = [r for r in committee_results if r.get('decision') == 'buy']
     hold = [r for r in committee_results if r.get('decision') == 'hold']
     reject = [r for r in committee_results if r.get('decision') == 'reject']
+    pool = [r for r in committee_results if r.get('decision') == 'pool']
 
     if buy:
         tier_labels = {1: '[主线]', 2: '[活跃]', 3: '[发现]'}
@@ -386,13 +469,14 @@ def format_report_text(committee_results: List[dict],
             name = r.get('name', '')
             score = r.get('composite_score', 0)
             stop = r.get('stop_loss', 0)
-            rr = r.get('risk_reward', 0)
+            zone = r.get('entry_zone', {})
+            zone_str = f' 买点:{zone["low"]:.1f}-{zone["high"]:.1f}' if zone else ''
             factors = ', '.join(r.get('key_factors', [])[:2])
             tier = r.get('sector_tier', 2)
             tl = tier_labels.get(tier, '')
             lines.append(
                 f'  {i}. {tl}{code_to_prefix(code)} ({name}) '
-                f'评分:{score:.0f} 止损:{stop:.2f} R/R:{rr:.1f}')
+                f'评分:{score:.0f} 止损:{stop:.2f}{zone_str}')
             if factors:
                 lines.append(f'     {factors}')
         lines.append('')
@@ -428,11 +512,25 @@ def format_report_text(committee_results: List[dict],
     else:
         lines.append('【持仓跟踪】当前无持仓')
 
+    # 选股池 (买点偏离, 等回调)
+    if pool:
+        lines.append('')
+        lines.append(f'【选股池 观察】({len(pool)}只, 等回调至买点)')
+        for r in pool[:5]:
+            code = r.get('symbol', '') or r.get('code', '')
+            zone = r.get('entry_zone', {})
+            score = r.get('composite_score', 0)
+            zone_str = f'{zone["low"]:.1f}-{zone["high"]:.1f}' if zone else '?'
+            cur = zone.get('current_price', 0) if zone else 0
+            lines.append(
+                f'  {code_to_prefix(code)} ({r.get("name", "")}) '
+                f'评分:{score:.0f} 买点:{zone_str} 现价:{cur:.1f}')
+
     lines.append('')
     lines.append(
         f'【市场概况】扫描:{scan_count}只 | '
         f'评估:{len(committee_results)}只 | '
-        f'buy:{len(buy)} hold:{len(hold)} reject:{len(reject)}')
+        f'buy:{len(buy)} pool:{len(pool)} hold:{len(hold)} reject:{len(reject)}')
 
     return '\n'.join(lines)
 
@@ -445,6 +543,7 @@ def build_feishu_card(committee_results: List[dict],
     buy = [r for r in committee_results if r.get('decision') == 'buy']
     hold = [r for r in committee_results if r.get('decision') == 'hold']
     reject = [r for r in committee_results if r.get('decision') == 'reject']
+    pool = [r for r in committee_results if r.get('decision') == 'pool']
 
     # 委员会推荐
     if buy:
@@ -482,12 +581,28 @@ def build_feishu_card(committee_results: List[dict],
                      "content": f"**持仓 ({len(positions)}只)**\n" + '\n'.join(pos_lines)}
         })
 
+    # 选股池
+    if pool:
+        pool_lines = []
+        for r in pool[:5]:
+            code = r.get('symbol', '') or r.get('code', '')
+            zone = r.get('entry_zone', {})
+            zone_str = f'{zone["low"]:.1f}-{zone["high"]:.1f}' if zone else '?'
+            pool_lines.append(
+                f'- {code_to_prefix(code)} ({r.get("name", "")}) '
+                f'买点:{zone_str} {r.get("pool_reason", "")}')
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md",
+                     "content": f"**选股池 观察 ({len(pool)}只)**\n" + '\n'.join(pool_lines)}
+        })
+
     # 统计
     elements.append({
         "tag": "div",
         "text": {"tag": "lark_md",
                  "content": f"评估:{len(committee_results)}只 | "
-                            f"buy:{len(buy)} hold:{len(hold)} reject:{len(reject)}"}
+                            f"buy:{len(buy)} pool:{len(pool)} hold:{len(hold)} reject:{len(reject)}"}
     })
 
     return elements
