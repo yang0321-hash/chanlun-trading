@@ -1493,10 +1493,10 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
         # 三档强度加分 (2买和3买分开处理)
         if signal_type == '2buy':
             # 2买: 网格搜索最优 — medium(中枢内回踩)最佳, strong(不进中枢)反而追高
-            if buy_strength == 'medium':
+            if buy_strength == 'strong':
+                strength_bonus += 20  # 2买3买重叠: 缠论最强形态
+            elif buy_strength == 'medium':
                 strength_bonus += 12  # 类2买(中枢内): 67.7%胜率, +4.87%
-            elif buy_strength == 'strong':
-                strength_bonus += 3   # 强2买(不进中枢): 追高风险
             else:
                 strength_bonus += 5   # 普通中枢下2买
         elif signal_type == 'sub1buy':
