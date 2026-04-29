@@ -1,0 +1,1117 @@
+{
+  "config": {
+    "codes": [
+      "000426.SZ",
+      "002600.SZ",
+      "000559.SZ",
+      "000629.SZ",
+      "301128.SZ",
+      "688613.SH"
+    ],
+    "start": "2024-06-01",
+    "end": "2026-04-10",
+    "capital": 1000000
+  },
+  "stats": {
+    "初始资金": "1,000,000",
+    "最终权益": "2,937,360",
+    "总收益率": "193.7%",
+    "Sharpe": "2.44",
+    "最大回撤": "13.8%",
+    "总交易次数": 39,
+    "盈利次数": 21,
+    "亏损次数": 18,
+    "胜率": "53.8%",
+    "平均盈利": "14.35%",
+    "平均亏损": "-4.28%",
+    "盈亏比": "3.35"
+  },
+  "trades": [
+    {
+      "date": "2025-04-29 10:30:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 6.356349999999999,
+      "shares": 78600,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-05-14 10:30:00",
+      "code": "000559.SZ",
+      "action": "sell",
+      "price": 9.04999095,
+      "shares": 78600,
+      "pnl": 211356.9,
+      "pnl_pct": 42.29,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-05-16 10:30:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 9.339329999999999,
+      "shares": 64800,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-05-19 10:30:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 9.099089999999999,
+      "shares": 800,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-05-19 11:30:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 9.08908,
+      "shares": 100,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-05-22 10:30:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 8.65865,
+      "shares": 1600,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-05-22 11:30:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 8.5085,
+      "shares": 600,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-05-22 14:00:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 8.46846,
+      "shares": 100,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-05-22 15:00:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 8.42842,
+      "shares": 200,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-05-23 10:30:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 8.4084,
+      "shares": 100,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-05-23 14:00:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 8.33833,
+      "shares": 300,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-05-23 15:00:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 8.26826,
+      "shares": 300,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-05-26 10:30:00",
+      "code": "000559.SZ",
+      "action": "sell",
+      "price": 8.209991789999998,
+      "shares": 68900,
+      "pnl": -75384.52,
+      "pnl_pct": -11.76,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-06-04 10:30:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 2.5325299999999995,
+      "shares": 224200,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-06-05 14:00:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 2.5225199999999997,
+      "shares": 300,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-06-18 11:30:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 2.5125099999999994,
+      "shares": 500,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-06-19 10:30:00",
+      "code": "000629.SZ",
+      "action": "sell",
+      "price": 2.4899975100000002,
+      "shares": 225000,
+      "pnl": -9895.81,
+      "pnl_pct": -1.74,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-06-20 10:30:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 2.49249,
+      "shares": 225800,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-06-20 14:00:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 2.48248,
+      "shares": 400,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-07-14 15:00:00",
+      "code": "000629.SZ",
+      "action": "sell",
+      "price": 2.6499973499999996,
+      "shares": 226200,
+      "pnl": 35283.2,
+      "pnl_pct": 6.26,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-07-14 15:00:00",
+      "code": "688613.SH",
+      "action": "buy",
+      "price": 18.6186,
+      "shares": 31100,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-07-15 10:30:00",
+      "code": "002600.SZ",
+      "action": "buy",
+      "price": 9.008999999999999,
+      "shares": 63700,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-07-15 10:30:00",
+      "code": "688613.SH",
+      "action": "buy",
+      "price": 18.23822,
+      "shares": 300,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-07-15 15:00:00",
+      "code": "002600.SZ",
+      "action": "buy",
+      "price": 9.05905,
+      "shares": 100,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-07-16 10:30:00",
+      "code": "002600.SZ",
+      "action": "buy",
+      "price": 9.049039999999998,
+      "shares": 100,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-07-30 14:00:00",
+      "code": "688613.SH",
+      "action": "sell",
+      "price": 19.16998083,
+      "shares": 31400,
+      "pnl": 17071.54,
+      "pnl_pct": 2.92,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-07-30 15:00:00",
+      "code": "002600.SZ",
+      "action": "buy",
+      "price": 8.98898,
+      "shares": 1500,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-08-08 10:30:00",
+      "code": "002600.SZ",
+      "action": "sell",
+      "price": 9.569990429999999,
+      "shares": 65400,
+      "pnl": 36345.28,
+      "pnl_pct": 6.17,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-08-08 10:30:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 7.717709999999999,
+      "shares": 78700,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-08-08 11:30:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 2.7127099999999995,
+      "shares": 223700,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-08-27 15:00:00",
+      "code": "000559.SZ",
+      "action": "sell",
+      "price": 7.929992069999999,
+      "shares": 78700,
+      "pnl": 16337.16,
+      "pnl_pct": 2.69,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-08-27 15:00:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 2.7627599999999997,
+      "shares": 1000,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-08-28 11:30:00",
+      "code": "000426.SZ",
+      "action": "buy",
+      "price": 20.05003,
+      "shares": 30800,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-08-28 11:30:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 2.74274,
+      "shares": 800,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-09-01 15:00:00",
+      "code": "000629.SZ",
+      "action": "sell",
+      "price": 2.86999713,
+      "shares": 225500,
+      "pnl": 35016.48,
+      "pnl_pct": 5.72,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-09-03 11:30:00",
+      "code": "000426.SZ",
+      "action": "sell",
+      "price": 22.75997724,
+      "shares": 30800,
+      "pnl": 83070.81,
+      "pnl_pct": 13.45,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-09-03 11:30:00",
+      "code": "688613.SH",
+      "action": "buy",
+      "price": 19.899879999999996,
+      "shares": 33900,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-09-04 15:00:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 7.537529999999999,
+      "shares": 89000,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-09-04 15:00:00",
+      "code": "688613.SH",
+      "action": "buy",
+      "price": 19.70969,
+      "shares": 100,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-09-08 11:30:00",
+      "code": "688613.SH",
+      "action": "sell",
+      "price": 24.18997581,
+      "shares": 34000,
+      "pnl": 145432.57,
+      "pnl_pct": 21.49,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-09-08 14:00:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 7.977969999999999,
+      "shares": 7000,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-09-09 10:30:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 7.887879999999999,
+      "shares": 600,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-09-10 14:00:00",
+      "code": "301128.SZ",
+      "action": "buy",
+      "price": 85.66557999999999,
+      "shares": 8900,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-09-15 10:30:00",
+      "code": "301128.SZ",
+      "action": "sell",
+      "price": 87.02991296999998,
+      "shares": 8900,
+      "pnl": 11681.47,
+      "pnl_pct": 1.53,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-09-19 10:30:00",
+      "code": "000559.SZ",
+      "action": "sell",
+      "price": 10.42998957,
+      "shares": 96600,
+      "pnl": 275596.62,
+      "pnl_pct": 37.67,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-09-23 14:00:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 2.8027999999999995,
+      "shares": 317800,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-09-26 15:00:00",
+      "code": "301128.SZ",
+      "action": "buy",
+      "price": 86.58649999999999,
+      "shares": 10200,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-10-10 11:30:00",
+      "code": "301128.SZ",
+      "action": "sell",
+      "price": 84.34991564999999,
+      "shares": 10200,
+      "pnl": -23336.23,
+      "pnl_pct": -2.64,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-10-16 14:00:00",
+      "code": "000629.SZ",
+      "action": "sell",
+      "price": 3.0199969799999997,
+      "shares": 317800,
+      "pnl": 68470.05,
+      "pnl_pct": 7.68,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-10-17 10:30:00",
+      "code": "301128.SZ",
+      "action": "buy",
+      "price": 82.47238999999999,
+      "shares": 11000,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-10-17 14:00:00",
+      "code": "301128.SZ",
+      "action": "buy",
+      "price": 81.99190999999999,
+      "shares": 100,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-10-31 14:00:00",
+      "code": "301128.SZ",
+      "action": "sell",
+      "price": 99.5999004,
+      "shares": 11100,
+      "pnl": 189557.13,
+      "pnl_pct": 20.7,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-10-31 14:00:00",
+      "code": "688613.SH",
+      "action": "buy",
+      "price": 23.16314,
+      "shares": 43500,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-10-31 15:00:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 3.02302,
+      "shares": 332300,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-10-31 15:00:00",
+      "code": "688613.SH",
+      "action": "buy",
+      "price": 23.022999999999996,
+      "shares": 100,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-11-04 11:30:00",
+      "code": "688613.SH",
+      "action": "sell",
+      "price": 22.719977279999995,
+      "shares": 43600,
+      "pnl": -19908.03,
+      "pnl_pct": -1.97,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-11-04 14:00:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 2.96296,
+      "shares": 1000,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-11-04 15:00:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 2.95295,
+      "shares": 600,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-11-17 15:00:00",
+      "code": "000629.SZ",
+      "action": "sell",
+      "price": 3.3699966299999997,
+      "shares": 333900,
+      "pnl": 115317.24,
+      "pnl_pct": 11.42,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-11-17 15:00:00",
+      "code": "301128.SZ",
+      "action": "buy",
+      "price": 88.36827999999998,
+      "shares": 11900,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-11-18 10:30:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 12.57256,
+      "shares": 83900,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-11-18 14:00:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 12.23222,
+      "shares": 200,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-11-18 15:00:00",
+      "code": "000559.SZ",
+      "action": "sell",
+      "price": 12.099987899999999,
+      "shares": 84100,
+      "pnl": -40297.71,
+      "pnl_pct": -3.81,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-11-19 10:30:00",
+      "code": "002600.SZ",
+      "action": "buy",
+      "price": 13.543529999999999,
+      "shares": 74800,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-11-19 10:30:00",
+      "code": "301128.SZ",
+      "action": "sell",
+      "price": 84.77991521999999,
+      "shares": 11900,
+      "pnl": -43319.68,
+      "pnl_pct": -4.12,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-11-19 11:30:00",
+      "code": "002600.SZ",
+      "action": "buy",
+      "price": 13.453439999999999,
+      "shares": 200,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-11-19 15:00:00",
+      "code": "002600.SZ",
+      "action": "buy",
+      "price": 13.443429999999998,
+      "shares": 100,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-11-20 14:00:00",
+      "code": "002600.SZ",
+      "action": "buy",
+      "price": 13.393379999999999,
+      "shares": 100,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-11-20 15:00:00",
+      "code": "002600.SZ",
+      "action": "sell",
+      "price": 13.289986709999997,
+      "shares": 75200,
+      "pnl": -19628.76,
+      "pnl_pct": -1.93,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-11-21 10:30:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 11.771759999999999,
+      "shares": 85300,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-11-21 15:00:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 11.651639999999999,
+      "shares": 400,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-11-24 10:30:00",
+      "code": "000559.SZ",
+      "action": "sell",
+      "price": 11.429988569999999,
+      "shares": 85700,
+      "pnl": -29838.27,
+      "pnl_pct": -2.96,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-11-24 14:00:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 3.0029999999999997,
+      "shares": 329400,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-11-24 15:00:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 2.99299,
+      "shares": 400,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-11-26 15:00:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 12.011999999999999,
+      "shares": 82100,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-12-04 15:00:00",
+      "code": "000559.SZ",
+      "action": "sell",
+      "price": 12.749987249999998,
+      "shares": 82100,
+      "pnl": 59978.87,
+      "pnl_pct": 6.08,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-12-04 15:00:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 3.0430399999999995,
+      "shares": 7200,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-12-04 15:00:00",
+      "code": "301128.SZ",
+      "action": "buy",
+      "price": 82.5825,
+      "shares": 12400,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-12-05 10:30:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 3.0530499999999994,
+      "shares": 100,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-12-11 15:00:00",
+      "code": "000629.SZ",
+      "action": "sell",
+      "price": 2.9599970399999997,
+      "shares": 337100,
+      "pnl": -15388.71,
+      "pnl_pct": -1.52,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-12-16 10:30:00",
+      "code": "000426.SZ",
+      "action": "buy",
+      "price": 33.44340999999999,
+      "shares": 29800,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-12-16 10:30:00",
+      "code": "301128.SZ",
+      "action": "sell",
+      "price": 80.21991978,
+      "shares": 12400,
+      "pnl": -29901.62,
+      "pnl_pct": -2.92,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-12-16 11:30:00",
+      "code": "000426.SZ",
+      "action": "sell",
+      "price": 32.36996762999999,
+      "shares": 29800,
+      "pnl": -32576.95,
+      "pnl_pct": -3.27,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-12-16 11:30:00",
+      "code": "688613.SH",
+      "action": "buy",
+      "price": 19.909889999999997,
+      "shares": 49200,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-12-16 14:00:00",
+      "code": "002600.SZ",
+      "action": "buy",
+      "price": 14.964949999999998,
+      "shares": 65500,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-12-23 10:30:00",
+      "code": "688613.SH",
+      "action": "sell",
+      "price": 21.219978779999995,
+      "shares": 49200,
+      "pnl": 63849.29,
+      "pnl_pct": 6.52,
+      "hold_bars": 0
+    },
+    {
+      "date": "2025-12-23 11:30:00",
+      "code": "002600.SZ",
+      "action": "buy",
+      "price": 15.225209999999999,
+      "shares": 1500,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-12-23 11:30:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 11.881869999999997,
+      "shares": 85800,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2025-12-24 10:30:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 12.362349999999998,
+      "shares": 100,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-01-07 14:00:00",
+      "code": "000559.SZ",
+      "action": "sell",
+      "price": 17.5999824,
+      "shares": 85900,
+      "pnl": 490378.05,
+      "pnl_pct": 48.03,
+      "hold_bars": 0
+    },
+    {
+      "date": "2026-01-07 14:00:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 3.49349,
+      "shares": 370200,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-01-08 10:30:00",
+      "code": "002600.SZ",
+      "action": "buy",
+      "price": 16.47646,
+      "shares": 12600,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-01-08 10:30:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 3.5235199999999995,
+      "shares": 2100,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-01-08 14:00:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 3.49349,
+      "shares": 700,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-01-13 10:30:00",
+      "code": "002600.SZ",
+      "action": "sell",
+      "price": 17.429982569999996,
+      "shares": 79600,
+      "pnl": 176001.75,
+      "pnl_pct": 14.53,
+      "hold_bars": 0
+    },
+    {
+      "date": "2026-01-13 10:30:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 3.5835799999999995,
+      "shares": 6900,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-01-13 10:30:00",
+      "code": "688613.SH",
+      "action": "buy",
+      "price": 23.333309999999997,
+      "shares": 58300,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-01-14 14:00:00",
+      "code": "000629.SZ",
+      "action": "sell",
+      "price": 3.42999657,
+      "shares": 379900,
+      "pnl": -25595.11,
+      "pnl_pct": -1.93,
+      "hold_bars": 0
+    },
+    {
+      "date": "2026-01-14 14:00:00",
+      "code": "688613.SH",
+      "action": "sell",
+      "price": 22.72997727,
+      "shares": 58300,
+      "pnl": -35979.95,
+      "pnl_pct": -2.64,
+      "hold_bars": 0
+    },
+    {
+      "date": "2026-01-14 15:00:00",
+      "code": "301128.SZ",
+      "action": "buy",
+      "price": 94.87477999999999,
+      "shares": 13800,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-01-20 10:30:00",
+      "code": "301128.SZ",
+      "action": "sell",
+      "price": 107.95989203999999,
+      "shares": 13800,
+      "pnl": 179734.81,
+      "pnl_pct": 13.72,
+      "hold_bars": 0
+    },
+    {
+      "date": "2026-01-20 15:00:00",
+      "code": "688613.SH",
+      "action": "buy",
+      "price": 23.223199999999995,
+      "shares": 60400,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-01-21 15:00:00",
+      "code": "002600.SZ",
+      "action": "buy",
+      "price": 15.415399999999998,
+      "shares": 91200,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-01-27 10:30:00",
+      "code": "002600.SZ",
+      "action": "sell",
+      "price": 15.009984989999998,
+      "shares": 91200,
+      "pnl": -37806.29,
+      "pnl_pct": -2.69,
+      "hold_bars": 0
+    },
+    {
+      "date": "2026-02-02 10:30:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 17.287269999999996,
+      "shares": 78800,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-02-02 10:30:00",
+      "code": "688613.SH",
+      "action": "sell",
+      "price": 22.47997752,
+      "shares": 60400,
+      "pnl": -45718.78,
+      "pnl_pct": -3.26,
+      "hold_bars": 0
+    },
+    {
+      "date": "2026-02-02 11:30:00",
+      "code": "301128.SZ",
+      "action": "buy",
+      "price": 102.01190999999999,
+      "shares": 13300,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-02-03 11:30:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 17.38737,
+      "shares": 100,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-02-04 14:00:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 17.057039999999997,
+      "shares": 200,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-02-05 10:30:00",
+      "code": "000559.SZ",
+      "action": "sell",
+      "price": 16.63998336,
+      "shares": 79100,
+      "pnl": -51969.42,
+      "pnl_pct": -3.8,
+      "hold_bars": 0
+    },
+    {
+      "date": "2026-02-26 10:30:00",
+      "code": "301128.SZ",
+      "action": "sell",
+      "price": 111.999888,
+      "shares": 13300,
+      "pnl": 131986.2,
+      "pnl_pct": 9.73,
+      "hold_bars": 0
+    },
+    {
+      "date": "2026-02-26 10:30:00",
+      "code": "688613.SH",
+      "action": "buy",
+      "price": 24.814789999999995,
+      "shares": 56500,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-02-27 10:30:00",
+      "code": "000426.SZ",
+      "action": "buy",
+      "price": 53.88382999999999,
+      "shares": 25900,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-02-27 10:30:00",
+      "code": "688613.SH",
+      "action": "buy",
+      "price": 24.704679999999996,
+      "shares": 100,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-03-03 10:30:00",
+      "code": "000426.SZ",
+      "action": "sell",
+      "price": 56.09994389999999,
+      "shares": 25900,
+      "pnl": 56542.78,
+      "pnl_pct": 4.05,
+      "hold_bars": 0
+    },
+    {
+      "date": "2026-03-03 10:30:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 4.13413,
+      "shares": 334600,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-03-03 10:30:00",
+      "code": "688613.SH",
+      "action": "buy",
+      "price": 23.153129999999997,
+      "shares": 3100,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-03-04 11:30:00",
+      "code": "688613.SH",
+      "action": "sell",
+      "price": 21.299978699999997,
+      "shares": 59700,
+      "pnl": -205496.44,
+      "pnl_pct": -13.92,
+      "hold_bars": 0
+    },
+    {
+      "date": "2026-03-16 10:30:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 3.7637599999999996,
+      "shares": 1600,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-03-16 11:30:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 3.7537499999999997,
+      "shares": 500,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-03-17 14:00:00",
+      "code": "000629.SZ",
+      "action": "buy",
+      "price": 3.7337299999999995,
+      "shares": 900,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-03-17 15:00:00",
+      "code": "000629.SZ",
+      "action": "sell",
+      "price": 3.7099962899999994,
+      "shares": 337600,
+      "pnl": -142838.51,
+      "pnl_pct": -10.24,
+      "hold_bars": 0
+    },
+    {
+      "date": "2026-03-18 10:30:00",
+      "code": "301128.SZ",
+      "action": "buy",
+      "price": 112.43231999999998,
+      "shares": 11100,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-03-20 14:00:00",
+      "code": "301128.SZ",
+      "action": "sell",
+      "price": 133.62986636999997,
+      "shares": 11100,
+      "pnl": 234473.38,
+      "pnl_pct": 18.78,
+      "hold_bars": 0
+    },
+    {
+      "date": "2026-03-24 14:00:00",
+      "code": "000559.SZ",
+      "action": "buy",
+      "price": 14.804789999999997,
+      "shares": 92800,
+      "target_pos": 0.5
+    },
+    {
+      "date": "2026-04-03 15:00:00",
+      "code": "000426.SZ",
+      "action": "buy",
+      "price": 39.459419999999994,
+      "shares": 34800,
+      "target_pos": 0.5
+    }
+  ]
+}

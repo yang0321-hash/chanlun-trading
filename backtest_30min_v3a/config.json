@@ -1,0 +1,11 @@
+{
+  "source": "mootdx",
+  "codes": ["000426.SZ", "002600.SZ", "000559.SZ", "000629.SZ", "301128.SZ", "688613.SH"],
+  "start_date": "2024-06-01",
+  "end_date": "2026-04-10",
+  "interval": "30min",
+  "initial_capital": 1000000,
+  "commission": 0.0003,
+  "slippage": 0.001,
+  "description": "30分钟T+0策略v3a回测 - 2买入场+背驰止盈+动态止盈"
+}

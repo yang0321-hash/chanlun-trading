@@ -1,0 +1,37 @@
+{
+  "test_config": {
+    "stocks": 50,
+    "period": "2025-06-01 ~ 2026-04-17",
+    "rebalance_days": 10
+  },
+  "full_backtest": {
+    "final_value": 1373981.6173746306,
+    "total_return": 0.37398161737463065,
+    "max_drawdown": -0.02808097464262346,
+    "sharpe": 5.92711727825742,
+    "trade_count": 99,
+    "win_count": 67,
+    "loss_count": 32,
+    "win_rate": 0.6767676767676768,
+    "avg_pnl": 0.03173217143334297,
+    "avg_win": 0.055296422476966436,
+    "avg_loss": -0.017605479189243683,
+    "days": 589
+  },
+  "walk_forward": {
+    "final_value": 962114.6548900085,
+    "total_return": -0.03788534510999153,
+    "max_drawdown": -0.10834890690262185,
+    "sharpe": -0.7063705341304621,
+    "trade_count": 11,
+    "win_count": 4,
+    "loss_count": 7,
+    "win_rate": 0.36363636363636365,
+    "avg_pnl": -0.02193798675384524,
+    "avg_win": 0.06531095193257566,
+    "avg_loss": -0.07179452314608577,
+    "days": 588
+  },
+  "sharpe_ratio": -0.11917606839359453,
+  "diagnosis": "invalid"
+}

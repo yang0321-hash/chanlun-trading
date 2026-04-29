@@ -1,0 +1,17 @@
+{
+  "name": "缠论v14日线回测(线段+2卖+yfinance)",
+  "source": "yfinance",
+  "codes": [
+    "600438.SS", "000426.SZ", "000629.SZ", "301128.SZ",
+    "300936.SZ", "002600.SZ", "002951.SZ", "688613.SS",
+    "000559.SZ", "601012.SS", "002371.SZ", "300750.SZ",
+    "002475.SZ", "300059.SZ", "600519.SS", "000858.SZ"
+  ],
+  "start_date": "2024-01-01",
+  "end_date": "2026-04-13",
+  "interval": "1D",
+  "initial_capital": 1000000,
+  "commission": 0.0003,
+  "slippage": 0.001,
+  "description": "v14日线yfinance(akshare不可达): 线段背驰+2卖+2买+3买修复"
+}
