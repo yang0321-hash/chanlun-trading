@@ -271,3 +271,10 @@ test_*.py
 AUTOMATION_SETUP_COMPLETE.md
 MCP_INSTALLATION_GUIDE.md
 SECURE_CONFIG.md
+
+# Data & build artifacts
+tdx_data/
+workspace/
+backtest_v15_*/
+shell-trading-miniapp/
+缠论代码v3.zip
