@@ -29,11 +29,15 @@ COMMISSION = 0.001        # 单边佣金万1 (买卖各收一次)
 SLIPPAGE = 0.001          # 滑点 0.1% (入场+0.1%, 出场-0.1%)
 STAMP_TAX = 0.001         # 印花税 卖出时万1 (2023年降为万1)
 T_PLUS_1 = True           # T+1: 买入当天不能卖出
+DAY1_STOP_WIDEN = 1.5     # T+1入场日止损放宽倍数 (正常止损距离*1.5)
 
 # 出场参数
 REDUCE_PCT = 0.70
 TIGHT_TIERS = [(0.02, 0.008), (0.04, 0.015), (0.07, 0.030)]
 TIME_STOP_BARS = 20
+
+# quasi2buy特殊入场: 接受30min 1buy确认(不限于2buy)
+QUASI2BUY_ACCEPT_30M_1BUY = True
 
 with open(SAMPLE) as f:
     raw_codes = [l.strip() for l in f if l.strip()]
@@ -140,6 +144,12 @@ for ri, raw in enumerate(raw_codes):
                 if bp.point_type in ('2buy', '2buy_strong', 'class2buy', '2b3bbuy'):
                     entry_bp = bp
                     break
+            # quasi2buy特殊: 也接受30min 1buy作为入场确认
+            if not entry_bp and QUASI2BUY_ACCEPT_30M_1BUY and b.point_type == 'quasi2buy':
+                for bp in later_buys:
+                    if bp.point_type in ('1buy',):
+                        entry_bp = bp
+                        break
             if not entry_bp:
                 continue
 
@@ -289,8 +299,10 @@ def simulate_full_v2(ents):
             continue
         ep, sp = e['ep'], e['stop']
         entry_date = df_30.index[e['eidx']]
-        # T+1: 找出入场当天最后一根bar的index
         entry_day = entry_date.date() if hasattr(entry_date, 'date') else entry_date.normalize()
+        # T+1宽止损: 入场日止损距离放宽
+        stop_distance = ep - sp
+        day1_stop = ep - stop_distance * DAY1_STOP_WIDEN if DAY1_STOP_WIDEN > 1 else sp
         max_p = ep
         reduced = False
         reduce_price = 0
@@ -310,9 +322,13 @@ def simulate_full_v2(ents):
 
             max_p = max(max_p, h)
 
-            # 1. 全额止损 (T+1豁免: 止损不受T+1限制，但现实中次日才能止损)
-            if not same_day and l <= sp:
-                ret = calc_net_ret(ep, sp, reduced, reduce_price)
+            # 1. 全额止损 (T+1: 入场日用宽止损, 次日起正常止损)
+            if same_day:
+                current_stop = day1_stop
+            else:
+                current_stop = sp
+            if l <= current_stop:
+                ret = calc_net_ret(ep, current_stop, reduced, reduce_price)
                 trades.append({'ret': ret, 'reason': 'stop', 'hold': hold,
                               'daily_type': e['daily_type'], '30m_type': e['30m_type'],
                               'reduced': reduced})
