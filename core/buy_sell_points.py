@@ -186,6 +186,10 @@ class BuySellPointDetector:
         # 量价确认修正
         self._apply_volume_confirmation()
 
+        # 统一去重: 同位置(±3 bars)只保留最高confidence
+        self._buy_points = self._dedup_points(self._buy_points)
+        self._sell_points = self._dedup_points(self._sell_points)
+
         return self._buy_points, self._sell_points
 
     def detect_latest_buy(self) -> Optional[BuySellPoint]:
@@ -275,6 +279,11 @@ class BuySellPointDetector:
         if not pivot_div:
             return None
 
+        # 弱背驰过滤: amp_ratio 0.8-1.0 时必须有MACD确认
+        weak_divergence = 0.8 <= amp_ratio < 1.0
+        if weak_divergence and (macd_ratio <= 0 or macd_ratio >= 1.0):
+            return None
+
         # 置信度基准（宽幅映射：弱背驰0.35，强背驰0.90）
         base_confidence = 0.40 + min((1.0 - amp_ratio) * 0.35, 0.30)
 
@@ -312,6 +321,10 @@ class BuySellPointDetector:
 
         trend_mod = self._get_trend_modifier('buy')
         confidence = max(0.1, min(1.0, base_confidence + trend_mod))
+
+        # 弱背驰置信度封顶0.60
+        if weak_divergence:
+            confidence = min(confidence, 0.60)
 
         # 止损：必须 < 入场价（安全 guard）
         theory_stop = last_leaving.end_value * 0.97
@@ -1305,6 +1318,19 @@ class BuySellPointDetector:
                 if vol_notes:
                     sp.reason += ' | ' + ', '.join(vol_notes)
 
+    def _dedup_points(self, points: List[BuySellPoint], window: int = 3) -> List[BuySellPoint]:
+        """同位置(±window bars)只保留最高confidence的点"""
+        if not points:
+            return points
+        sorted_pts = sorted(points, key=lambda p: (p.index, -p.confidence))
+        result = []
+        for pt in sorted_pts:
+            if not result or pt.index - result[-1].index > window:
+                result.append(pt)
+            elif pt.confidence > result[-1].confidence:
+                result[-1] = pt
+        return result
+
     def _find_implied_first_buy(self) -> Optional[BuySellPoint]:
         """从笔结构推断隐含的1买点（用于2买检测），增加背驰验证"""
         if not self.pivots or len(self.strokes) < 3:
@@ -1319,30 +1345,33 @@ class BuySellPointDetector:
         last_down = down_strokes[-1]
 
         # 增加背驰验证：最后一笔的跌幅应小于前一笔（底背驰特征）
+        macd_confirmed = False
         if len(down_strokes) >= 2:
             prev_down = down_strokes[-2]
             curr_drop = abs(last_down.price_change_pct) if hasattr(last_down, 'price_change_pct') else 0
             prev_drop = abs(prev_down.price_change_pct) if hasattr(prev_down, 'price_change_pct') else 0
 
-            if prev_drop > 0 and curr_drop >= prev_drop * 0.7:
+            if prev_drop > 0 and curr_drop >= prev_drop * 0.85:
                 return None
 
-            # MACD背驰辅助验证
+            # MACD背驰辅助验证（改为加分项，不强制）
             if self.macd:
                 has_div, div_ratio = self.macd.check_divergence(
                     last_down.start_index, last_down.end_index, 'down',
                     prev_start=prev_down.start_index,
                     prev_end=prev_down.end_index
                 )
-                if not has_div:
-                    return None
+                if has_div:
+                    macd_confirmed = True
+
+        confidence = 0.35 if not macd_confirmed else 0.50
 
         return BuySellPoint(
             point_type='1buy',
             price=last_down.low,
             index=last_down.end_index,
             related_pivot=last_pivot,
-            confidence=0.5,
+            confidence=confidence,
             stop_loss=last_down.low * 0.99,
             reason='隐含1买(推断+背驰验证)'
         )
@@ -2443,7 +2472,7 @@ class BuySellPointDetector:
             down_in_pivot = [s for s in self.strokes
                             if s.is_down
                             and s.start_index >= pivot.start_index
-                            and s.start_index <= pivot.end_index + 30]
+                            and s.start_index <= pivot.end_index + 50]
             if len(down_in_pivot) < 2:
                 continue
 
@@ -2457,8 +2486,8 @@ class BuySellPointDetector:
                 if curr_down.end_value < prev_down.end_value:
                     continue  # 打破了前低，不是类2买
 
-                # 当前向下笔终点应在中枢下沿附近（ZD附近，允许低于ZD最多3%）
-                if curr_down.end_value < zd * 0.97:
+                # 当前向下笔终点应在中枢下沿附近（ZD附近，允许低于ZD最多5%）
+                if curr_down.end_value < zd * 0.95:
                     continue
 
                 # 去重：确保同位置没有更强的买点
@@ -2482,7 +2511,7 @@ class BuySellPointDetector:
                     )
                     if prev_area > 0 and curr_area > 0:
                         ratio = curr_area / prev_area
-                        if ratio < 1.0:
+                        if ratio < 1.2:
                             confidence += 0.1
 
                 # 子级别确认

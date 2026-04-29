@@ -853,20 +853,14 @@ def main():
                               f'类型={daily_context["signal_type"]} '
                               f'止损={final_stop:.2f} ({result.reason})')
                     else:
-                        # 5笔背驰未通过 → 放入选股池等, 不直接HOLD
-                        if has_top_fractal and result and result.details.get('waiting'):
-                            r['decision'] = 'pool'
-                            r['v3a_confirmed'] = False
-                            r['pool_reason'] = f'日线顶分型, {result.reason}'
-                            print(f'  [选股池] {code_to_prefix(code)} ({name}) '
-                                  f'顶分型等回调: {result.reason}')
-                        else:
-                            r['decision'] = 'hold'
-                            r['v3a_confirmed'] = False
-                            conf_str = f'{result.confidence:.2f}' if result else '无数据'
-                            reason_str = f' ({result.reason})' if result else ''
-                            print(f'  [X] {code_to_prefix(code)} ({name}) '
-                                  f'未确认 ({conf_str}){reason_str} -> 降为HOLD')
+                        # 30min未确认 → 全部放入选股池等30min 2买
+                        r['decision'] = 'pool'
+                        r['v3a_confirmed'] = False
+                        reason_str = f' ({result.reason})' if result else ''
+                        conf_str = f'{result.confidence:.2f}' if result else '无数据'
+                        r['pool_reason'] = f'30min未确认({conf_str}){reason_str}'
+                        print(f'  [选股池] {code_to_prefix(code)} ({name}) '
+                              f'30min未确认({conf_str}){reason_str} → 等待2买')
 
                 if v3a_confirmed:
                     print(f'\n  30min确认: {len(v3a_confirmed)}/{len(buy_results)}只')
@@ -900,6 +894,13 @@ def main():
             print('  无BUY推荐，跳过')
     else:
         print('  无委员会结果，跳过')
+
+    # ---- Phase 2.6: 30min未确认的BUY → 追加写入选股池 ----
+    if committee_results:
+        pool_from_30min = [r for r in committee_results
+                          if r.get('decision') == 'pool' and '30min未确认' in r.get('pool_reason', '')]
+        if pool_from_30min:
+            _save_watch_pool(pool_from_30min)
 
     # ---- Phase 2.8: v2.0规则引擎 — 仓位调整 ----
     print()

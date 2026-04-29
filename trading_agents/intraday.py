@@ -272,7 +272,6 @@ class IntradayAgent:
                         if c:
                             codes.add(c)
                             self.watchlist_names[c] = item.get('name', '')
-                            # Also store entry zone for pullback check
                             if not hasattr(self, '_obs_entries'):
                                 self._obs_entries = {}
                             self._obs_entries[c] = {
@@ -281,6 +280,38 @@ class IntradayAgent:
                                 'score': item.get('score', 0),
                                 'name': item.get('name', ''),
                             }
+            except Exception:
+                pass
+
+        # 选股池 (daily_workflow写入的30min未确认BUY)
+        watch_file = 'signals/watch_pool.json'
+        if os.path.exists(watch_file):
+            try:
+                with open(watch_file, 'r', encoding='utf-8') as f:
+                    pool = json.load(f)
+                if not hasattr(self, '_obs_entries'):
+                    self._obs_entries = {}
+                for item in pool:
+                    c = item.get('code', '')
+                    if not c:
+                        continue
+                    if c in self._obs_entries:
+                        continue
+                    codes.add(c)
+                    self.watchlist_names[c] = item.get('name', '')
+                    zone = item.get('entry_zone', {})
+                    zone_str = ''
+                    if isinstance(zone, dict):
+                        lo = zone.get('low', 0)
+                        hi = zone.get('high', 0)
+                        if lo > 0 and hi > 0:
+                            zone_str = f'{lo:.2f}-{hi:.2f}'
+                    self._obs_entries[c] = {
+                        'entry_zone': zone_str,
+                        'stop_loss': item.get('stop_loss', 0),
+                        'score': item.get('score', 0),
+                        'name': item.get('name', ''),
+                    }
             except Exception:
                 pass
 
