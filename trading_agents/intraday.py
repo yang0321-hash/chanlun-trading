@@ -523,14 +523,18 @@ class IntradayAgent:
                 # 通用出场逻辑 (非v3a持仓)
                 # 优先用 UnifiedExitManager
                 if self.exit_mgr and self.exit_mgr.has_position(code):
+                    # 检测30min卖点 (供1卖减仓使用)
+                    sell_30min = self._get_30min_sell_point(code)
                     signal = self.exit_mgr.check_exit(
                         symbol=code,
                         price=price,
                         current_qty=pos.shares,
                         bar_index=self.scan_count,
+                        sell_point_30min=sell_30min,
                     )
                     if signal:
-                        self._handle_exit(code, pos.name, price, signal)
+                        self._handle_exit(code, pos.name, price, signal,
+                                         current_qty=pos.shares)
                         continue
 
                 # Fallback: 简单止损检查
@@ -541,10 +545,11 @@ class IntradayAgent:
             except Exception:
                 pass
 
-    def _handle_exit(self, code: str, name: str, price: float, signal):
+    def _handle_exit(self, code: str, name: str, price: float, signal,
+                     current_qty: int = 0):
         """处理 UnifiedExitManager 的退出信号"""
-        # 判断是否部分减仓
-        partial_ratio = getattr(signal, 'sell_ratio', None)
+        # 判断是否部分减仓: 1卖减仓通过exit_type和quantity判断
+        is_partial = signal.exit_type == 'sell_1sell_reduce' or signal.quantity < current_qty
 
         self.events.append({
             'time': datetime.now().strftime('%H:%M'),
@@ -554,22 +559,24 @@ class IntradayAgent:
             'price': price,
             'action': signal.action,
             'reason': signal.reason,
-            'partial': partial_ratio is not None,
+            'partial': is_partial,
             'msg': f'{code_to_prefix(code)} ({name}) {signal.action}: {signal.reason}',
         })
         print(f'  [EXIT] {code_to_prefix(code)} ({name}) {signal.action}: {signal.reason}'
-              f'{" (partial " + f"{partial_ratio:.0%}" + ")" if partial_ratio else ""}')
+              f'{" (部分减仓)" if is_partial else ""}')
 
         # 实际卖出
-        if partial_ratio and partial_ratio < 1.0:
-            self.pm.partial_sell(code, ratio=partial_ratio)
+        if is_partial and signal.quantity < current_qty:
+            sell_qty = min(signal.quantity, current_qty)
+            self.pm.partial_sell(code, quantity=sell_qty)
         else:
             self.pm.sell(code)
             if self.exit_mgr:
                 self.exit_mgr.on_sell(code)
 
-        action_cn = '部分减仓' if partial_ratio and partial_ratio < 1.0 else (
-            '紧急清仓' if signal.action == 'force_exit' else '卖出信号')
+        action_cn = '30min1卖减仓' if signal.exit_type == 'sell_1sell_reduce' else (
+            '部分减仓' if is_partial else (
+            '紧急清仓' if signal.action == 'force_exit' else '卖出信号'))
         send_notification(
             f'{action_cn} {name}',
             f'{code_to_prefix(code)} ({name})\n'
@@ -1099,6 +1106,51 @@ class IntradayAgent:
             except Exception:
                 pass
             time.sleep(0.2)
+
+    def _get_30min_sell_point(self, code: str) -> Optional[object]:
+        """获取30min最新卖点对象 (供UnifiedExitManager 1卖减仓使用)"""
+        try:
+            from core.kline import KLine
+            from core.fractal import FractalDetector
+            from core.stroke import StrokeGenerator
+            from core.pivot import PivotDetector
+            from core.buy_sell_points import BuySellPointDetector
+            from indicator.macd import MACD
+
+            df = self.hs.get_kline(code, period='30min')
+            if df is None or len(df) < 80:
+                return None
+
+            close_s = pd.Series(df['close'].values)
+            kline = KLine.from_dataframe(df, strict_mode=False)
+            fractals = FractalDetector(kline, confirm_required=False).get_fractals()
+            if len(fractals) < 4:
+                return None
+            strokes = StrokeGenerator(kline, fractals, min_bars=3).get_strokes()
+            if len(strokes) < 3:
+                return None
+            pivots = PivotDetector(kline, strokes).get_pivots()
+            if not pivots:
+                return None
+            macd = MACD(close_s)
+            det = BuySellPointDetector(fractals, strokes, [], pivots, macd)
+            _, sells = det.detect_all()
+
+            if not sells:
+                return None
+
+            klen = len(close_s)
+            # 最近5根K线内的1卖
+            recent_1sells = [
+                s for s in sells
+                if s.point_type in ('1sell',)
+                and s.index >= klen - 5
+            ]
+            if recent_1sells:
+                return max(recent_1sells, key=lambda s: s.confidence)
+            return None
+        except Exception:
+            return None
 
     def _check_30min_sell(self, code: str) -> Optional[dict]:
         """检测单只股票30min卖点"""

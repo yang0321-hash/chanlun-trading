@@ -1,19 +1,14 @@
-"""日线信号感知的30min确认
+"""日线信号的30min缠论确认
 
-替代v3a作为日线级别买卖点的30min二次确认。
-v3a是独立的30min交易策略，条件与日线3买信号不匹配。
-本模块知道日线信号为什么触发（中枢ZG/ZD），验证30min是否支持入场。
+统一入场逻辑:
+  所有日线买点 → 30min检测中枢背驰1买 → 等2买确认 → 入场
+  止损 = 30min 1买低点 (破了说明底是假的)
 
-5个检查:
-  1. 30min回调状态 — 最近笔是向下的
-  2. 接近日线支撑 — 价格 >= 日线pivot_zd * 0.97
-  3. MACD支持 — DIF>DEA / 绿柱缩短 / DIF递增 (任1)
-  4. 未超涨 — 复用5min过滤器
-  5. 结构质量 — 回调未破日线支撑 / 底分型形成
-
-通过条件: 1 + 2 + (3或5) + 4
+状态:
+  - 30min出现2买 → 确认入场, 止损=1买低点
+  - 30min出现1买但无2买 → 等2买 (选股池观察)
+  - 30min无买点 → 等回调 (选股池观察)
 """
-
 import os
 import sys
 from dataclasses import dataclass, field
@@ -31,6 +26,7 @@ from core.kline import KLine
 from core.fractal import FractalDetector
 from core.stroke import StrokeGenerator
 from core.pivot import PivotDetector
+from core.buy_sell_points import BuySellPointDetector
 from indicator.macd import MACD
 
 
@@ -51,20 +47,21 @@ class Daily30minConfirmer:
         self._cache_ttl = 120
 
     def confirm_daily_signal(self, code: str, daily_context: dict) -> Optional[ConfirmResult]:
-        """确认日线信号在30min级别是否支持入场
+        """日线买点 → 30min等2买入场, 止损=1买低点
+
+        核心逻辑:
+          1. 30min检测买卖点 (1买/2买/3买)
+          2. 最新买点是2买 → 入场, 找前面1买低点作止损
+          3. 最新买点是1买 → 等2买形成
+          4. 无买点 → 等回调
 
         Args:
             code: 股票代码 (sh600519)
-            daily_context: {
-                'signal_type': '3buy',
-                'pivot_zg': float,  # 日线中枢ZG
-                'pivot_zd': float,  # 日线中枢ZD
-                'pivot_gg': float,  # 日线中枢GG (optional)
-                'entry_price': float,
-                'stop_price': float,
-            }
+            daily_context: 日线上下文
         """
         analysis = self._run_30min_pipeline(code)
+        daily_stop = daily_context.get('stop_price', 0)
+
         if not analysis:
             return ConfirmResult(
                 passed=True, confidence=0.40, stop_loss=0.0,
@@ -72,94 +69,109 @@ class Daily30minConfirmer:
                 details={'no_data': True},
             )
 
-        daily_pivot_zg = daily_context.get('pivot_zg', 0)
-        daily_pivot_zd = daily_context.get('pivot_zd', 0)
-        daily_pivot_gg = daily_context.get('pivot_gg', daily_pivot_zg)
-        signal_type = daily_context.get('signal_type', '2buy')
-        daily_stop = daily_context.get('stop_price', 0)
+        buy_points = analysis.get('buy_points', [])
         current_price = analysis['current_price']
 
-        checks = {}
-        stop_loss = daily_stop
-
-        # Check 1: 30min回调状态
-        checks['pullback'] = self._check_pullback_state(analysis)
-        if not checks['pullback']['pass']:
+        if not buy_points:
             return ConfirmResult(
-                passed=False, confidence=0.0, stop_loss=stop_loss,
-                reason=f"回调状态: {checks['pullback']['reason']}",
-                details=checks,
+                passed=False, confidence=0.0, stop_loss=daily_stop,
+                reason='30min无买点, 等回调',
+                details={'waiting': True, 'stage': 'no_buy_point'},
             )
 
-        # Check 2: 接近日线支撑
-        checks['support'] = self._check_daily_support(
-            current_price, daily_pivot_zg, daily_pivot_zd, signal_type,
-        )
-        if not checks['support']['pass']:
+        last_buy = buy_points[-1]
+        buy_type = last_buy.point_type
+        kline_len = len(analysis['close_series'])
+        distance = kline_len - last_buy.index
+
+        # === 2买(含强2买/类2买): 确认入场 ===
+        if buy_type in ('2buy', '2buy_strong', 'class2buy', '2b3bbuy'):
+            # 找1买低点作止损
+            stop_1buy = self._find_1buy_stop(buy_points, last_buy.index)
+            final_stop = stop_1buy if stop_1buy > 0 else daily_stop
+            if daily_stop > 0:
+                final_stop = max(final_stop, daily_stop)
+
+            if distance > 20:
+                return ConfirmResult(
+                    passed=False, confidence=0.0, stop_loss=final_stop,
+                    reason=f'30min 2买距今{distance}根, 可能已过时, 等1买→2买',
+                    details={'waiting': True, 'stage': 'stale_2buy', 'distance': distance},
+                )
+
+            conf = 0.50
+            conf += last_buy.confidence * 0.20
+            if buy_type in ('2buy_strong', '2b3bbuy'):
+                conf += 0.15
+            if self._has_recent_bottom_fractal(analysis, window=5):
+                conf += 0.10
+            conf = min(0.95, max(0.45, conf))
+
+            stop_info = f', 止损@1买低{stop_1buy:.2f}' if stop_1buy > 0 else ''
             return ConfirmResult(
-                passed=False, confidence=0.0, stop_loss=stop_loss,
-                reason=f"远离日线支撑: {checks['support']['reason']}",
-                details=checks,
+                passed=True, confidence=conf, stop_loss=float(final_stop),
+                reason=f'30min {buy_type}确认入场{stop_info}',
+                details={
+                    'buy_type': buy_type,
+                    'buy_confidence': round(last_buy.confidence, 2),
+                    'stop_1buy': round(stop_1buy, 2) if stop_1buy > 0 else 0,
+                    'distance': distance,
+                },
             )
 
-        # Check 3: MACD支持 (scored)
-        checks['macd'] = self._check_macd(analysis)
-
-        # Check 4: 5min超涨过滤
-        checks['overextended'] = self._check_5min_overextended(code)
-
-        # Check 5: 结构质量 (scored)
-        checks['structure'] = self._check_structure_quality(
-            analysis, daily_pivot_zd, daily_pivot_zg,
-        )
-
-        # 5min超涨否决
-        if checks['overextended'].get('has_sell'):
+        # === 1买: 等2买 ===
+        if buy_type in ('1buy',):
+            stop_1buy = last_buy.stop_loss if last_buy.stop_loss > 0 else 0
             return ConfirmResult(
-                passed=False, confidence=0.0, stop_loss=stop_loss,
-                reason=f"5min超涨: {checks['overextended'].get('reason', '')}",
-                details=checks,
+                passed=False, confidence=0.0,
+                stop_loss=max(stop_1buy, daily_stop) if stop_1buy > 0 else daily_stop,
+                reason=f'30min 1买已出(距今{distance}根), 等2买确认入场',
+                details={
+                    'waiting': True, 'stage': 'wait_2buy',
+                    'stop_1buy': round(stop_1buy, 2),
+                    'distance': distance,
+                },
             )
 
-        # 综合判断: MACD或结构质量至少一个正面
-        macd_ok = checks['macd']['score'] >= 0.3
-        struct_ok = checks['structure']['score'] >= 0.3
-        if not macd_ok and not struct_ok:
+        # === 3买: 也等 → 30min 3买说明已经在反弹了, 等下一个1买→2买更安全 ===
+        if buy_type in ('3buy', '3buy_strong'):
             return ConfirmResult(
-                passed=False, confidence=0.0, stop_loss=stop_loss,
-                reason='MACD和结构均不支持',
-                details=checks,
+                passed=False, confidence=0.0, stop_loss=daily_stop,
+                reason=f'30min {buy_type}(已在反弹), 等1买→2买更安全',
+                details={'waiting': True, 'stage': f'wait_1buy_after_{buy_type}'},
             )
 
-        # 计算置信度
-        conf = 0.40
-        conf += checks['macd']['score'] * 0.20
-        conf += checks['structure']['score'] * 0.20
-        if checks['support'].get('strong'):
-            conf += 0.10
-        vol_info = checks.get('volume', {})
-        if vol_info.get('contraction'):
-            conf += 0.05
-        conf = min(0.95, max(0.35, conf))
-
-        # 止损: 取日线止损和30min结构止损中较高的
-        struct_stop = checks['structure'].get('stop_price', 0)
-        if struct_stop > 0:
-            stop_loss = max(stop_loss, struct_stop)
-
-        reason_parts = []
-        if macd_ok:
-            reason_parts.append('MACD支持')
-        if struct_ok:
-            reason_parts.append('结构确认')
-        if checks['support'].get('strong'):
-            reason_parts.append('强支撑')
-        reason = ' + '.join(reason_parts) if reason_parts else '基础确认'
-
+        # 其他: 等
         return ConfirmResult(
-            passed=True, confidence=conf, stop_loss=float(stop_loss),
-            reason=reason, details=checks,
+            passed=False, confidence=0.0, stop_loss=daily_stop,
+            reason=f'30min {buy_type}, 等明确的1买→2买',
+            details={'waiting': True, 'stage': 'wait'},
         )
+
+    def check_top_fractal_5stroke(self, code: str, daily_context: dict) -> Optional[ConfirmResult]:
+        """日线顶分型也走统一逻辑: 等30min 1买→2买"""
+        return self.confirm_daily_signal(code, daily_context)
+
+    def _find_1buy_stop(self, buy_points: list, current_2buy_idx: int) -> float:
+        """找到2买之前最近的1买, 返回其stop_loss(=1买低点)"""
+        for bp in reversed(buy_points):
+            if bp.index >= current_2buy_idx:
+                continue
+            if bp.point_type in ('1buy',):
+                return bp.stop_loss if bp.stop_loss > 0 else 0
+        # fallback: 找2买前最近的向下笔末端
+        return 0
+
+    def _has_recent_bottom_fractal(self, analysis: dict, window: int = 5) -> bool:
+        from core.fractal import FractalType
+        fractals = analysis.get('fractals', [])
+        kline_len = len(analysis['close_series'])
+        if not fractals:
+            return False
+        for f in reversed(fractals[-10:]):
+            if f.type == FractalType.BOTTOM and (kline_len - f.index) <= window:
+                return True
+        return False
 
     def _run_30min_pipeline(self, code: str) -> Optional[dict]:
         now = datetime.now().timestamp()
@@ -174,8 +186,6 @@ class Daily30minConfirmer:
                 return None
 
             close_s = pd.Series(df['close'].values)
-            low_s = pd.Series(df['low'].values)
-            vol_s = pd.Series(df['volume'].values) if 'volume' in df.columns else None
             macd = MACD(close_s)
 
             kline = KLine.from_dataframe(df, strict_mode=False)
@@ -189,154 +199,26 @@ class Daily30minConfirmer:
 
             pivots = PivotDetector(kline, strokes).get_pivots()
 
+            det = BuySellPointDetector(fractals, strokes, [], pivots, macd=macd)
+            buys, _ = det.detect_all()
+
+            seen = {}
+            for b in buys:
+                if b.index not in seen or b.confidence > seen[b.index].confidence:
+                    seen[b.index] = b
+            buy_points = sorted(seen.values(), key=lambda x: x.index)
+
             result = {
-                'kline': kline,
                 'strokes': strokes,
                 'pivots': pivots,
                 'fractals': fractals,
                 'macd': macd,
+                'buy_points': buy_points,
                 'current_price': float(close_s.iloc[-1]),
                 'klen': len(close_s),
                 'close_series': close_s,
-                'low_series': low_s,
-                'volume_series': vol_s,
             }
             self._analysis_cache[code] = (now, result)
             return result
         except Exception:
             return None
-
-    def _check_pullback_state(self, analysis: dict) -> dict:
-        """Check 1: 最近笔是否在回调中"""
-        strokes = analysis['strokes']
-        if not strokes:
-            return {'pass': False, 'reason': '无笔数据'}
-
-        last = strokes[-1]
-        is_down = last.end_value < last.start_value
-
-        if is_down:
-            return {'pass': True, 'reason': '当前向下笔(回调中)'}
-
-        if len(strokes) >= 2:
-            prev = strokes[-2]
-            prev_down = prev.end_value < prev.start_value
-            if prev_down:
-                return {'pass': True, 'reason': '前一笔向下(回调刚结束)'}
-
-        return {'pass': False, 'reason': '连续向上，无回调'}
-
-    def _check_daily_support(self, current_price: float,
-                             daily_zg: float, daily_zd: float,
-                             signal_type: str) -> dict:
-        """Check 2: 价格是否在日线支撑位附近"""
-        if daily_zd <= 0 and daily_zg <= 0:
-            return {'pass': True, 'reason': '无日线中枢数据，放行', 'strong': False}
-
-        if signal_type == '3buy' and daily_zg > 0:
-            if current_price >= daily_zg * 0.98:
-                return {'pass': True, 'strong': True,
-                        'reason': f'价格{current_price:.2f}在中枢ZG{daily_zg:.2f}之上'}
-            if current_price >= daily_zd * 0.97:
-                return {'pass': True, 'strong': False,
-                        'reason': f'价格{current_price:.2f}在中枢ZD{daily_zd:.2f}附近'}
-            return {'pass': False, 'strong': False,
-                    'reason': f'价格{current_price:.2f}低于中枢ZD{daily_zd:.2f}*0.97'}
-
-        if daily_zd > 0:
-            if current_price >= daily_zd * 0.95:
-                return {'pass': True, 'strong': current_price >= daily_zd,
-                        'reason': '价格在中枢ZD附近'}
-
-        return {'pass': True, 'reason': '常规信号放行', 'strong': False}
-
-    def _check_macd(self, analysis: dict) -> dict:
-        """Check 3: MACD动能支持 (scored 0-1)"""
-        macd = analysis['macd']
-        latest = macd.get_latest()
-        if not latest:
-            return {'score': 0.0, 'reason': '无MACD数据'}
-
-        score = 0.0
-        reasons = []
-
-        if latest.macd > latest.signal:
-            score += 0.4
-            reasons.append('DIF>DEA')
-
-        hist_series = macd.get_histogram_series()
-        if len(hist_series) >= 2:
-            hist_now = float(hist_series.iloc[-1])
-            hist_prev = float(hist_series.iloc[-2])
-            if hist_now <= 0 and hist_now > hist_prev:
-                score += 0.3
-                reasons.append('绿柱缩短')
-
-        dif_series = macd.get_dif_series()
-        if len(dif_series) >= 2:
-            if float(dif_series.iloc[-1]) > float(dif_series.iloc[-2]):
-                score += 0.3
-                reasons.append('DIF递增')
-
-        return {'score': min(1.0, score), 'reason': '+'.join(reasons) or '无确认'}
-
-    def _check_5min_overextended(self, code: str) -> dict:
-        """Check 4: 5min超涨检测"""
-        try:
-            from strategies.v3a_30min_strategy import V3a30MinStrategy, V3aConfig
-            cfg = V3aConfig(enable_5min_filter=True)
-            v3a = V3a30MinStrategy(cfg, self.hs)
-            result = v3a._check_5min_filter(code)
-            if result is None:
-                return {'has_sell': False, 'reason': '5min数据不足'}
-            return {
-                'has_sell': result.get('has_sell', False),
-                'reason': result.get('reason', ''),
-                'stop_5min': result.get('stop_5min', 0),
-            }
-        except Exception:
-            return {'has_sell': False, 'reason': '5min检查失败'}
-
-    def _check_structure_quality(self, analysis: dict,
-                                  daily_zd: float, daily_zg: float) -> dict:
-        """Check 5: 30min结构质量 (scored 0-1)"""
-        strokes = analysis['strokes']
-        fractals = analysis['fractals']
-        score = 0.0
-        stop_price = 0.0
-
-        recent_n = min(15, len(strokes))
-        recent_strokes = strokes[-recent_n:]
-        down_strokes = [s for s in recent_strokes if s.end_value < s.start_value]
-
-        if down_strokes:
-            score += 0.3
-            last_down = down_strokes[-1]
-            last_down_low = min(last_down.start_value, last_down.end_value)
-            if daily_zd > 0 and last_down_low >= daily_zd * 0.98:
-                score += 0.3
-            if daily_zg > 0 and last_down_low >= daily_zg * 0.98:
-                score += 0.2
-            stop_price = last_down_low
-
-        if fractals:
-            from core.fractal import FractalType
-            bottom_fractals = [f for f in fractals[-10:] if f.type == FractalType.BOTTOM]
-            if bottom_fractals and analysis['klen'] - bottom_fractals[-1].index <= 5:
-                score += 0.2
-
-        vol_s = analysis.get('volume_series')
-        if vol_s is not None and len(vol_s) >= 20 and down_strokes:
-            last_down = down_strokes[-1]
-            pb_start = max(0, last_down.start_index - 2)
-            pb_end = min(len(vol_s) - 1, last_down.end_index + 2)
-            if pb_end > pb_start:
-                pb_vol = float(vol_s.iloc[pb_start:pb_end + 1].mean())
-                up_start = max(0, pb_start - 15)
-                up_end = pb_start
-                if up_end > up_start:
-                    up_vol = float(vol_s.iloc[up_start:up_end].mean())
-                    if up_vol > 0 and pb_vol < up_vol * 0.85:
-                        score += 0.1
-
-        return {'score': min(1.0, score), 'stop_price': stop_price}

@@ -1682,10 +1682,10 @@ class FundManager:
                     top_price = h2
             if has_top_fractal:
                 top_fractal_warning = (
-                    f'日线顶分型@{top_price:.2f}, 需30min底分型确认入场'
+                    f'日线顶分型@{top_price:.2f}, 需30min 5笔背驰确认入场'
                 )
                 risk.position_pct *= 0.7
-                entry_condition = 'wait_30min_bottom_fractal'
+                entry_condition = 'wait_30min_5stroke_divergence'
                 key_factors.append(top_fractal_warning)
                 risk.warnings.append(top_fractal_warning)
 

@@ -825,9 +825,19 @@ def main():
                         'pivot_gg': orig.get('pivot_gg', orig.get('pivot_zg', 0)),
                         'entry_price': r.get('entry_price', orig.get('entry_price', 0)),
                         'stop_price': r.get('stop_loss', orig.get('stop_price', 0)),
+                        'top_fractal_price': r.get('top_fractal_warning', ''),
                     }
 
-                    result = confirmer.confirm_daily_signal(code, daily_context)
+                    # 日线顶分型: 用5笔背驰确认; 否则用标准确认
+                    has_top_fractal = bool(r.get('top_fractal_warning'))
+                    if has_top_fractal:
+                        # 从warning提取顶分型价格
+                        import re
+                        m = re.search(r'@([\d.]+)', r.get('top_fractal_warning', ''))
+                        daily_context['top_fractal_price'] = float(m.group(1)) if m else 0
+                        result = confirmer.check_top_fractal_5stroke(code, daily_context)
+                    else:
+                        result = confirmer.confirm_daily_signal(code, daily_context)
                     if result and result.passed and result.confidence >= 0.45:
                         r['v3a_confirmed'] = True
                         r['v3a_confidence'] = result.confidence
@@ -837,17 +847,26 @@ def main():
                         final_stop = max(committee_stop, result.stop_loss) if committee_stop > 0 else result.stop_loss
                         r['final_stop'] = final_stop
                         v3a_confirmed.append(r)
-                        print(f'  [OK] {code_to_prefix(code)} ({name}) '
+                        tag = '5笔背驰' if has_top_fractal else 'OK'
+                        print(f'  [{tag}] {code_to_prefix(code)} ({name}) '
                               f'确认通过 conf={result.confidence:.2f} '
                               f'类型={daily_context["signal_type"]} '
                               f'止损={final_stop:.2f} ({result.reason})')
                     else:
-                        r['decision'] = 'hold'
-                        r['v3a_confirmed'] = False
-                        conf_str = f'{result.confidence:.2f}' if result else '无数据'
-                        reason_str = f' ({result.reason})' if result else ''
-                        print(f'  [X] {code_to_prefix(code)} ({name}) '
-                              f'未确认 ({conf_str}){reason_str} -> 降为HOLD')
+                        # 5笔背驰未通过 → 放入选股池等, 不直接HOLD
+                        if has_top_fractal and result and result.details.get('waiting'):
+                            r['decision'] = 'pool'
+                            r['v3a_confirmed'] = False
+                            r['pool_reason'] = f'日线顶分型, {result.reason}'
+                            print(f'  [选股池] {code_to_prefix(code)} ({name}) '
+                                  f'顶分型等回调: {result.reason}')
+                        else:
+                            r['decision'] = 'hold'
+                            r['v3a_confirmed'] = False
+                            conf_str = f'{result.confidence:.2f}' if result else '无数据'
+                            reason_str = f' ({result.reason})' if result else ''
+                            print(f'  [X] {code_to_prefix(code)} ({name}) '
+                                  f'未确认 ({conf_str}){reason_str} -> 降为HOLD')
 
                 if v3a_confirmed:
                     print(f'\n  30min确认: {len(v3a_confirmed)}/{len(buy_results)}只')

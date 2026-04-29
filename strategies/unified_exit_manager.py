@@ -7,6 +7,7 @@ Priority-based exit system with dynamic take-profit:
 3. Fixed stop loss
 4. ATR adaptive trailing stop (replaces fixed trailing)
 5. Trend-adaptive partial profit (dynamic targets)
+5.5. 30min 1卖减仓 (reduce 70%, tighten trailing for remainder)
 6. Time stop
 6.5. Structure-accelerated exit (NEW)
 7. Signal reversal (ChanLun opposite signal)
@@ -41,6 +42,8 @@ class PositionRecord:
     bars_held: int = 0
     buy_point_type: str = ''  # 买点类型: 1buy/2buy/3buy
     breakeven_raised: bool = False  # 止损是否已上移至保本
+    sell_reduced: bool = False       # 30min 1卖是否已触发减仓
+    sell_reduce_price: float = 0.0   # 1卖减仓时的价格
 
 
 class UnifiedExitManager:
@@ -124,6 +127,8 @@ class UnifiedExitManager:
         atr_value: float = 0.0,
         trend_status: str = 'neutral',
         structure_warning: str = 'none',
+        # 30min sell point for 1-sell reduce
+        sell_point_30min: Optional[object] = None,
     ) -> Optional[ExitSignal]:
         """
         Check all exit conditions by priority.
@@ -140,6 +145,7 @@ class UnifiedExitManager:
             atr_value: Current ATR value (for adaptive trailing)
             trend_status: Trend status (STRONG_UP/WEAK_UP/NEUTRAL/...)
             structure_warning: Structure warning (none/caution/danger)
+            sell_point_30min: 30min sell point object (for 1-sell reduce)
 
         Returns:
             ExitSignal or None
@@ -187,7 +193,42 @@ class UnifiedExitManager:
                     exit_type='fixed_stop',
                 )
 
+        # === 3.5. 30min 1卖减仓 ===
+        if self.config.use_1sell_reduce and not record.sell_reduced and sell_point_30min is not None:
+            sp = sell_point_30min
+            sp_type = getattr(sp, 'point_type', '')
+            if sp_type in ('1sell',):
+                reduce_pct = self.config.sell_reduce_pct
+                exit_qty = int(current_qty * reduce_pct)
+                exit_qty = (exit_qty // min_unit) * min_unit
+                exit_qty = max(exit_qty, min_unit)
+                if exit_qty > 0 and exit_qty < current_qty:
+                    record.sell_reduced = True
+                    record.sell_reduce_price = price
+                    return ExitSignal(
+                        action='sell',
+                        quantity=exit_qty,
+                        reason=f'30min 1卖减仓{reduce_pct:.0%}: {sp_type} conf={getattr(sp, "confidence", 0):.2f} at +{profit_pct:.2%}',
+                        confidence=0.85,
+                        exit_type='sell_1sell_reduce',
+                    )
+
         # === 4. Trailing stop (ATR-adaptive or fixed) ===
+        # 1卖减仓后始终启用紧跟踪(不受activation阈值限制)
+        if record.sell_reduced and self.config.use_trailing_stop and self.config.sell_reduce_tight_tiers:
+            max_p = record.highest_price
+            for tg, trail in reversed(self.config.sell_reduce_tight_tiers):
+                if (max_p - record.entry_price) / record.entry_price >= tg:
+                    tp = record.entry_price * (1 + tg - trail)
+                    if price <= tp:
+                        return ExitSignal(
+                            action='sell',
+                            quantity=current_qty,
+                            reason=f'Tight trailing after 1sell reduce: {tp:.2f} at +{profit_pct:.2%}',
+                            confidence=0.9,
+                            exit_type='trailing_stop',
+                        )
+
         if self.config.use_trailing_stop and profit_pct > self.config.trailing_activation:
             if self.config.use_atr_trailing and atr_value > 0:
                 # ATR-adaptive trailing: stop = highest - N * ATR

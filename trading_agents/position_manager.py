@@ -113,8 +113,13 @@ class PositionManager:
             self._save()
         return pos
 
-    def partial_sell(self, code: str, ratio: float = 0.5) -> Optional[Position]:
-        """部分减仓, 返回修改后的Position (ratio=卖出比例, 如0.5=减半)
+    def partial_sell(self, code: str, ratio: float = 0.5,
+                     quantity: int = 0) -> Optional[Position]:
+        """部分减仓, 返回修改后的Position
+
+        Args:
+            ratio: 卖出比例 (如0.5=减半), 当quantity>0时忽略
+            quantity: 卖出股数, 0则用ratio计算
 
         若减完后剩余为0则完全清仓。
         """
@@ -122,7 +127,7 @@ class PositionManager:
         if not pos:
             return None
 
-        sell_shares = int(pos.shares * ratio)
+        sell_shares = quantity if quantity > 0 else int(pos.shares * ratio)
         if sell_shares <= 0:
             return pos
 

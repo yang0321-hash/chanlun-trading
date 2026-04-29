@@ -99,6 +99,15 @@ class ExitConfig:
     use_structure_exit: bool = True      # 结构加速出场
     structure_exit_ratio: float = 0.5    # 结构出场卖出剩余仓位比例
 
+    # === 30min 1卖减仓 (回测验证: PF 5.31, 胜率75%) ===
+    use_1sell_reduce: bool = True           # 启用30min 1卖减仓
+    sell_reduce_pct: float = 0.70           # 1卖触发时减仓比例 (70%)
+    sell_reduce_tight_tiers: List[Tuple[float, float]] = field(default_factory=lambda: [
+        (0.02, 0.008),  # 剩余仓位: 2%启动/0.8%回撤
+        (0.04, 0.015),  # 4%启动/1.5%回撤
+        (0.07, 0.030),  # 7%启动/3%回撤
+    ])
+
 
 @dataclass
 class PositionConfig:
