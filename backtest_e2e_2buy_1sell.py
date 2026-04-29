@@ -25,7 +25,10 @@ from indicator.macd import MACD
 
 hs = HybridSource()
 SAMPLE = '.claude/temp/sample_300.txt'
-COMMISSION = 0.001
+COMMISSION = 0.001        # 单边佣金万1 (买卖各收一次)
+SLIPPAGE = 0.001          # 滑点 0.1% (入场+0.1%, 出场-0.1%)
+STAMP_TAX = 0.001         # 印花税 卖出时万1 (2023年降为万1)
+T_PLUS_1 = True           # T+1: 买入当天不能卖出
 
 # 出场参数
 REDUCE_PCT = 0.70
@@ -141,7 +144,7 @@ for ri, raw in enumerate(raw_codes):
                 continue
 
             eidx = min(entry_bp.index + 1, len(df_30) - 1)
-            ep = float(df_30['open'].iloc[eidx])
+            ep = float(df_30['open'].iloc[eidx]) * (1 + SLIPPAGE)  # 滑点
             s1 = find_1buy_stop(bp30, entry_bp.index)
             fs = max(s1, stop_d) if s1 > 0 else stop_d
             if ep <= 0 or fs >= ep:
@@ -151,7 +154,9 @@ for ri, raw in enumerate(raw_codes):
                 'code': hc,
                 'name': name[:6],
                 'daily_type': b.point_type,
+                'daily_conf': b.confidence,
                 '30m_type': entry_bp.point_type,
+                '30m_conf': entry_bp.confidence,
                 'ep': ep,
                 'stop': fs,
                 'eidx': eidx,
@@ -255,6 +260,26 @@ def simulate_full(ents):
 
 
 # 修复: 紧跟踪break逻辑
+def calc_net_ret(ep, exit_price, reduced=False, reduce_price=0):
+    """计算净收益率(扣除佣金+滑点+印花税)"""
+    # 买入成本: ep已含买入滑点, 再加佣金
+    buy_cost = ep * (1 + COMMISSION)
+    # 减仓卖出: 扣滑点+佣金+印花税
+    if reduced and reduce_price > 0:
+        reduce_net = reduce_price * (1 - SLIPPAGE) * (1 - COMMISSION - STAMP_TAX)
+    else:
+        reduce_net = 0
+    # 清仓卖出: 扣滑点+佣金+印花税
+    exit_net = exit_price * (1 - SLIPPAGE) * (1 - COMMISSION - STAMP_TAX)
+
+    if reduced:
+        ret = REDUCE_PCT * (reduce_net - buy_cost) / buy_cost * 100 + \
+              (1 - REDUCE_PCT) * (exit_net - buy_cost) / buy_cost * 100
+    else:
+        ret = (exit_net - buy_cost) / buy_cost * 100
+    return ret
+
+
 def simulate_full_v2(ents):
     trades = []
     for e in ents:
@@ -264,6 +289,8 @@ def simulate_full_v2(ents):
             continue
         ep, sp = e['ep'], e['stop']
         entry_date = df_30.index[e['eidx']]
+        # T+1: 找出入场当天最后一根bar的index
+        entry_day = entry_date.date() if hasattr(entry_date, 'date') else entry_date.normalize()
         max_p = ep
         reduced = False
         reduce_price = 0
@@ -275,19 +302,26 @@ def simulate_full_v2(ents):
             c = float(future['close'].iloc[idx])
             fi = e['eidx'] + 1 + idx
             hold = idx + 1
+            bar_date = future.index[idx]
+            bar_day = bar_date.date() if hasattr(bar_date, 'date') else bar_date.normalize()
+
+            # T+1: 入场当天不能卖出
+            same_day = (bar_day == entry_day)
+
             max_p = max(max_p, h)
 
-            # 1. 全额止损
-            if l <= sp:
-                if reduced:
-                    ret = REDUCE_PCT * (reduce_price - ep) / ep * 100 + (1-REDUCE_PCT) * (sp - ep) / ep * 100
-                else:
-                    ret = (sp - ep) / ep * 100
+            # 1. 全额止损 (T+1豁免: 止损不受T+1限制，但现实中次日才能止损)
+            if not same_day and l <= sp:
+                ret = calc_net_ret(ep, sp, reduced, reduce_price)
                 trades.append({'ret': ret, 'reason': 'stop', 'hold': hold,
                               'daily_type': e['daily_type'], '30m_type': e['30m_type'],
                               'reduced': reduced})
                 exited = True
                 break
+
+            # T+1: 以下出场逻辑仅非入场日执行
+            if same_day:
+                continue
 
             # 2. 30min 1卖 → 减仓
             if not reduced and sp30:
@@ -308,7 +342,7 @@ def simulate_full_v2(ents):
                     if (max_p - ep) / ep >= tg:
                         tp = ep * (1 + tg - trail)
                         if l <= tp:
-                            ret = REDUCE_PCT * (reduce_price - ep) / ep * 100 + (1-REDUCE_PCT) * (tp - ep) / ep * 100
+                            ret = calc_net_ret(ep, tp, True, reduce_price)
                             trades.append({'ret': ret, 'reason': f'tight_trail', 'hold': hold,
                                           'daily_type': e['daily_type'], '30m_type': e['30m_type'],
                                           'reduced': True})
@@ -320,10 +354,7 @@ def simulate_full_v2(ents):
 
             # 4. 时间止损
             if hold >= TIME_STOP_BARS and c <= ep:
-                if reduced:
-                    ret = REDUCE_PCT * (reduce_price - ep) / ep * 100 + (1-REDUCE_PCT) * (c - ep) / ep * 100
-                else:
-                    ret = (c - ep) / ep * 100
+                ret = calc_net_ret(ep, c, reduced, reduce_price)
                 trades.append({'ret': ret, 'reason': 'time', 'hold': hold,
                               'daily_type': e['daily_type'], '30m_type': e['30m_type'],
                               'reduced': reduced})
@@ -332,10 +363,7 @@ def simulate_full_v2(ents):
 
         if not exited:
             c = float(future['close'].iloc[-1])
-            if reduced:
-                ret = REDUCE_PCT * (reduce_price - ep) / ep * 100 + (1-REDUCE_PCT) * (c - ep) / ep * 100
-            else:
-                ret = (c - ep) / ep * 100
+            ret = calc_net_ret(ep, c, reduced, reduce_price)
             trades.append({'ret': ret, 'reason': 'eod', 'hold': len(future),
                           'daily_type': e['daily_type'], '30m_type': e['30m_type'],
                           'reduced': reduced})
@@ -346,13 +374,59 @@ def simulate_full_v2(ents):
 print()
 print('=' * 100)
 print('  端到端回测: 日线买点 → 30min 2买入场 → 1卖减70% → 紧跟踪(2/4/7%) → 止损/20bars')
+print(f'  佣金:{COMMISSION*10000:.0f}基点 滑点:{SLIPPAGE*100:.1f}% 印花税:{STAMP_TAX*10000:.0f}基点 T+1:{T_PLUS_1}')
 print('=' * 100)
 
-trades = simulate_full_v2(entries)
-if not trades:
-    print('无交易')
-    sys.exit(0)
+# === 置信度阈值网格搜索 ===
+print(f'\n入场信号: {len(entries)}个')
+print(f'\n=== 置信度阈值网格搜索 ===')
+print(f'{"阈值":<12} {"笔数":>5} {"胜率":>6} {"均收益":>8} {"PF":>6} {"总PnL":>8} {"1卖触发":>8}')
+print('-' * 65)
 
+thresholds = [
+    ('全量', 0.0),
+    ('conf≥0.30', 0.30),
+    ('conf≥0.40', 0.40),
+    ('conf≥0.50', 0.50),
+    ('conf≥0.55', 0.55),
+    ('conf≥0.60', 0.60),
+    ('conf≥0.65', 0.65),
+    ('conf≥0.70', 0.70),
+]
+
+best_pf = 0
+best_label = ''
+best_trades = []
+
+for label, threshold in thresholds:
+    filtered = [e for e in entries
+                if e.get('daily_conf', 0) >= threshold]
+    trades = simulate_full_v2(filtered)
+    if not trades:
+        print(f'{label:<12} {"无交易":>5}')
+        continue
+    rets = [t['ret'] for t in trades]
+    wins = [r for r in rets if r > 0]
+    losses = [r for r in rets if r < 0]
+    gp = sum(wins)
+    gl = abs(sum(losses)) if losses else 0.01
+    pf = gp / gl
+    wr = len(wins) / len(rets) * 100
+    triggered = sum(1 for t in trades if t.get('reduced'))
+
+    print(f'{label:<12} {len(trades):>5} {wr:>5.1f}% {np.mean(rets):>+7.2f}% {pf:>6.2f} {sum(rets):>+7.0f}% {triggered/len(trades)*100:>6.0f}%')
+
+    if pf > best_pf and len(trades) >= 30:
+        best_pf = pf
+        best_label = label
+        best_trades = trades
+
+# 最优阈值详细分析
+print(f'\n{"="*100}')
+print(f'  最优阈值: {best_label} (PF={best_pf:.2f}, {len(best_trades)}笔)')
+print(f'{"="*100}')
+
+trades = best_trades
 rets = [t['ret'] for t in trades]
 wins = [r for r in rets if r > 0]
 losses = [r for r in rets if r < 0]
@@ -375,23 +449,11 @@ for r, rs in sorted(reasons.items(), key=lambda x: -len(x[1])):
     wr = sum(1 for x in rs if x > 0) / len(rs) * 100
     print(f'  {r:<20} {len(rs):>3}笔  WR:{wr:.0f}%  Avg:{np.mean(rs):+.2f}%')
 
-print(f'\n--- 1卖减仓触发率 ---')
-triggered = sum(1 for t in trades if t.get('reduced'))
-print(f'  触发: {triggered}/{len(trades)} ({triggered/len(trades)*100:.0f}%)')
-
 print(f'\n--- 按日线买点类型 ---')
 by_daily = defaultdict(list)
 for t in trades:
     by_daily[t['daily_type']].append(t['ret'])
 for dt, rs in sorted(by_daily.items(), key=lambda x: -len(x[1])):
-    wr = sum(1 for r in rs if r > 0) / len(rs) * 100
-    print(f'  {dt:<12} {len(rs):>3}笔  WR:{wr:.0f}%  Avg:{np.mean(rs):+.2f}%  PF:{sum(r for r in rs if r>0)/max(abs(sum(r for r in rs if r<0)),0.01):.2f}')
-
-print(f'\n--- 按30min 2买类型 ---')
-by_30m = defaultdict(list)
-for t in trades:
-    by_30m[t['30m_type']].append(t['ret'])
-for dt, rs in sorted(by_30m.items(), key=lambda x: -len(x[1])):
     wr = sum(1 for r in rs if r > 0) / len(rs) * 100
     print(f'  {dt:<12} {len(rs):>3}笔  WR:{wr:.0f}%  Avg:{np.mean(rs):+.2f}%  PF:{sum(r for r in rs if r>0)/max(abs(sum(r for r in rs if r<0)),0.01):.2f}')
 
