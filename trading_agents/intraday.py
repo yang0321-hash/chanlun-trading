@@ -957,7 +957,13 @@ class IntradayAgent:
         send_notification(f'尾盘分析 {datetime.now().strftime("%m-%d")}', report)
 
     def _check_observation_pool(self):
-        """检查观察池股票是否回踩到入场区并出现缠论买点确认"""
+        """检查观察池股票 — 30min 2买确认入场
+
+        逻辑与生产一致:
+          1. 价格回踩到入场区(含略低于入场区)
+          2. 30min检测买点 → 最新是2买 → 确认入场
+          3. 止损 = 30min 1买低点
+        """
         if not hasattr(self, '_obs_entries') or not self._obs_entries:
             return
 
@@ -965,16 +971,21 @@ class IntradayAgent:
             if info.get('confirmed'):
                 continue
 
-            # Get current price from events
+            # 从实时行情获取价格
             price = 0
             for ev in self.events:
                 if ev.get('code') == code or ev.get('code') == code.upper():
                     price = ev.get('price', 0)
                     break
             if price <= 0:
+                try:
+                    price = self.hs.get_realtime_price(code) or 0
+                except Exception:
+                    pass
+            if price <= 0:
                 continue
 
-            # Parse entry zone
+            # 解析入场区间
             entry_zone = info.get('entry_zone', '')
             try:
                 zone_part = entry_zone.split('(')[0].strip()
@@ -982,64 +993,64 @@ class IntradayAgent:
                 lo, hi = float(lo), float(hi)
             except Exception:
                 lo = price * 0.95
-                hi = price * 1.0
+                hi = price * 1.05
 
-            if not (lo <= price <= hi or price < lo):
+            # 价格在入场区或以下
+            if price > hi * 1.02:
                 continue
 
-            # Price in entry zone — run ChanLun confirmation
+            # 30min 2买确认
             try:
-                from core.kline import KLine
-                from core.fractal import FractalDetector
-                from core.stroke import StrokeGenerator
-                from core.pivot import PivotDetector
-                from indicator.macd import MACD
-                from core.buy_sell_points import BuySellPointDetector
+                from strategies.daily_30min_confirm import Daily30minConfirmer
+                confirmer = Daily30minConfirmer(self.hs)
+                result = confirmer.confirm_daily_signal(code, {
+                    'stop_price': info.get('stop_loss', 0),
+                })
 
-                df = self.hs.get_kline(code, period='daily')
-                if df is None or len(df) < 60:
+                if not result or not result.passed:
+                    # 未确认: 记录等待状态
+                    if result and result.details.get('waiting'):
+                        stage = result.details.get('stage', '')
+                        if not info.get('waiting_logged'):
+                            info['waiting_logged'] = True
+                            print(f'  [POOL] {code} ({info.get("name","")}) '
+                                  f'30min等待: {result.reason}')
                     continue
 
-                close_s = pd.Series(df['close'].values)
-                macd_obj = MACD(close_s)
-                kline = KLine.from_dataframe(df, strict_mode=False)
-                fractals = FractalDetector(kline, confirm_required=False).get_fractals()
-                if len(fractals) < 4:
-                    continue
-                strokes = StrokeGenerator(kline, fractals, min_bars=3).get_strokes()
-                if len(strokes) < 3:
-                    continue
-                pivots = PivotDetector(kline, strokes).get_pivots()
-                det = BuySellPointDetector(fractals, strokes, [], pivots, macd=macd_obj)
-                buys, _ = det.detect_all()
-
-                n = len(df)
-                recent_buys = [b for b in buys if b.index >= n - 5]
-                if not recent_buys:
-                    continue
-
-                best = max(recent_buys, key=lambda b: b.confidence)
-                types = list(set(b.point_type for b in recent_buys))
-
-                # Mark confirmed
+                # 确认入场!
                 info['confirmed'] = True
-                msg = (f"★ 观察池回踩确认! {info.get('name',code)} "
-                       f"价格={price:.2f} 入场区=[{lo:.1f}-{hi:.1f}] "
-                       f"买点={','.join(types)} conf={best.confidence:.2f} "
-                       f"止损={info.get('stop_loss',0):.2f}")
+                stop_30 = result.stop_loss
+                stop_final = max(stop_30, info.get('stop_loss', 0)) if stop_30 > 0 else info.get('stop_loss', 0)
+
+                msg = (f"★ 30min 2买确认入场! {info.get('name',code)} "
+                       f"价格={price:.2f} 入场区=[{lo:.1f}-{hi:.1f}]\n"
+                       f"  {result.reason}\n"
+                       f"  止损={stop_final:.2f} "
+                       f"置信度={result.confidence:.2f}")
 
                 print(f'  {msg}')
                 self.events.append({
                     'time': datetime.now().strftime('%H:%M'),
-                    'type': 'pullback_confirm',
+                    'type': 'pool_2buy_confirm',
                     'code': code,
                     'name': info.get('name', ''),
                     'price': price,
-                    'signal': ','.join(types),
-                    'confidence': best.confidence,
+                    'stop_loss': stop_final,
+                    'confidence': result.confidence,
+                    'reason': result.reason,
                 })
 
-                # Save alert
+                # 推送
+                send_notification(
+                    f'★ 观察池2买确认 {info.get("name", code)}',
+                    f'{code} ({info.get("name","")})\n'
+                    f'价格:{price:.2f}\n'
+                    f'止损:{stop_final:.2f}\n'
+                    f'置信度:{result.confidence:.2f}\n'
+                    f'{result.reason}'
+                )
+
+                # 保存alert
                 alert_file = 'signals/observation_alerts.json'
                 all_alerts = []
                 if os.path.exists(alert_file):
@@ -1053,29 +1064,30 @@ class IntradayAgent:
                     'code': code,
                     'name': info.get('name', ''),
                     'price': price,
-                    'stop_loss': info.get('stop_loss', 0),
-                    'signal_type': ','.join(types),
-                    'confidence': best.confidence,
+                    'stop_loss': stop_final,
+                    'signal_type': '30min_2buy',
+                    'confidence': result.confidence,
                     'message': msg,
                 })
                 with open(alert_file, 'w', encoding='utf-8') as f:
                     json.dump(all_alerts, f, ensure_ascii=False, indent=2)
 
-                # Update pool status
+                # 更新pool状态
                 pool_file = 'signals/observation_pool.json'
                 if os.path.exists(pool_file):
                     with open(pool_file, 'r', encoding='utf-8') as f:
                         pool = json.load(f)
                     for s in pool.get('stocks', []):
                         if s.get('code') == code:
-                            s['status'] = 'confirmed'
+                            s['status'] = '2buy_confirmed'
                             s['confirm_price'] = price
                             s['confirm_time'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+                            s['stop_loss'] = stop_final
                     with open(pool_file, 'w', encoding='utf-8') as f:
                         json.dump(pool, f, ensure_ascii=False, indent=2)
 
             except Exception as e:
-                print(f'  观察池检查 {code} 异常: {e}')
+                print(f'  观察池30min确认 {code} 异常: {e}')
 
     def _detect_sell_signals(self):
         """检测30min减仓点 — 持仓股 + 今日出买点的个股"""
