@@ -1,0 +1,185 @@
+{
+  "version": "v2.0框架回测 vs 优化方案对比",
+  "date": "2026-04-23",
+  "key_finding": "v2.0仓位方向与2buy策略本质矛盾",
+  "conclusion": "v2.0的「强市高仓/弱市低仓」设计是基于趋势跟踪，但2buy是均值回归——弱市(超跌)才是2buy最强环境",
+  "score_distribution": {
+    "v2.0_buckets": {
+      "strong": 35,
+      "mod_strong": 182,
+      "weak": 118,
+      "very_weak": 121
+    },
+    "simple_regime": {
+      "up": 175,
+      "side": 164,
+      "down": 117
+    }
+  },
+  "cross_tab": {
+    "note": "v2.0与简化regime一致性仅59.6%",
+    "meaning": "两者分类逻辑差异很大，v2.0更保守"
+  },
+  "per_bucket_performance_unadjusted": {
+    "v2.0_strong": {
+      "n": 1709,
+      "wr": "25.2%",
+      "avg": "+3.269%",
+      "sharpe": 0.24,
+      "note": "最差"
+    },
+    "v2.0_mod_strong": {
+      "n": 6492,
+      "wr": "36.2%",
+      "avg": "+9.299%",
+      "sharpe": 0.56
+    },
+    "v2.0_weak": {
+      "n": 6886,
+      "wr": "38.7%",
+      "avg": "+11.518%",
+      "sharpe": 0.66
+    },
+    "v2.0_very_weak": {
+      "n": 6935,
+      "wr": "46.6%",
+      "avg": "+13.186%",
+      "sharpe": 0.7,
+      "note": "最强"
+    },
+    "simple_down": {
+      "n": 6890,
+      "wr": "44.0%",
+      "avg": "+12.597%",
+      "sharpe": 0.66
+    },
+    "simple_side": {
+      "n": 9203,
+      "wr": "39.4%",
+      "avg": "+11.052%",
+      "sharpe": 0.64
+    },
+    "simple_up": {
+      "n": 5929,
+      "wr": "34.0%",
+      "avg": "+8.132%",
+      "sharpe": 0.52
+    }
+  },
+  "position_matrix_test": {
+    "baseline_no_adj": {
+      "sharpe": 0.62,
+      "note": "基准(仅2buy+SL5%+板块)"
+    },
+    "v2_positive_matrix": {
+      "sharpe": 0.47,
+      "note": "v2.0正向(强市高仓) → 变差"
+    },
+    "reverse_matrix": {
+      "sharpe": 0.6,
+      "note": "反向仓位(弱市高仓) → 略差"
+    },
+    "mild_reverse": {
+      "sharpe": 0.61,
+      "note": "温和反向 → 接近基准"
+    }
+  },
+  "filter_test": {
+    "baseline": {
+      "n": 22022,
+      "sharpe": 0.62
+    },
+    "simplified_excl_up": {
+      "n": 16093,
+      "sharpe": 0.65
+    },
+    "v2_excl_strong": {
+      "n": 20313,
+      "sharpe": 0.64
+    },
+    "v2_only_weak+vweak": {
+      "n": 13821,
+      "sharpe": 0.68
+    },
+    "v2_only_very_weak": {
+      "n": 6935,
+      "sharpe": 0.7
+    },
+    "both_excl": {
+      "n": 15614,
+      "sharpe": 0.65
+    }
+  },
+  "v2_tp_profitable_test": {
+    "timeout_exit": {
+      "n": 7987,
+      "wr": "95.5%",
+      "avg": "+40.2%",
+      "sharpe": 1.33,
+      "note": "被动持有到最终"
+    },
+    "TP_exit": {
+      "n": 4231,
+      "wr": "24.7%",
+      "avg": "-0.9%",
+      "sharpe": -0.74,
+      "note": "v2.0 TP止盈 → 负优化"
+    },
+    "SL_exit": {
+      "n": 9804,
+      "wr": "0.0%",
+      "avg": "-8.2%",
+      "sharpe": -7.99
+    }
+  },
+  "recommendations": [
+    "1. v2.0 6因子评分系统保留，但仓位矩阵方向要反过来：弱市(分数低) → 高仓；强市 → 低仓或不操作",
+    "2. 或者：v2.0评分仅用于『排除强市(9-12分)操作』，不用于仓位分级",
+    "3. 简化版regime(up/side/down)更稳定，与v2.0评分互补使用",
+    "4. TP止盈5档取消，改为纯被动持有(SL=5% + 卖点退出)",
+    "5. 最优方案：v2.0仅very_weak市场做2buy，Sharpe可达0.70（vs基准0.62）"
+  ],
+  "final_ranking": [
+    {
+      "rank": 1,
+      "scheme": "v2.0仅very_weak做2buy",
+      "sharpe": 0.7
+    },
+    {
+      "rank": 2,
+      "scheme": "v2.0弱市+very_weak做2buy",
+      "sharpe": 0.68
+    },
+    {
+      "rank": 3,
+      "scheme": "简化排除up",
+      "sharpe": 0.65
+    },
+    {
+      "rank": 4,
+      "scheme": "v2.0排除strong",
+      "sharpe": 0.64
+    },
+    {
+      "rank": 5,
+      "scheme": "基准(无过滤)",
+      "sharpe": 0.62
+    },
+    {
+      "rank": 6,
+      "scheme": "温和反向仓位",
+      "sharpe": 0.61
+    },
+    {
+      "rank": 7,
+      "scheme": "反向仓位(弱市高仓)",
+      "sharpe": 0.6
+    },
+    {
+      "rank": 8,
+      "scheme": "v2.0正向仓位矩阵",
+      "sharpe": 0.47,
+      "note": "最差"
+    }
+  ]
+}
