@@ -382,18 +382,18 @@ def _weekly_chanlun_score(df_w):
                     score -= 0.05  # early: 未确认, 减分
 
         # 6. 周线下跌笔末端底分型检测
-        # 周线笔向下 + 最近出现底分型 = 潜在反转点，止损好设
+        # 下跌笔中，底分型是笔的终点，顶分型之后才有底分型
+        # 查找最近的底分型（不一定是最后一个分型）
         weekly_bottom_fractal = False
         if len(strokes) >= 1 and strokes[-1].is_down:
-            # 检查最近5根周线是否有底分型
-            if len(fractals) >= 1:
-                last_frac = fractals[-1]
-                last_frac_idx = last_frac.index
-                total_bars = len(kline.processed_data)
-                # 底分型在最近5根K线内(约1个月)
-                if last_frac.type.value == 'bottom' and (total_bars - last_frac_idx) <= 5:
-                    weekly_bottom_fractal = True
-                    score += 0.10  # 底分型加分
+            total_bars = len(kline.processed_data)
+            for frac in reversed(fractals):
+                if frac.type.value == 'bottom':
+                    dist = total_bars - frac.index
+                    if dist <= 8:  # 最近8根周线(约2个月)内有底分型
+                        weekly_bottom_fractal = True
+                        score += 0.10
+                    break  # 只看最近一个底分型
 
         # 将标记附加到函数属性，供调用方读取
         _weekly_chanlun_score.weekly_bottom_fractal = weekly_bottom_fractal
@@ -1613,6 +1613,7 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
             'weekly_trend': weekly_trend_str,
             'weekly_score': round(weekly_score, 2),
             'weekly_rise_pct': item.get('weekly_rise_pct', 0),
+            'weekly_bottom_fractal': item.get('weekly_bottom_fractal', False),
             'three_buy_checks': item.get('three_buy_checks', {}),
             'three_buy_passed': item.get('three_buy_passed', 0),
             'trend_type': trend_type_val,
