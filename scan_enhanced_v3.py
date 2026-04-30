@@ -293,14 +293,17 @@ def _detect_weekly_trend(code, hs):
         # 综合评分: 缠论60% + 传统40%
         score = chanlun_score * 0.6 + tech_score * 0.4 / 0.45  # 归一化tech到0-1
 
+        # 读取周线底分型标记
+        weekly_bottom_fractal = getattr(_weekly_chanlun_score, 'weekly_bottom_fractal', False)
+
         if score >= 0.5:
-            return 'bull', score, weekly_rise_pct
+            return 'bull', score, weekly_rise_pct, weekly_bottom_fractal
         elif score <= 0.15:
-            return 'bear', score, weekly_rise_pct
+            return 'bear', score, weekly_rise_pct, weekly_bottom_fractal
         else:
-            return 'range', score, weekly_rise_pct
+            return 'range', score, weekly_rise_pct, weekly_bottom_fractal
     except Exception:
-        return 'range', 0.3, 0.0
+        return 'range', 0.3, 0.0, False
 
 
 def _weekly_chanlun_score(df_w):
@@ -377,6 +380,23 @@ def _weekly_chanlun_score(df_w):
                     score += 0.05  # mid
                 else:
                     score -= 0.05  # early: 未确认, 减分
+
+        # 6. 周线下跌笔末端底分型检测
+        # 周线笔向下 + 最近出现底分型 = 潜在反转点，止损好设
+        weekly_bottom_fractal = False
+        if len(strokes) >= 1 and strokes[-1].is_down:
+            # 检查最近5根周线是否有底分型
+            if len(fractals) >= 1:
+                last_frac = fractals[-1]
+                last_frac_idx = last_frac.index
+                total_bars = len(kline.processed_data)
+                # 底分型在最近5根K线内(约1个月)
+                if last_frac.type.value == 'bottom' and (total_bars - last_frac_idx) <= 5:
+                    weekly_bottom_fractal = True
+                    score += 0.10  # 底分型加分
+
+        # 将标记附加到函数属性，供调用方读取
+        _weekly_chanlun_score.weekly_bottom_fractal = weekly_bottom_fractal
 
         return max(0, min(1, score))
     except Exception:
@@ -1342,10 +1362,11 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
         if code in scanned:
             continue
         scanned.add(code)
-        weekly_trend, weekly_score, weekly_rise_pct = _detect_weekly_trend(code, hs)
+        weekly_trend, weekly_score, weekly_rise_pct, wbf = _detect_weekly_trend(code, hs)
         item['weekly_rise_pct'] = round(weekly_rise_pct, 1)
-        if weekly_rise_pct < 20.0:
-            continue
+        item['weekly_bottom_fractal'] = wbf
+        if weekly_rise_pct < 20.0 and not wbf:
+            continue  # 周线涨幅不够，除非有底分型
         if weekly_trend == 'bear':
             item['weekly_veto'] = True
         else:
@@ -1544,6 +1565,11 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
             strength_bonus += 5  # 周线多头加分
         else:
             weekly_trend_str = '盘整'
+
+        # 周线底分型加分: 止损好设，结构清晰
+        if item.get('weekly_bottom_fractal'):
+            strength_bonus += 8
+            weekly_trend_str += '+底分型'
 
         # === 走势类型加分 (基于全市场4382信号验证 2026-04-25) ===
         # 上涨趋势: 54.2%胜率, +4.27% → 加分
