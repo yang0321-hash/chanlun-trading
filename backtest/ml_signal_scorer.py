@@ -250,11 +250,28 @@ def build_dataset(signals_data: List[dict], daily_map: dict,
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
-def train_model(df: pd.DataFrame):
-    """训练XGBoost三分类模型 (自适应阈值)"""
+def train_model(df: pd.DataFrame, signal_type: str = ''):
+    """训练XGBoost三分类模型 (自适应阈值, 可选按买点类型)
+
+    signal_type: 空字符串=统一模型, '1buy'/'2buy'/'3buy'/...=按类型
+    """
     import xgboost as xgb
 
     os.makedirs(MODEL_DIR, exist_ok=True)
+
+    # 按类型筛选
+    if signal_type:
+        type_col = f'type_{signal_type}'
+        if type_col not in df.columns:
+            print(f'  跳过 {signal_type}: 无{type_col}列')
+            return None, None
+        df = df[df[type_col] == 1].copy()
+        if len(df) < 500:
+            print(f'  跳过 {signal_type}: 样本不足({len(df)})')
+            return None, None
+
+    suffix = f'_{signal_type}' if signal_type else ''
+    label = signal_type or '统一'
 
     df = df.sort_values('date').reset_index(drop=True)
     meta_cols = ['code', 'date', 'ret_5d', 'max_dd_5d', 'label_profit', 'label_triple']
@@ -286,9 +303,11 @@ def train_model(df: pd.DataFrame):
     y_test = np.where(y_ret[val_end:] < q33_train, 0, np.where(y_ret[val_end:] > q67_train, 2, 1))
 
     # 保存feature columns和阈值
-    with open(FEATURE_COLS_FILE, 'w') as f:
+    fc_path = os.path.join(MODEL_DIR, f'feature_columns{suffix}.json')
+    th_path = os.path.join(MODEL_DIR, f'thresholds{suffix}.json')
+    with open(fc_path, 'w') as f:
         json.dump(feature_cols, f)
-    with open(os.path.join(MODEL_DIR, 'thresholds.json'), 'w') as f:
+    with open(th_path, 'w') as f:
         json.dump({'q33': round(q33_train, 2), 'q67': round(q67_train, 2)}, f)
 
     # 三分类模型
@@ -308,7 +327,7 @@ def train_model(df: pd.DataFrame):
     p_weak = proba[:, 0]
 
     print(f"\n{'='*60}")
-    print(f"ML信号打分器 — 训练完成")
+    print(f"ML信号打分器 [{label}] — 训练完成")
     print(f"{'='*60}")
     print(f"特征: {len(feature_cols)} 维 | 样本: {len(df)}")
     print(f"阈值: 弱信号<{q33_train:.2f}% / 强信号>{q67_train:.2f}%")
@@ -355,22 +374,31 @@ def train_model(df: pd.DataFrame):
         print(f"  {i+1:2d}. {name:<30s} {imp:.4f}")
 
     # 保存模型
-    clf.save_model(os.path.join(MODEL_DIR, 'clf_triple.json'))
+    clf.save_model(os.path.join(MODEL_DIR, f'clf_triple{suffix}.json'))
 
-    imp_path = os.path.join(MODEL_DIR, 'feature_importance.json')
+    imp_path = os.path.join(MODEL_DIR, f'feature_importance{suffix}.json')
     with open(imp_path, 'w', encoding='utf-8') as f:
         json.dump([{'feature': fn, 'importance': float(imp)} for fn, imp in feat_imp], f, indent=2)
 
-    print(f"\n模型已保存至 {MODEL_DIR}/")
+    print(f"\n模型已保存至 {MODEL_DIR}/clf_triple{suffix}.json")
     return clf, feature_cols
 
 
-def load_model():
-    """加载已训练的模型"""
+def load_model(signal_type: str = ''):
+    """加载已训练的模型 (优先按类型，fallback到统一模型)"""
     import xgboost as xgb
+    suffix = f'_{signal_type}' if signal_type else ''
+    model_path = os.path.join(MODEL_DIR, f'clf_triple{suffix}.json')
+    fc_path = os.path.join(MODEL_DIR, f'feature_columns{suffix}.json')
+
+    # fallback: 没有分类型模型就用统一模型
+    if not os.path.exists(model_path):
+        model_path = os.path.join(MODEL_DIR, 'clf_triple.json')
+        fc_path = FEATURE_COLS_FILE
+
     clf = xgb.XGBClassifier()
-    clf.load_model(os.path.join(MODEL_DIR, 'clf_triple.json'))
-    with open(FEATURE_COLS_FILE, 'r') as f:
+    clf.load_model(model_path)
+    with open(fc_path, 'r') as f:
         feature_cols = json.load(f)
     return clf, feature_cols
 
@@ -378,13 +406,17 @@ def load_model():
 def predict_signal(signal: dict, daily_df: pd.DataFrame,
                    weekly_dir: str = 'neutral',
                    market_env: Optional[MarketEnvironment] = None) -> dict:
-    """预测单个信号的质量"""
+    """预测单个信号的质量 (自动选择分类型模型)"""
     import xgboost as xgb
 
-    if not os.path.exists(os.path.join(MODEL_DIR, 'clf_triple.json')):
+    # 优先尝试分类型模型
+    sig_type = signal.get('signal_type', '')
+    has_typed = os.path.exists(os.path.join(MODEL_DIR, f'clf_triple_{sig_type}.json'))
+    has_unified = os.path.exists(os.path.join(MODEL_DIR, 'clf_triple.json'))
+    if not has_typed and not has_unified:
         return {'p_bigwin': 0.33, 'p_bigloss': 0.33, 'p_flat': 0.33, 'advice': '模型未训练'}
 
-    clf, feature_cols = load_model()
+    clf, feature_cols = load_model(sig_type if has_typed else '')
     features = extract_features(signal, daily_df, weekly_dir, market_env)
 
     X = pd.DataFrame([{k: features.get(k, 0) for k in feature_cols}])
@@ -395,7 +427,7 @@ def predict_signal(signal: dict, daily_df: pd.DataFrame,
         'p_bigloss': round(float(proba[0]), 3),
         'p_flat': round(float(proba[1]), 3),
         'p_bigwin': round(float(proba[2]), 3),
-        'advice': '大赢概率高' if proba[2] > 0.4 else ('大亏风险' if proba[0] > 0.4 else '中性'),
+        'advice': '强信号' if proba[2] > 0.45 else ('弱信号' if proba[0] > 0.40 else '中性'),
     }
 
 
