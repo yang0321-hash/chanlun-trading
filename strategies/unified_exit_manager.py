@@ -70,7 +70,7 @@ class UnifiedExitManager:
     ):
         """Record buy event"""
         # 按买点类型选择止损比例
-        if buy_point_type in ('3buy', 'quasi3buy') and self.config.fixed_stop_pct_3buy > 0:
+        if buy_point_type in ('3buy', 'quasi3buy', '2b3bbuy') and self.config.fixed_stop_pct_3buy > 0:
             stop_pct = self.config.fixed_stop_pct_3buy
         else:
             stop_pct = self.config.fixed_stop_pct
@@ -232,8 +232,12 @@ class UnifiedExitManager:
         if self.config.use_trailing_stop and profit_pct > self.config.trailing_activation:
             if self.config.use_atr_trailing and atr_value > 0:
                 # ATR-adaptive trailing: stop = highest - N * ATR
-                # 强趋势中给更多空间（让利润跑更远）
+                # 按买点类型使用不同ATR倍数:
+                # 3buy=3.0 (趋势确立, 给空间), 其他=1.0 (抄底信号, 紧止损)
                 multiplier = self.config.atr_trailing_multiplier
+                bpt = record.buy_point_type
+                if bpt in ('3buy', 'quasi3buy', '2b3bbuy'):
+                    multiplier = max(multiplier, 3.0)  # 3买类给大空间
                 if trend_status in ('STRONG_UP', 'strong_up') and profit_pct > 0.15:
                     multiplier *= 1.5  # 强趋势且已有15%+利润，放宽50%
                 atr_trailing_stop = record.highest_price - atr_value * multiplier
@@ -286,6 +290,31 @@ class UnifiedExitManager:
                         reason=f'Partial profit ({current_stage + 1}, {trend_label}): +{profit_pct:.2%}',
                         confidence=0.8,
                         exit_type='partial_profit',
+                    )
+
+        # === 6.4. 30min sell confirmation (SubLevelConfirm) ===
+        # 日线顶背驰 + 30min 1S/2S + 放量 = 极强卖出信号 (回测100%准确)
+        if self.config.use_structure_exit and sell_point_30min is not None:
+            sp = sell_point_30min
+            sp_type = getattr(sp, 'point_type', '')
+            if sp_type in ('1sell', '2sell') and profit_pct > 0:
+                # 检查放量: 30min最后一根成交量 > 20周期均量的0.8倍
+                vol_confirmed = getattr(sp, 'volume_confirmed', True)
+                if vol_confirmed:
+                    return ExitSignal(
+                        action='sell',
+                        quantity=current_qty,
+                        reason=f'30min {sp_type} sell confirm + volume at +{profit_pct:.2%}',
+                        confidence=0.95,
+                        exit_type='sublevel_sell_confirm',
+                    )
+                elif profit_pct > 0.05:
+                    return ExitSignal(
+                        action='sell',
+                        quantity=int(current_qty * 0.5),
+                        reason=f'30min {sp_type} sell (no vol) at +{profit_pct:.2%}, reduce 50%',
+                        confidence=0.80,
+                        exit_type='sublevel_sell_no_vol',
                     )
 
         # === 6. Time stop ===

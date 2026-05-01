@@ -22,6 +22,7 @@ from core.stroke import StrokeGenerator
 from core.pivot import PivotDetector
 from core.buy_sell_points import BuySellPointDetector
 from indicator.macd import MACD
+from backtest.ml_signal_scorer import predict_signal as _predict_signal
 
 hs = HybridSource()
 SAMPLE = '.claude/temp/sample_300.txt'
@@ -65,6 +66,7 @@ print()
 t0 = time.time()
 entries = []
 cache = {}
+daily_cache = {}  # ML打分用
 
 for ri, raw in enumerate(raw_codes):
     hc = to_hs(raw)
@@ -83,6 +85,9 @@ for ri, raw in enumerate(raw_codes):
         cs = pd.Series(df_d['close'].values)
         mc = MACD(cs)
         kl = KLine.from_dataframe(df_d, strict_mode=False)
+        closes_d = [k.close for k in kl.processed_data]
+        highs_d = [k.high for k in kl.processed_data]
+        lows_d = [k.low for k in kl.processed_data]
         fr = FractalDetector(kl, confirm_required=False).get_fractals()
         if len(fr) < 4:
             continue
@@ -92,7 +97,8 @@ for ri, raw in enumerate(raw_codes):
         pv = PivotDetector(kl, st).get_pivots()
         if not pv:
             continue
-        det = BuySellPointDetector(fr, st, [], pv, macd=mc)
+        det = BuySellPointDetector(fr, st, [], pv, macd=mc,
+                                    closes=closes_d, highs=highs_d, lows=lows_d)
         buys_d, _ = det.detect_all()
         seen_d = {}
         for b in buys_d:
@@ -112,7 +118,11 @@ for ri, raw in enumerate(raw_codes):
         if len(s30) < 3:
             continue
         p30 = PivotDetector(k30, s30).get_pivots()
-        d30 = BuySellPointDetector(f30, s30, [], p30, macd=m30)
+        closes_30 = [k.close for k in k30.processed_data]
+        highs_30 = [k.high for k in k30.processed_data]
+        lows_30 = [k.low for k in k30.processed_data]
+        d30 = BuySellPointDetector(f30, s30, [], p30, macd=m30,
+                                    closes=closes_30, highs=highs_30, lows=lows_30)
         buys_30, sells_30 = d30.detect_all()
 
         seen_b = {}
@@ -127,6 +137,7 @@ for ri, raw in enumerate(raw_codes):
         bp30 = sorted(seen_b.values(), key=lambda x: x.index)
         sp30 = sorted(seen_s.values(), key=lambda x: x.index)
         cache[hc] = (df_30, bp30, sp30)
+        daily_cache[hc] = df_d
         min_30date = df_30.index[0]
 
         for b in seen_d.values():
@@ -160,6 +171,40 @@ for ri, raw in enumerate(raw_codes):
             if ep <= 0 or fs >= ep:
                 continue
 
+            # ML信号打分 (使用信号点之前的窗口，避免未来数据)
+            ml_strong, ml_weak = 0.33, 0.33
+            try:
+                sig_window = df_d.iloc[max(0, b.index - 100):b.index + 1]
+                if len(sig_window) >= 30:
+                    sig_dict = {
+                        'signal_type': b.point_type,
+                        'confidence': b.confidence,
+                        'pivot_info': {'zg': b.related_pivot.zg if b.related_pivot else 0,
+                                       'zd': b.related_pivot.zd if b.related_pivot else 0},
+                        'stop_price': fs,
+                    }
+                    ml_pred = _predict_signal(sig_dict, sig_window)
+                    ml_strong = ml_pred.get('p_bigwin', 0.33)
+                    ml_weak = ml_pred.get('p_bigloss', 0.33)
+            except Exception as ex:
+                if len(entries) < 3:
+                    print(f'  ML打分异常({hc} {b.point_type}): {ex}')
+                sig_window = df_d.iloc[max(0, b.index - 100):b.index + 1]
+                if len(sig_window) >= 30:
+                    sig_dict = {
+                        'signal_type': b.point_type,
+                        'confidence': b.confidence,
+                        'pivot_info': {'zg': b.related_pivot.zg if b.related_pivot else 0,
+                                       'zd': b.related_pivot.zd if b.related_pivot else 0},
+                        'stop_price': fs,
+                    }
+                    ml_pred = predict_signal(sig_dict, sig_window)
+                    ml_strong = ml_pred.get('p_bigwin', 0.33)
+                    ml_weak = ml_pred.get('p_bigloss', 0.33)
+            except Exception as ex:
+                if len(entries) < 3:
+                    print(f'  ML打分异常({hc} {b.point_type}): {ex}')
+
             entries.append({
                 'code': hc,
                 'name': name[:6],
@@ -171,6 +216,8 @@ for ri, raw in enumerate(raw_codes):
                 'stop': fs,
                 'eidx': eidx,
                 'sig_date': sig_date,
+                'ml_strong': ml_strong,
+                'ml_weak': ml_weak,
             })
     except Exception:
         pass
@@ -178,6 +225,11 @@ for ri, raw in enumerate(raw_codes):
         print(f'  [{ri+1}/300] entries={len(entries)} ({time.time()-t0:.0f}s)')
 
 print(f'入场信号: {len(entries)}个 ({time.time()-t0:.0f}s)')
+
+# ML打分统计
+ml_s = [e for e in entries if e.get('ml_strong', 0) >= 0.45 and e.get('ml_weak', 0) < 0.30]
+ml_w = [e for e in entries if e.get('ml_weak', 0) >= 0.40]
+print(f'ML信号: 强={len(ml_s)} 弱={len(ml_w)} 中性={len(entries)-len(ml_s)-len(ml_w)}')
 
 
 # === Phase 2: 完整策略模拟 ===
@@ -435,6 +487,38 @@ for label, threshold in thresholds:
         best_pf = pf
         best_label = label
         best_trades = trades
+
+# === ML过滤对比 ===
+print(f'\n--- ML信号过滤对比 ---')
+print(f'{"过滤条件":<24} {"笔数":>5} {"胜率":>6} {"均收益":>8} {"PF":>6} {"总PnL":>8}')
+print('-' * 70)
+
+ml_filters = [
+    ('全量(基线)', lambda e: True),
+    ('ML强信号≥0.35', lambda e: e.get('ml_strong', 0) >= 0.35),
+    ('ML强信号≥0.40', lambda e: e.get('ml_strong', 0) >= 0.40),
+    ('ML强信号≥0.45', lambda e: e.get('ml_strong', 0) >= 0.45),
+    ('ML弱信号<0.35', lambda e: e.get('ml_weak', 0) < 0.35),
+    ('ML弱信号<0.30', lambda e: e.get('ml_weak', 0) < 0.30),
+    ('ML强≥0.40+弱<0.35', lambda e: e.get('ml_strong', 0) >= 0.40 and e.get('ml_weak', 0) < 0.35),
+    ('ML强≥0.45+弱<0.30', lambda e: e.get('ml_strong', 0) >= 0.45 and e.get('ml_weak', 0) < 0.30),
+    ('conf≥0.50+ML强≥0.40', lambda e: e.get('daily_conf', 0) >= 0.50 and e.get('ml_strong', 0) >= 0.40),
+]
+
+for label, fn in ml_filters:
+    filtered = [e for e in entries if fn(e)]
+    trades_ml = simulate_full_v2(filtered)
+    if not trades_ml:
+        print(f'{label:<24} {"无交易":>5}')
+        continue
+    rets = [t['ret'] for t in trades_ml]
+    wins = [r for r in rets if r > 0]
+    losses = [r for r in rets if r < 0]
+    gp = sum(wins)
+    gl = abs(sum(losses)) if losses else 0.01
+    pf = gp / gl
+    wr = len(wins) / len(rets) * 100
+    print(f'{label:<24} {len(trades_ml):>5} {wr:>5.1f}% {np.mean(rets):>+7.2f}% {pf:>6.2f} {sum(rets):>+7.0f}%')
 
 # 最优阈值详细分析
 print(f'\n{"="*100}')

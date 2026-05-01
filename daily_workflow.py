@@ -19,6 +19,15 @@ for k in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy',
 import json
 import numpy as np
 
+# 大盘环境自动判断
+from market_regime import get_market_regime
+
+# ML信号打分
+try:
+    from backtest.ml_signal_scorer import predict_signal as _ml_predict
+except ImportError:
+    _ml_predict = None
+
 # 加载 .env 环境变量
 try:
     from dotenv import load_dotenv
@@ -221,6 +230,30 @@ def run_scan_fallback(hs: HybridSource, codes: List[str],
             elif 'quasi' in best.point_type:
                 score += 5
 
+            # ML信号打分
+            ml_label = 'neutral'
+            if _ml_predict is not None:
+                try:
+                    sig_window = df.iloc[max(0, best.index - 100):best.index + 1]
+                    if len(sig_window) >= 30:
+                        sig_dict = {
+                            'signal_type': best.point_type,
+                            'confidence': best.confidence,
+                            'pivot_info': {},
+                            'stop_price': stop,
+                        }
+                        ml_pred = _ml_predict(sig_dict, sig_window)
+                        p_strong = ml_pred.get('p_bigwin', 0.33)
+                        p_weak = ml_pred.get('p_bigloss', 0.33)
+                        if p_strong >= 0.45 and p_weak < 0.30:
+                            ml_label = 'strong'
+                            score = int(score * 1.15)
+                        elif p_weak >= 0.40:
+                            ml_label = 'weak'
+                            score = int(score * 0.7)
+                except Exception:
+                    pass
+
             candidates.append({
                 'code': code,
                 'name': sector_map.get(code, ''),
@@ -235,6 +268,7 @@ def run_scan_fallback(hs: HybridSource, codes: List[str],
                 'buy_reason': best.reason if hasattr(best, 'reason') else '',
                 '2buy_date': df.index[best.index].strftime('%Y-%m-%d')
                     if best.index < len(df) else '',
+                'ml_label': ml_label,
             })
 
         except Exception:
@@ -536,9 +570,45 @@ def format_report_text(committee_results: List[dict],
 
 
 def build_feishu_card(committee_results: List[dict],
-                      positions_data: dict) -> List[dict]:
+                      positions_data: dict,
+                      market_regime: dict = None) -> List[dict]:
     """构建飞书卡片元素"""
     elements = []
+
+    # ── 大盘状态（置顶显示）─────────────────────────────────
+    if market_regime:
+        regime_labels = {
+            'bull': '🟢 牛市/上涨笔',
+            'sideways': '🟡 震荡市',
+            'bear': '🔴 熊市/下跌笔',
+        }
+        param_labels = {
+            'A': 'v3b原始（无过滤）',
+            'B': 'v3b+1B轻仓',
+            'C': 'v3b+5日动量≥3%',
+        }
+        regime_text = regime_labels.get(market_regime.get('regime', ''), '未知')
+        action_text = market_regime.get('action', '')
+        max_pos = market_regime.get('max_pos', 0)
+        param_text = param_labels.get(market_regime.get('param_set', 'A'), 'A')
+        close_p = market_regime.get('close', 0)
+        chg_p = market_regime.get('chg_pct', 0)
+        ma5 = market_regime.get('ma5', 0)
+        ma10 = market_regime.get('ma10', 0)
+        mom5d = market_regime.get('mom5d', 0)
+
+        elements.append({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": f"**大盘状态** {regime_text}\n"
+                           f"沪指 {close_p:.2f} {chg_p:+.2f}% | "
+                           f"MA5={ma5:.0f} MA10={ma10:.0f} | "
+                           f"5日动量={mom5d:+.2f}%\n"
+                           f"操作: {action_text} | 最大仓位: {max_pos}%\n"
+                           f"推荐参数: {param_text}"
+            }
+        })
 
     buy = [r for r in committee_results if r.get('decision') == 'buy']
     hold = [r for r in committee_results if r.get('decision') == 'hold']
@@ -613,7 +683,11 @@ def build_feishu_card(committee_results: List[dict],
 def send_report(report_text: str, committee_results: List[dict] = None,
                 positions_data: dict = None):
     """发送通知到缠论专用飞书机器人"""
-    title = f'缠论日报 {datetime.now().strftime("%m-%d")}'
+    # 大盘状态
+    regime_labels = {'bull': '🟢', 'sideways': '🟡', 'bear': '🔴'}
+    mr = get_market_regime()
+    mr_label = regime_labels.get(mr.get('regime', ''), '')
+    title = f'{mr_label} 缠论日报 {datetime.now().strftime("%m-%d")}'
     sent = False
 
     # 优先使用缠论专用飞书机器人
@@ -625,7 +699,7 @@ def send_report(report_text: str, committee_results: List[dict] = None,
 
             if committee_results:
                 elements = build_feishu_card(
-                    committee_results, positions_data or {'positions': []})
+                    committee_results, positions_data or {'positions': []}, market_regime=mr)
                 notifier.send_card(title, elements)
             else:
                 notifier.send_text(report_text)

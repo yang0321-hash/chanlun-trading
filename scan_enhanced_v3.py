@@ -13,6 +13,7 @@ for k in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']:
     os.environ.pop(k, None)
 
 import json, time
+from collections import defaultdict
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
@@ -26,6 +27,8 @@ from backtest_cc15_mtf import (
 )
 
 from core.trend_type import classify_trend_type, TrendType
+from indicator.vol_price_divergence import detect_volume_price_divergence, DivergenceType
+from indicator.market_environment import MarketEnvironment
 
 
 # 成长性行业优先列表（基于回测验证的高胜率行业）
@@ -295,6 +298,17 @@ def _detect_weekly_trend(code, hs):
 
         # 读取周线底分型标记
         weekly_bottom_fractal = getattr(_weekly_chanlun_score, 'weekly_bottom_fractal', False)
+        weekly_target_gg = getattr(_weekly_chanlun_score, 'weekly_target_gg', None)
+        weekly_bf_low = getattr(_weekly_chanlun_score, 'weekly_bf_low', None)
+
+        # 计算盈亏比
+        weekly_risk_reward = None
+        if weekly_bf_low and weekly_target_gg and last > 0:
+            risk = last - weekly_bf_low
+            reward = weekly_target_gg - last
+            if risk > 0:
+                weekly_risk_reward = round(reward / risk, 1)
+        _detect_weekly_trend.weekly_risk_reward = weekly_risk_reward
 
         if score >= 0.5:
             return 'bull', score, weekly_rise_pct, weekly_bottom_fractal
@@ -348,8 +362,14 @@ def _weekly_chanlun_score(df_w):
 
         # 3. 周线买卖点
         try:
-            macd = MACD(pd.Series([k.close for k in kline]))
-            det = BuySellPointDetector(fractals, strokes, [], pivots, macd=macd)
+            closes_w = [k.close for k in kline]
+            highs_w = [k.high for k in kline]
+            lows_w = [k.low for k in kline]
+            macd = MACD(pd.Series(closes_w))
+            det = BuySellPointDetector(
+                fractals, strokes, [], pivots, macd=macd,
+                closes=closes_w, highs=highs_w, lows=lows_w,
+            )
             buys, sells = det.detect_all()
             for bp in reversed(buys):
                 if bp.index >= len(df_w) - 60:
@@ -398,54 +418,38 @@ def _weekly_chanlun_score(df_w):
         # 将标记附加到函数属性，供调用方读取
         _weekly_chanlun_score.weekly_bottom_fractal = weekly_bottom_fractal
 
+        # 周线中枢GG作为目标价, 底分型低点作为止损参考
+        weekly_target_gg = None
+        weekly_bf_low = None
+        if pivots:
+            weekly_target_gg = pivots[-1].gg
+        if weekly_bottom_fractal:
+            for frac in reversed(fractals):
+                if frac.type.value == 'bottom':
+                    total_bars2 = len(kline.processed_data)
+                    if total_bars2 - frac.index <= 8:
+                        weekly_bf_low = frac.low
+                    break
+        _weekly_chanlun_score.weekly_target_gg = weekly_target_gg
+        _weekly_chanlun_score.weekly_bf_low = weekly_bf_low
+
         return max(0, min(1, score))
     except Exception:
         return 0.3
 
 
-def _detect_market_regime(index_code='000001'):
-    """检测当前市场环境: strong/normal/weak
+def _detect_market_regime():
+    """检测当前市场环境: BULL/NEUTRAL/BEAR
 
-    强势行情不做1买抄底
+    基于上证指数MA250+斜率+20日动量三级判定。
+    返回 MarketEnvironment 实例。
     """
-    try:
-        hs_tmp = HybridSource()
-        df = hs_tmp.get_kline(index_code, period='daily')
-        if len(df) < 60:
-            return 'normal'
-
-        close = df['close']
-        # MA趋势
-        ma5 = close.rolling(5).mean().iloc[-1]
-        ma20 = close.rolling(20).mean().iloc[-1]
-        ma60 = close.rolling(60).mean().iloc[-1]
-
-        # 近20日涨幅
-        ret_20 = (close.iloc[-1] / close.iloc[-20] - 1)
-
-        # 近5日涨幅
-        ret_5 = (close.iloc[-1] / close.iloc[-5] - 1)
-
-        bull_count = 0
-        if ma5 > ma20 > ma60:
-            bull_count += 2
-        if ma5 > ma20:
-            bull_count += 1
-        if ret_20 > 0.05:
-            bull_count += 2
-        elif ret_20 > 0.02:
-            bull_count += 1
-        if ret_5 > 0.03:
-            bull_count += 1
-
-        if bull_count >= 5:
-            return 'strong'
-        elif bull_count >= 2:
-            return 'normal'
-        else:
-            return 'weak'
-    except Exception:
-        return 'normal'
+    env = MarketEnvironment()
+    ms = env.get_market_state()
+    # 兼容旧接口: 映射到 strong/normal/weak
+    _map = {'BULL': 'strong', 'NEUTRAL': 'normal', 'BEAR': 'weak'}
+    env._compat_regime = _map.get(ms.state, 'normal')
+    return env
 
 
 def _classify_2buy_strength(df, pair, engine):
@@ -1307,14 +1311,49 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
     t_scan_start = time.time()
 
     # === 规则5: 检测市场环境 ===
-    market_regime = _detect_market_regime()
-    print(f'   市场环境: {market_regime} (强势行情不做1买)')
+    market_env = _detect_market_regime()
+    market_regime = market_env._compat_regime
+    print(f'   {market_env.get_summary()}')
 
     cutoff_ts = datetime.now() - timedelta(days=lookback_days)
 
-    # 准备轻量数据用于多进程传输 (避免pickle整个DataFrame)
-    stock_data = {}
+    # === 增量缓存: 用数据指纹跳过未变动的股票 ===
+    import pickle as _pickle, hashlib as _hashlib
+    _sig_cache_dir = os.path.join('.claude', 'cache')
+    os.makedirs(_sig_cache_dir, exist_ok=True)
+    _sig_cache_file = os.path.join(_sig_cache_dir, 'signal_cache.pkl')
+    _sig_cache = {}
+    if os.path.exists(_sig_cache_file):
+        try:
+            with open(_sig_cache_file, 'rb') as _f:
+                _sig_cache = _pickle.load(_f)
+        except Exception:
+            pass
+    _cache_date = _sig_cache.get('_date', '')
+    _today_str = datetime.now().strftime('%Y-%m-%d')
+
+    def _data_fp(df):
+        return _hashlib.md5(df['close'].iloc[-5:].values.tobytes()).hexdigest()[:12]
+
+    codes_to_analyze = []
+    cached_signals = []
     for code, df in prefiltered_map.items():
+        fp = _data_fp(df)
+        cached = _sig_cache.get(code)
+        if _cache_date == _today_str and cached and cached.get('fp') == fp:
+            cached_signals.extend(cached['signals'])
+        else:
+            codes_to_analyze.append(code)
+
+    _cache_hits = len(prefiltered_map) - len(codes_to_analyze)
+    if _cache_hits > 0:
+        print(f'   信号缓存: {_cache_hits}/{len(prefiltered_map)} 命中, '
+              f'{len(codes_to_analyze)} 只需分析')
+
+    # 准备轻量数据用于多进程传输 (仅未缓存的部分)
+    stock_data = {}
+    for code in codes_to_analyze:
+        df = prefiltered_map[code]
         stock_data[code] = {
             'open': df['open'].values,
             'high': df['high'].values,
@@ -1325,15 +1364,37 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
         }
 
     # 分批提交到进程池
-    from multiprocessing import Pool
-    n_workers = min(os.cpu_count() or 4, 8)
-    task_args = [(code, stock_data[code], market_regime, cutoff_ts)
-                 for code in stock_data]
+    new_signals = []
+    if codes_to_analyze:
+        from multiprocessing import Pool
+        n_workers = min(os.cpu_count() or 4, 8)
+        task_args = [(code, stock_data[code], market_regime, cutoff_ts)
+                     for code in codes_to_analyze]
 
-    all_signals = []
-    with Pool(processes=n_workers) as pool:
-        for result in pool.imap_unordered(_mp_worker, task_args, chunksize=50):
-            all_signals.extend(result)
+        with Pool(processes=n_workers) as pool:
+            for result in pool.imap_unordered(_mp_worker, task_args, chunksize=50):
+                new_signals.extend(result)
+
+        # 更新缓存 (从new_signals中提取code)
+        sig_by_code = defaultdict(list)
+        for sig in new_signals:
+            sig_by_code[sig.get('code', '')].append(sig)
+        for code, sigs in sig_by_code.items():
+            if code in prefiltered_map:
+                _sig_cache[code] = {
+                    'fp': _data_fp(prefiltered_map[code]),
+                    'signals': sigs,
+                }
+
+        # 更新缓存
+        _sig_cache['_date'] = _today_str
+        try:
+            with open(_sig_cache_file, 'wb') as _f:
+                _pickle.dump(_sig_cache, _f, protocol=_pickle.HIGHEST_PROTOCOL)
+        except Exception:
+            pass
+
+    all_signals = cached_signals + new_signals
 
     # 按类型统计
     type_counts = {}
@@ -1342,7 +1403,7 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
         type_counts[t] = type_counts.get(t, 0) + 1
     t_scan = time.time() - t_scan_start
     print(f'   最近{lookback_days}天信号: {dict(type_counts)} 共{len(all_signals)}个 '
-          f'({t_scan:.1f}s, {len(prefiltered_map)}只)')
+          f'({t_scan:.1f}s, 缓存{_cache_hits}+分析{len(codes_to_analyze)})')
 
     if not all_signals:
         print('无近期买点信号')
@@ -1365,6 +1426,9 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
         weekly_trend, weekly_score, weekly_rise_pct, wbf = _detect_weekly_trend(code, hs)
         item['weekly_rise_pct'] = round(weekly_rise_pct, 1)
         item['weekly_bottom_fractal'] = wbf
+        item['weekly_risk_reward'] = getattr(_detect_weekly_trend, 'weekly_risk_reward', None)
+        item['weekly_bf_low'] = getattr(_weekly_chanlun_score, 'weekly_bf_low', None)
+        item['weekly_target_gg'] = getattr(_weekly_chanlun_score, 'weekly_target_gg', None)
         if weekly_rise_pct < 20.0 and not wbf:
             continue  # 周线涨幅不够，除非有底分型
         if weekly_trend == 'bear':
@@ -1508,6 +1572,16 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
 
         # === 买点强度加分 ===
         strength_bonus = 0
+
+        # 量价背离加分
+        vpd = detect_volume_price_divergence(
+            df['close'].tolist(), df['volume'].tolist()
+        )
+        if vpd:
+            if vpd.divergence_type == DivergenceType.BULLISH_ACCUMULATION:
+                strength_bonus += 3  # 价跌量增 → 资金进场
+            elif vpd.divergence_type == DivergenceType.BEARISH_DISTRIBUTION:
+                strength_bonus -= 5  # 价涨量缩 → 资金出逃
         buy_strength = item.get('buy_strength', '')
         golden_pass = item.get('golden_ratio_pass', False)
 
@@ -1588,6 +1662,39 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
 
         total_score = tech_score + sector_score + strength_bonus + weekly_penalty + trend_bonus
 
+        # === 大盘环境权重 ===
+        env_weight = market_env.get_signal_weight(signal_type)
+        if env_weight <= 0:
+            continue  # 当前环境禁用此买点类型
+        total_score = int(total_score * env_weight)
+
+        # === ML信号打分 ===
+        ml_score = 0.0
+        ml_label = ''
+        try:
+            from backtest.ml_signal_scorer import predict_signal
+            sig_dict = {
+                'signal_type': signal_type,
+                'confidence': item.get('confidence', 0.5),
+                'pivot_info': pivot_info,
+                'stop_price': stop_price,
+            }
+            # 取该股票的日线数据（已在sig_cache中）
+            ml_daily = daily_map.get(code)
+            if ml_daily is not None and len(ml_daily) >= 30:
+                ml_pred = predict_signal(sig_dict, ml_daily, weekly_trend_str, market_env)
+                p_strong = ml_pred.get('p_bigwin', 0.33)
+                p_weak = ml_pred.get('p_bigloss', 0.33)
+                ml_score = round(p_strong - p_weak, 3)
+                if p_strong >= 0.45 and p_weak < 0.30:
+                    ml_label = 'strong'
+                elif p_weak >= 0.40:
+                    ml_label = 'weak'
+                else:
+                    ml_label = 'neutral'
+        except Exception:
+            pass
+
         results.append({
             'code': code,
             'name': name,
@@ -1614,10 +1721,15 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
             'weekly_score': round(weekly_score, 2),
             'weekly_rise_pct': item.get('weekly_rise_pct', 0),
             'weekly_bottom_fractal': item.get('weekly_bottom_fractal', False),
+            'weekly_risk_reward': item.get('weekly_risk_reward'),
+            'weekly_bf_low': item.get('weekly_bf_low'),
+            'weekly_target_gg': item.get('weekly_target_gg'),
             'three_buy_checks': item.get('three_buy_checks', {}),
             'three_buy_passed': item.get('three_buy_passed', 0),
             'trend_type': trend_type_val,
             'trend_strength': trend_str_val,
+            'ml_score': ml_score,
+            'ml_label': ml_label,
         })
 
     # 7. 排序 + 最低分过滤
@@ -1625,16 +1737,28 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
     elapsed = time.time() - t0
     MIN_SCORE = 50  # 低于50分胜率<50%、平均收益为负 (全市场4885信号验证)
     before_filter = len(results)
+
+    # ML信号调整: 强信号加分，弱信号减分
+    for r in results:
+        if r.get('ml_label') == 'strong':
+            r['total_score'] = int(r['total_score'] * 1.15)  # +15%
+        elif r.get('ml_label') == 'weak':
+            r['total_score'] = int(r['total_score'] * 0.7)   # -30%
+
     results = [r for r in results if r['total_score'] >= MIN_SCORE]
     results.sort(key=lambda x: x['total_score'], reverse=True)
 
     print(f'\n{"="*90}')
     print(f'扫描完成 ({elapsed:.0f}s) — {len(results)} 只候选股 (过滤{before_filter - len(results)}只<{MIN_SCORE}分), 显示Top {top_n}')
     print(f'  Step5缠论: {t_scan:.0f}s | Step6确认+评分: {t_30min:.0f}s')
+    ml_strong = sum(1 for r in results if r.get('ml_label') == 'strong')
+    ml_weak = sum(1 for r in results if r.get('ml_label') == 'weak')
+    ml_neutral = sum(1 for r in results if r.get('ml_label') == 'neutral')
+    print(f'  ML信号: 强={ml_strong} 中性={ml_neutral} 弱={ml_weak}')
     print(f'{"="*90}')
 
     print(f'\n{"排名":<4} {"层级":<6} {"代码":<8} {"名称":<8} {"类型":<5} {"强度":<6} {"行业":<8} {"行业涨幅":>7} '
-          f'{"现价":>8} {"入场价":>8} {"R/R":>5} {"评分":>4} {"周线涨幅":>7} {"周线":<10} {"信号日":<12}')
+          f'{"现价":>8} {"入场价":>8} {"R/R":>5} {"评分":>4} {"ML":>4} {"周线涨幅":>7} {"周线":<10} {"信号日":<12}')
     print('-' * 120)
 
     strength_cn = {'strong': '强', 'standard': '标准', 'weak': '弱', '': ''}
@@ -1650,7 +1774,21 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
               f'{st:<6} '
               f'{r["sector"]:<8} '
               f'{r["sector_ret"]:>+6.1f}% {r["price"]:>8.2f} {r["entry_price"]:>8.2f} '
-              f'{r["risk_reward"]:>5.1f} {r["total_score"]:>4} {r.get("weekly_rise_pct",0):>6.1f}% {r["weekly_trend"]:<10} {t_lbl} {r["2buy_date"]:<12}')
+              f'{r["risk_reward"]:>5.1f} {r["total_score"]:>4} {r.get("ml_label","")[:4]:>4} {r.get("weekly_rise_pct",0):>6.1f}% {r["weekly_trend"]:<10} {t_lbl} {r["2buy_date"]:<12}')
+
+    # 周线底分型候选（盈亏比排序）
+    wbf_results = [r for r in results if r.get('weekly_bottom_fractal') and r.get('weekly_risk_reward')]
+    if wbf_results:
+        wbf_results.sort(key=lambda x: -(x.get('weekly_risk_reward') or 0))
+        print(f'\n  周线底分型候选（盈亏比排序）: {len(wbf_results)}只')
+        print(f'  {"代码":<10} {"名称":<8} {"类型":<5} {"现价":>8} {"止损":>8} {"目标GG":>8} {"盈亏比":>6}')
+        print(f'  {"-"*55}')
+        for r in wbf_results[:15]:
+            bf_low = r.get('weekly_bf_low', 0) or 0
+            target_gg = r.get('weekly_target_gg', 0) or 0
+            rr = r.get('weekly_risk_reward', 0)
+            print(f'  {r["code"]:<10} {r["name"]:<8} {r.get("signal_type","2buy"):<5} '
+                  f'{r["price"]:>8.2f} {bf_low:>8.2f} {target_gg:>8.2f} {rr:>6.1f}')
 
     # 保存
     output_file = f'signals/scan_enhanced_{datetime.now().strftime("%Y%m%d_%H%M")}.json'
