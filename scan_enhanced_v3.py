@@ -866,15 +866,15 @@ def _find_3buy_standalone(engine, code, df):
                         zs_expanded = pv.get('is_expanded', False)
 
                         three_buy_checks = {
-                            'above_gg': above_gg,         # 条件1
-                            'support': has_support,       # 条件2
-                            'pullback_div': pullback_div, # 条件3
-                            'top_micro': top_micro,       # 条件4
-                            'breakout_strong': breakout_strong,  # 条件5
-                            'golden_pass': golden_pass,   # 条件6
-                            'vol_pattern': vol_ok,        # 条件7
-                            'solid_breakout': solid_breakout,  # 条件8
-                            'zs_expanded': zs_expanded,   # 条件9
+                            'above_gg': bool(above_gg),         # 条件1
+                            'support': bool(has_support),       # 条件2
+                            'pullback_div': bool(pullback_div), # 条件3
+                            'top_micro': bool(top_micro),       # 条件4
+                            'breakout_strong': bool(breakout_strong),  # 条件5
+                            'golden_pass': bool(golden_pass),   # 条件6
+                            'vol_pattern': bool(vol_ok),        # 条件7
+                            'solid_breakout': bool(solid_breakout),  # 条件8
+                            'zs_expanded': bool(zs_expanded),   # 条件9
                         }
 
                         # === 基于回测验证的加权评分 + 新增三要素 ===
@@ -1621,6 +1621,9 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
                 strength_bonus += 6
             elif weighted < 0:
                 strength_bonus -= 5   # 追高惩罚
+            elif weighted == 0:
+                # 无任何正面条件 → 大幅降分（减少低质3买噪音）
+                strength_bonus -= 15
 
         # 黄金分割0.618加分 (仅3买)
         if golden_pass:
@@ -1726,6 +1729,7 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
             'weekly_target_gg': item.get('weekly_target_gg'),
             'three_buy_checks': item.get('three_buy_checks', {}),
             'three_buy_passed': item.get('three_buy_passed', 0),
+            'three_buy_weighted': item.get('three_buy_weighted', 0),
             'trend_type': trend_type_val,
             'trend_strength': trend_str_val,
             'ml_score': ml_score,
