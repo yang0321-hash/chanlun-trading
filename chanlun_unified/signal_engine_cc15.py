@@ -1432,16 +1432,24 @@ class SignalEngine:
                     sj = strokes[j]
 
                     # A. 完全在中枢内 → 延伸
+                    # v3 semantics: 延伸时ZG/ZD随所有笔动态更新
+                    # ZG = min(所有笔高点), ZD = max(所有笔低点)
                     if sj['high'] <= zg_cur and sj['low'] >= zd_cur:
                         pivot_strokes.append(sj)
                         pivot_end = j
                         total_strokes += 1
                         if 6 <= total_strokes <= 9:
                             extended_flag = True
+                        # ── 动态更新ZG/ZD（移植v3逻辑）────────────────────────────
+                        zg_cur = min(st['high'] for st in pivot_strokes)
+                        zd_cur = max(st['low'] for st in pivot_strokes)
+                        # ───────────────────────────────────────────────────────────
                         j += 1
                         continue
 
                     # B. 扩张触发检测
+                    # 扩张: stroke突破原始ZG/ZD但下一stroke回抽到原始区间
+                    # 注意: 扩张条件仍基于zg_orig/zd_orig（突破是相对原始边界的）
                     cond_A = (sj['high'] > zg_orig and
                               j + 1 < len(strokes) and
                               zd_orig <= strokes[j + 1]['low'] <= zg_orig)
@@ -1466,6 +1474,7 @@ class SignalEngine:
                         zg_cur = zg_expanded
                         zd_cur = zd_expanded
 
+                        # ── 扩张后贪婪吸收落入新区间的笔 ──────────────────────────
                         k = j + 1
                         while k < len(strokes):
                             sk = strokes[k]
@@ -1473,9 +1482,14 @@ class SignalEngine:
                                 pivot_strokes.append(sk)
                                 pivot_end = k
                                 total_strokes += 1
+                                # ── 动态更新ZG/ZD（移植v3逻辑）────────────────────
+                                zg_cur = min(st['high'] for st in pivot_strokes)
+                                zd_cur = max(st['low'] for st in pivot_strokes)
+                                # ─────────────────────────────────────────────────
                                 k += 1
                             else:
                                 break
+                        # ────────────────────────────────────────────────────────
                         j = k
 
                         if total_strokes >= 9:
@@ -1484,9 +1498,13 @@ class SignalEngine:
                     else:
                         break
 
+                # ── v3 semantics: 最终ZG/ZD = 动态值（非原始初始3笔）────────────
+                # 这确保3买判断基于完整延伸后的中枢，与v3保持一致
                 pivots.append({
-                    'ZG': zg_orig,
-                    'ZD': zd_orig,
+                    'ZG': zg_cur,          # v3: 动态ZG（延伸后所有笔的min高点）
+                    'ZD': zd_cur,          # v3: 动态ZD（延伸后所有笔的max低点）
+                    'ZG_orig': zg_orig,   # 保留原始值供参考
+                    'ZD_orig': zd_orig,   # 保留原始值供参考
                     'ZG_expanded': zg_expanded,
                     'ZD_expanded': zd_expanded,
                     'stroke_start': i,

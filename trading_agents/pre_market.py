@@ -423,6 +423,18 @@ class PreMarketAgent:
         except Exception:
             pass
 
+        # 市场宽度指标 (TDX本地数据)
+        try:
+            from indicator.market_breadth import calc_market_breadth
+            mb = calc_market_breadth()
+            if mb.total > 0:
+                lines.append(f'\n  市场宽度: MA20上方{mb.pct_ma20:.0f}% MA60上方{mb.pct_ma60:.0f}% MA250上方{mb.pct_ma250:.0f}%')
+                lines.append(f'  涨跌比{mb.advance_decline:.2f} 涨停{mb.limit_up} 跌停{mb.limit_down} '
+                             f'放量{mb.vol_expanding} 缩量{mb.vol_shrinking}')
+                lines.append(f'  健康度: {mb.health_score}/100 {mb.grade}')
+        except Exception:
+            pass
+
     def _append_position_overview(self, lines: list):
         """持仓概况"""
         positions = self.positions_data.get('positions', [])

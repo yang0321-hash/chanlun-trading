@@ -28,6 +28,7 @@ from .segment import Segment
 from .pivot import Pivot
 from .trend_track import TrendTrackDetector, TrendTrack, TrendStatus
 from .trend_type import TrendTypeClassifier, TrendType, TrendTypeResult
+from .td_sequential import analyze_td, td_confirm_buy
 from indicator.macd import MACD
 from indicator.volume_dynamics import VolumeDynamics, VolumeDivergenceResult
 
@@ -87,6 +88,10 @@ class BuySellPointDetector:
         min_strokes_for_divergence: int = 2,  # 背驰比较最少需要的同向笔数
         fuzzy_tolerance: float = 0.005,  # ZG/ZD模糊容忍区(0.5%)
         segment_pivots: Optional[List[Pivot]] = None,  # 线段级别中枢
+        # TD Sequential确认
+        closes: Optional[List[float]] = None,  # K线收盘价序列(用于TD)
+        highs: Optional[List[float]] = None,   # K线最高价序列
+        lows: Optional[List[float]] = None,    # K线最低价序列
     ):
         self.fractals = fractals
         self.strokes = strokes
@@ -148,6 +153,16 @@ class BuySellPointDetector:
             except Exception:
                 pass
 
+        # TD Sequential
+        self._td_result = None
+        if closes and len(closes) >= 5:
+            try:
+                h = highs or closes
+                l = lows or closes
+                self._td_result = analyze_td(h, l, closes)
+            except Exception:
+                pass
+
         # 已识别的买卖点缓存
         self._buy_points: List[BuySellPoint] = []
         self._sell_points: List[BuySellPoint] = []
@@ -189,6 +204,9 @@ class BuySellPointDetector:
         # 统一去重: 同位置(±3 bars)只保留最高confidence
         self._buy_points = self._dedup_points(self._buy_points)
         self._sell_points = self._dedup_points(self._sell_points)
+
+        # TD Sequential确认
+        self._apply_td_confirmation()
 
         return self._buy_points, self._sell_points
 
@@ -1317,6 +1335,26 @@ class BuySellPointDetector:
                 sp.confidence = max(0.1, min(1.0, sp.confidence + modifier))
                 if vol_notes:
                     sp.reason += ' | ' + ', '.join(vol_notes)
+
+    def _apply_td_confirmation(self) -> None:
+        """TD Sequential确认: 对买卖点进行趋势衰竭/反转信号加权"""
+        if not self._td_result:
+            return
+
+        for bp in self._buy_points:
+            boost, detail = td_confirm_buy(self._td_result, bp.index, bp.point_type)
+            if boost != 0:
+                bp.confidence = max(0.1, min(1.0, bp.confidence + boost))
+                bp.reason += f' | TD:{detail}'
+
+        for sp in self._sell_points:
+            reading = self._td_result.get_at(sp.index)
+            if not reading:
+                continue
+            sell_score = reading.sell_score()
+            if sell_score > 0.5:
+                sp.confidence = min(1.0, sp.confidence + 0.03)
+                sp.reason += f' | TD Sell={sell_score:.2f}'
 
     def _dedup_points(self, points: List[BuySellPoint], window: int = 3) -> List[BuySellPoint]:
         """同位置(±window bars)只保留最高confidence的点"""
