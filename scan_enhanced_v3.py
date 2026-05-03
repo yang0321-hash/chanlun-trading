@@ -1683,7 +1683,7 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
                 'stop_price': stop_price,
             }
             # 取该股票的日线数据（已在sig_cache中）
-            ml_daily = daily_map.get(code)
+            ml_daily = daily_map.get(code) or prefiltered_map.get(code)
             if ml_daily is not None and len(ml_daily) >= 30:
                 ml_pred = predict_signal(sig_dict, ml_daily, weekly_trend_str, market_env)
                 p_strong = ml_pred.get('p_bigwin', 0.33)
@@ -1695,7 +1695,10 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
                     ml_label = 'weak'
                 else:
                     ml_label = 'neutral'
-        except Exception:
+        except Exception as _ml_err:
+            if not hasattr(scan_enhanced, '_ml_err_logged'):
+                scan_enhanced._ml_err_logged = True
+                print(f'   [ML] 首次异常: {_ml_err.__class__.__name__}: {_ml_err}')
             pass
 
         results.append({
