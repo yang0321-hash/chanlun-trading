@@ -1941,11 +1941,30 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
         elif ms < 0.0:
             r['total_score'] = int(r['total_score'] * 0.90)   # 微负: -10%
 
+    # 风控惩罚: 高风险信号降分 (回测验证)
+    risk_filtered = 0
+    for r in results:
+        penalty = 0
+        # 周线非上升趋势: 33%大亏率
+        if r.get('trend_type') in ('consolidation', 'down'):
+            penalty += 20
+        # 3买质量差(weighted<=-1): 22.9%大亏率
+        if r.get('signal_type') == '3buy' and int(r.get('three_buy_weighted', 0)) <= -1:
+            penalty += 15
+        # 盈亏比极低(R/R<0.5): 20.7%大亏率
+        if float(r.get('risk_reward', 0)) < 0.5:
+            penalty += 10
+        if penalty > 0:
+            r['total_score'] -= penalty
+            r['risk_penalty'] = penalty
+            if r['total_score'] < MIN_SCORE:
+                risk_filtered += 1
+
     results = [r for r in results if r['total_score'] >= MIN_SCORE]
     results.sort(key=lambda x: x['total_score'], reverse=True)
 
     print(f'\n{"="*90}')
-    print(f'扫描完成 ({elapsed:.0f}s) — {len(results)} 只候选股 (过滤{before_filter - len(results)}只<{MIN_SCORE}分), 显示Top {top_n}')
+    print(f'扫描完成 ({elapsed:.0f}s) — {len(results)} 只候选股 (过滤{before_filter - len(results)}只: {before_filter - len(results) - risk_filtered}低分 + {risk_filtered}风控), 显示Top {top_n}')
     print(f'  Step5缠论: {t_scan:.0f}s | Step6确认+评分: {t_30min:.0f}s')
     ml_strong = sum(1 for r in results if r.get('ml_label') == 'strong')
     ml_weak = sum(1 for r in results if r.get('ml_label') == 'weak')
