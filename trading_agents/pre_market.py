@@ -139,23 +139,29 @@ class PreMarketAgent:
         brief = self.pre_market_brief()
         self.report_parts.append(brief)
 
-        # 3. 热点板块识别
-        print('[3] 热点板块识别...')
+        # 3. 组合风险评估 (VaR/CVaR)
+        print('[3] 组合风险评估...')
+        risk_report = self.portfolio_risk_assessment()
+        if risk_report:
+            self.report_parts.append(risk_report)
+
+        # 4. 热点板块识别
+        print('[4] 热点板块识别...')
         hot_sector_report = self.hot_sector_scan()
         self.report_parts.append(hot_sector_report)
 
-        # 4. 竞价数据 (09:15后才有)
+        # 5. 竞价数据 (09:15后才有)
         now = datetime.now()
         if now.hour >= 9 and now.minute >= 15:
-            print('[4] 获取竞价数据...')
+            print('[5] 获取竞价数据...')
             auction = self.fetch_auction_data()
             self.report_parts.append(auction)
         else:
-            print('[4] 跳过竞价数据（09:15后才可获取）')
+            print('[5] 跳过竞价数据（09:15后才可获取）')
             self.report_parts.append('\n【竞价异动】尚未到竞价时间，盘前无数据')
 
-        # 5. 生成报告 + 推送
-        print('[5] 生成报告...')
+        # 6. 生成报告 + 推送
+        print('[6] 生成报告...')
         report = '\n\n'.join(self.report_parts)
         self.save_report(report)
         self.push_report()
@@ -285,6 +291,59 @@ class PreMarketAgent:
             return ('OK', '所有模块加载正常')
         except ImportError as e:
             return ('FAIL', f'模块加载失败: {e}')
+
+    # ---------- 3. 组合风险评估 ----------
+
+    def portfolio_risk_assessment(self) -> str:
+        """盘前组合VaR/CVaR风险评估"""
+        positions = self.positions_data.get('positions', [])
+        if not positions:
+            return ''
+
+        try:
+            from analytics.risk_manager import RiskManager
+            rm = RiskManager()
+
+            # 收集各持仓的日线数据
+            returns_dict = {}
+            position_values = {}
+            position_sectors = {}
+
+            for p in positions:
+                code = p.get('code', '')
+                name = p.get('name', code)
+                shares = p.get('shares', 0)
+                entry_price = p.get('entry_price', 0)
+                sector = p.get('sector', '未知')
+
+                if not code or shares == 0:
+                    continue
+
+                # 获取最近120天日线
+                prefix = code_to_prefix(code)
+                df = self.hs.get_daily(prefix, days=120)
+                if df is None or len(df) < 30:
+                    continue
+
+                returns = df['close'].pct_change().dropna()
+                returns_dict[code] = returns
+                position_values[code] = entry_price * shares
+                position_sectors[code] = sector
+
+            if len(returns_dict) == 0:
+                return '\n【组合风险】数据不足，跳过风险评估'
+
+            report = rm.generate_report(
+                returns_dict=returns_dict,
+                position_values=position_values,
+                position_sectors=position_sectors,
+                confidence=0.95,
+                horizon=1,
+            )
+            return report.summary()
+
+        except Exception as e:
+            return f'\n【组合风险】评估失败: {e}'
 
     # ---------- 2. 盘前简报 ----------
 

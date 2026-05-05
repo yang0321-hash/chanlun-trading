@@ -419,6 +419,10 @@ class IntradayAgent:
         # 止损检查
         self._check_stop_losses()
 
+        # 组合VaR实时监控 (每10轮一次)
+        if self.scan_count % 10 == 0:
+            self._check_portfolio_risk()
+
         # 买点检测 (每3轮一次，减少API压力)
         if self.scan_count % 3 == 1:
             self._detect_buy_signals()
@@ -497,6 +501,54 @@ class IntradayAgent:
                     pass
         if price_map:
             self.pm.update_prices(price_map)
+
+    def _check_portfolio_risk(self):
+        """盘中组合VaR/CVaR实时监控 — 风险超标时告警"""
+        positions = self.pm.get_all_positions()
+        if len(positions) < 1:
+            return
+
+        try:
+            from analytics.risk_manager import RiskManager
+            rm = RiskManager()
+
+            returns_dict = {}
+            position_values = {}
+
+            for pos in positions:
+                prefix = code_to_prefix(pos.code)
+                df = self.hs.get_daily(prefix, days=60)
+                if df is None or len(df) < 30:
+                    continue
+                returns = df['close'].pct_change().dropna()
+                returns_dict[pos.code] = returns
+                position_values[pos.code] = pos.entry_price * pos.shares
+
+            if not returns_dict:
+                return
+
+            total_value = sum(position_values.values())
+            if total_value <= 0:
+                return
+
+            weights = {s: v / total_value for s, v in position_values.items()}
+            var_result = rm.portfolio_var(returns_dict, weights, 0.95, 1, total_value)
+
+            if var_result.var_pct > 0.05:
+                msg = (f'组合风险超标! 1日VaR={var_result.var_pct:.1%} '
+                       f'(¥{var_result.var_value:,.0f}), 建议减仓')
+                print(f'  ⚠ {msg}')
+                self.event_log.append({
+                    'time': datetime.now().strftime('%H:%M'),
+                    'type': 'risk_alert',
+                    'msg': msg,
+                })
+                send_notification('组合风险告警', msg)
+            else:
+                print(f'  组合VaR(95%)={var_result.var_pct:.2%} 正常')
+
+        except Exception as e:
+            print(f'  组合风险评估失败: {e}')
 
     def _check_stop_losses(self):
         """检查持仓止损 — 使用 UnifiedExitManager 7层退出"""
