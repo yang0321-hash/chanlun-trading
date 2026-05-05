@@ -1206,6 +1206,17 @@ def _mp_worker(args):
     engine.momentum_factor_enabled = False
     engine.vol_regime_enabled = False
 
+    # TD Sequential分析 (一次性，用于所有信号)
+    # TD Sequential分析 (一次性，用于所有信号)
+    td_result = None
+    try:
+        sys.path.insert(0, '.')
+        from core.td_sequential import analyze_td, td_confirm_buy
+        td_result = analyze_td(
+            df['high'].tolist(), df['low'].tolist(), df['close'].tolist())
+    except Exception:
+        pass
+
     signals = []
     try:
         pairs = find_daily_1buy_2buy(engine, code, df)
@@ -1261,6 +1272,20 @@ def _mp_worker(args):
                     signals.append(s)
     except Exception:
         pass
+
+    # TD Sequential确认 — 给每个信号打TD分
+    if td_result is not None:
+        for s in signals:
+            try:
+                sig_idx = s.get('sig_idx', -1)
+                sig_type = s.get('signal_type', '')
+                if sig_idx >= 0:
+                    boost, detail = td_confirm_buy(td_result, sig_idx, sig_type)
+                    s['td_boost'] = boost
+                    s['td_detail'] = detail
+            except Exception:
+                pass
+
     return signals
 
 
@@ -1495,6 +1520,36 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
     t_30min_start = time.time()
     results = []
     scanned = set()
+
+    # 5.5. TD Sequential确认 (主进程, 避免multiprocessing import问题)
+    t_td_start = time.time()
+    td_codes_done = set()
+    for item in all_signals:
+        code = item['code']
+        if code in td_codes_done:
+            continue
+        td_codes_done.add(code)
+        df = daily_map.get(code)
+        if df is None:
+            df = prefiltered_map.get(code)
+        if df is None or len(df) < 30:
+            continue
+        try:
+            from core.td_sequential import analyze_td, td_confirm_buy
+            td_result = analyze_td(
+                df['high'].tolist(), df['low'].tolist(), df['close'].tolist())
+            # 给该股票的所有信号打TD分
+            for s in all_signals:
+                if s['code'] == code:
+                    sig_idx = s.get('sig_idx', -1)
+                    if sig_idx >= 0:
+                        boost, detail = td_confirm_buy(td_result, sig_idx, s.get('signal_type', ''))
+                        s['td_boost'] = boost
+                        s['td_detail'] = detail
+        except Exception:
+            pass
+    td_hit = sum(1 for s in all_signals if s.get('td_boost', 0) != 0)
+    print(f'   [5.5] TD Sequential: {td_hit}/{len(all_signals)} signals affected ({time.time()-t_td_start:.1f}s)')
 
     # 6a. 周线过滤 (本地TDX, 快速)
     print('   [6a] 周线过滤...')
@@ -1769,7 +1824,12 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
         elif trend_type_val == 'consolidation':
             trend_bonus = -8
 
-        total_score = tech_score + sector_score + strength_bonus + weekly_penalty + trend_bonus
+        # === TD Sequential加分 ===
+        td_boost = item.get('td_boost', 0)
+        # TD boost范围 -0.10 ~ +0.15, 映射到评分: ×100
+        td_bonus = int(td_boost * 100) if td_boost else 0
+
+        total_score = tech_score + sector_score + strength_bonus + weekly_penalty + trend_bonus + td_bonus
 
         # === 大盘环境权重 ===
         env_weight = market_env.get_signal_weight(signal_type)
@@ -1857,6 +1917,8 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
             'trend_strength': trend_str_val,
             'ml_score': ml_score,
             'ml_label': ml_label,
+            'td_boost': item.get('td_boost', 0),
+            'td_detail': item.get('td_detail', ''),
         })
 
     # 7. 排序 + 最低分过滤
