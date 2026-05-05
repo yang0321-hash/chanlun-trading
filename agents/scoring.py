@@ -20,12 +20,12 @@ LEGACY_WEIGHTS = {
 }
 
 DEFAULT_WEIGHTS = {
-    'technical_bull': 0.35,
+    'technical_bull': 0.30,      # 0.35→0.30 IC/IR: total_score更有效，让出空间
     'technical_bear': 0.15,
-    'sentiment': 0.15,
+    'sentiment': 0.10,           # 0.15→0.10 情绪过热=追高风险，降权
     'sector_rotation': 0.20,
-    'scanner_base': 0.075,
-    'risk_adjustment': 0.075,
+    'scanner_base': 0.15,        # 0.075→0.15 IC/IR验证total_score是最有效因子(IR=0.64)
+    'risk_adjustment': 0.10,     # 0.075→0.10 加强风控
     'news_sentiment': 0.08,
     'debate_adjustment': 0.05,
 }

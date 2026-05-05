@@ -184,6 +184,20 @@ class UnifiedExitManager:
 
         # === 3. Fixed stop loss ===
         if self.config.use_fixed_stop and record.fixed_stop_loss > 0:
+            # 阶梯保本+锁利: 盈利越多止损越高
+            if profit_pct >= 0.15:
+                lock_stop = record.entry_price * 1.08
+                if record.fixed_stop_loss < lock_stop:
+                    record.fixed_stop_loss = lock_stop
+            elif profit_pct >= 0.08:
+                lock_stop = record.entry_price * 1.03
+                if record.fixed_stop_loss < lock_stop:
+                    record.fixed_stop_loss = lock_stop
+            elif profit_pct >= 0.03:
+                if record.fixed_stop_loss < record.entry_price:
+                    record.fixed_stop_loss = record.entry_price
+                    record.breakeven_raised = True
+
             if price <= record.fixed_stop_loss:
                 return ExitSignal(
                     action='sell',
@@ -276,8 +290,8 @@ class UnifiedExitManager:
 
                     # 阶梯止损上移：每次部分止盈后，将止损提到已实现利润的一部分
                     # 公式：new_stop = entry * (1 + profit_pct * lock_ratio)
-                    # lock_ratio: 锁定已实现利润的30%
-                    lock_ratio = 0.30
+                    # lock_ratio: 锁定已实现利润的50%
+                    lock_ratio = 0.50
                     new_stop = record.entry_price * (1 + profit_pct * lock_ratio)
                     record.fixed_stop_loss = max(record.fixed_stop_loss, new_stop)
                     record.breakeven_raised = True

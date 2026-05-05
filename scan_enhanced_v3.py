@@ -1800,13 +1800,14 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
             weekly_trend_str = '空头(扣分)'
         elif weekly_trend == 'bull':
             weekly_trend_str = '多头'
-            strength_bonus += 5  # 周线多头加分
+            # IC/IR验证: weekly_score负相关(IR=-0.33), 多头加分从5降到2
+            strength_bonus += 2
         else:
             weekly_trend_str = '盘整'
 
         # 周线底分型加分: 止损好设，结构清晰
         if item.get('weekly_bottom_fractal'):
-            strength_bonus += 8
+            strength_bonus += 6  # 从8降到6
             weekly_trend_str += '+底分型'
 
         # === 走势类型加分 (基于全市场4382信号验证 2026-04-25) ===
@@ -1829,7 +1830,7 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
         # TD boost范围 -0.10 ~ +0.15, 映射到评分: ×100
         td_bonus = int(td_boost * 100) if td_boost else 0
 
-        total_score = tech_score + sector_score + strength_bonus + weekly_penalty + trend_bonus + td_bonus
+        total_score = tech_score + sector_score + int(strength_bonus * 0.7) + weekly_penalty + trend_bonus + td_bonus
 
         # === 大盘环境权重 ===
         env_weight = market_env.get_signal_weight(signal_type)
@@ -1928,8 +1929,11 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
     before_filter = len(results)
 
     # ML信号调整: 用连续ml_score映射到乘数 (比3分类更精细)
+    # IC/IR验证: ml_score在多天全0(降级), 跳过0值避免误调整
     for r in results:
         ms = r.get('ml_score', 0)
+        if ms == 0:
+            continue  # ML降级时跳过，不调整
         if ms >= 0.5:
             r['total_score'] = int(r['total_score'] * 1.20)   # 高置信: +20%
         elif ms >= 0.3:

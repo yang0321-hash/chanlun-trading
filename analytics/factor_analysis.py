@@ -110,7 +110,7 @@ class FactorAnalyzer:
         ic_values = []
         for dt in dates:
             sub = merged[merged[date_col] == dt]
-            if len(sub) < 5:
+            if len(sub) < 5 or sub[factor_col].std() == 0 or sub[return_col].std() == 0:
                 ic_values.append(np.nan)
                 continue
             if method == 'spearman':

@@ -63,12 +63,12 @@ class ExitConfig:
 
     fixed_stop_pct: float = 0.05         # 固定止损比例 5%（1买/2买默认）
     fixed_stop_pct_3buy: float = 0.05   # 三买固定止损比例 5%（三买回踩确认，止损更紧）
-    trailing_activation: float = 0.05    # 跟踪止损激活点 5%
+    trailing_activation: float = 0.03    # 跟踪止损激活点 3% (原5%, 更早保护利润)
     trailing_offset: float = 0.08        # 跟踪止损回撤 8%
     profit_targets: List[Tuple[float, float]] = field(default_factory=lambda: [
-        (0.05, 0.3),   # 盈利5%卖30%
-        (0.10, 0.3),   # 盈利10%卖30%
-        (0.15, 0.4),   # 盈利15%卖剩余
+        (0.08, 0.2),   # 盈利8%卖20% (原5%卖30%, 让利润多跑)
+        (0.15, 0.2),   # 盈利15%卖20% (原10%卖30%)
+        (0.25, 0.3),   # 盈利25%卖30% (原15%卖40%, 剩余30%靠ATR跟踪)
     ])
     time_stop_bars: int = 60             # 时间止损K线数
 
@@ -80,15 +80,15 @@ class ExitConfig:
     use_dynamic_targets: bool = True     # 趋势自适应分批止盈
     # 趋势自适应止盈目标: (profit_pct, sell_ratio)
     dynamic_targets_strong: List[Tuple[float, float]] = field(default_factory=lambda: [
-        (0.10, 0.10),  # 强趋势: 10%先卖10%（轻仓试探）
-        (0.20, 0.15),  # 20%再卖15%
-        (0.35, 0.25),  # 35%再卖25%
+        (0.15, 0.15),  # 强趋势: 15%先卖15% (原10%卖10%, 给更大空间)
+        (0.30, 0.20),  # 30%再卖20% (原20%卖15%)
+        (0.50, 0.15),  # 50%再卖15% (原35%卖25%)
         # 剩余50%靠ATR跟踪止损（让利润跑更远）
     ])
     dynamic_targets_normal: List[Tuple[float, float]] = field(default_factory=lambda: [
-        (0.05, 0.3),   # 正常: 5%卖30%
-        (0.10, 0.3),   # 10%卖30%
-        (0.15, 0.4),   # 15%卖剩余
+        (0.08, 0.2),   # 正常: 8%卖20% (原5%卖30%, 让利润多跑)
+        (0.15, 0.2),   # 15%卖20% (原10%卖30%)
+        (0.25, 0.3),   # 25%卖30% (原15%卖40%, 剩余30%靠ATR跟踪)
     ])
     dynamic_targets_weak: List[Tuple[float, float]] = field(default_factory=lambda: [
         (0.03, 0.4),   # 弱势: 3%卖40%

@@ -183,6 +183,11 @@ class ChanLunStrategy(Strategy):
 
             # 持仓逻辑
             if position > 0:
+                # 更新持仓最高价
+                if symbol in self._highest_prices:
+                    high_price = bar['high'] if hasattr(bar, 'get') and 'high' in bar.index else current_price
+                    if high_price > self._highest_prices[symbol]:
+                        self._highest_prices[symbol] = float(high_price)
                 signal = self._check_sell_signal(current_price, index, symbol, bar=bar)
             else:
                 signal = self._check_buy_signal(current_price, index, symbol)
