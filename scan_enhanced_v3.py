@@ -1924,7 +1924,7 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
     # 7. 排序 + 最低分过滤
     t_30min = time.time() - t_30min_start
     elapsed = time.time() - t0
-    MIN_SCORE = 50  # 低于50分胜率<50%、平均收益为负 (全市场4885信号验证)
+    MIN_SCORE = 80  # 低于80分胜率56%、平均+1.8% (404信号回测验证)
     before_filter = len(results)
 
     # ML信号调整: 用连续ml_score映射到乘数 (比3分类更精细)
