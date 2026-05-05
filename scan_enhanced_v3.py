@@ -1869,9 +1869,9 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
                 p_strong = ml_pred.get('p_bigwin', 0.33)
                 p_weak = ml_pred.get('p_bigloss', 0.33)
                 ml_score = round(p_strong - p_weak, 3)
-                if p_strong >= 0.45 and p_weak < 0.30:
+                if ml_score >= 0.3:
                     ml_label = 'strong'
-                elif p_weak >= 0.40:
+                elif ml_score < -0.1:
                     ml_label = 'weak'
                 else:
                     ml_label = 'neutral'
@@ -1927,12 +1927,19 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
     MIN_SCORE = 50  # 低于50分胜率<50%、平均收益为负 (全市场4885信号验证)
     before_filter = len(results)
 
-    # ML信号调整: 强信号加分，弱信号减分
+    # ML信号调整: 用连续ml_score映射到乘数 (比3分类更精细)
     for r in results:
-        if r.get('ml_label') == 'strong':
-            r['total_score'] = int(r['total_score'] * 1.15)  # +15%
-        elif r.get('ml_label') == 'weak':
-            r['total_score'] = int(r['total_score'] * 0.7)   # -30%
+        ms = r.get('ml_score', 0)
+        if ms >= 0.5:
+            r['total_score'] = int(r['total_score'] * 1.20)   # 高置信: +20%
+        elif ms >= 0.3:
+            r['total_score'] = int(r['total_score'] * 1.10)   # 中高: +10%
+        elif ms >= 0.1:
+            r['total_score'] = int(r['total_score'] * 1.02)   # 微正: +2%
+        elif ms < -0.1:
+            r['total_score'] = int(r['total_score'] * 0.75)   # 负面: -25%
+        elif ms < 0.0:
+            r['total_score'] = int(r['total_score'] * 0.90)   # 微负: -10%
 
     results = [r for r in results if r['total_score'] >= MIN_SCORE]
     results.sort(key=lambda x: x['total_score'], reverse=True)
