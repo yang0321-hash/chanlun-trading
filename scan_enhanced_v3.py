@@ -8,6 +8,7 @@
   4. 综合排名输出
 """
 import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, '.')
 for k in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']:
     os.environ.pop(k, None)
@@ -29,6 +30,13 @@ from backtest_cc15_mtf import (
 from core.trend_type import classify_trend_type, TrendType
 from indicator.vol_price_divergence import detect_volume_price_divergence, DivergenceType
 from indicator.market_environment import MarketEnvironment
+
+try:
+    from backtest.ml_signal_scorer import predict_signal as _ml_predict
+    _ML_AVAILABLE = True
+except Exception:
+    _ml_predict = None
+    _ML_AVAILABLE = False
 
 
 # 成长性行业优先列表（基于回测验证的高胜率行业）
@@ -248,16 +256,27 @@ def score_technical(df, entry_price, stop_price, rr_ratio):
     return score
 
 
-def _detect_weekly_trend(code, hs):
+def _detect_weekly_trend(code, hs, daily_df=None):
     """检测周线趋势方向: bull/bear/range
 
     周线定方向: 缠论周线分析(笔/中枢/买卖点) + MA/MACD辅助
+
+    Args:
+        code: 股票代码
+        hs: HybridSource实例
+        daily_df: 日线DataFrame (如果提供则从日线resample，避免重新读TDX)
 
     Returns: (trend, score, weekly_rise_pct)
         weekly_rise_pct: 从周线最低点至今的涨幅百分比 (如 25.3 = 25.3%)
     """
     try:
-        df_w = hs.get_kline(code, period='weekly')
+        if daily_df is not None and len(daily_df) >= 120:
+            df_w = daily_df.resample('W').agg({
+                'open': 'first', 'high': 'max',
+                'low': 'min', 'close': 'last', 'volume': 'sum'
+            }).dropna()
+        else:
+            df_w = hs.get_kline(code, period='weekly')
         if len(df_w) < 30:
             return 'range', 0.0, 0.0
 
@@ -946,6 +965,68 @@ def _find_3buy_standalone(engine, code, df):
 
             # gap = P2.ZD - P1.ZG 越大越强
             gap = (p2['zd'] - p1['zg']) / p1['zg'] if p1['zg'] > 0 else 0
+
+            # === 质量检查 (与标准法相同条件) ===
+            zg = p1['zg']
+            zd = p1['zd']
+            gg = p1.get('gg', zg)
+            pv_end = p1['end_idx']
+            breakout_idx = p2['start_idx']
+
+            # 条件8: 实体突破
+            solid_breakout = entry_idx < n and close.iloc[entry_idx] > zg
+
+            # 条件9: 中枢扩张
+            zs_expanded = p2.get('is_expanded', False)
+
+            # 条件4: 顶部小中枢 (P2宽度 < P1宽度的50%)
+            p1_width = gg - zd
+            p2_width = (p2.get('gg', p2['zg']) - p2['zd'])
+            top_micro = p1_width > 0 and p2_width < p1_width * 0.5
+
+            # 条件6: 黄金分割
+            golden_pass = False
+            if p1_width > 0 and entry_idx > pv_end:
+                run_up_h = df['high'].iloc[pv_end:entry_idx + 1].max()
+                pullback = run_up_h - entry_price
+                run_up = run_up_h - zd
+                if run_up > 0:
+                    golden_pass = pullback < run_up * 0.382
+
+            # 条件7: 出中枢放量，回踩缩量
+            vol_ok, vol_ratio = _check_volume_pattern(
+                df, pv_end, breakout_idx, entry_idx)
+
+            three_buy_checks = {
+                'above_gg': False,
+                'support': False,
+                'pullback_div': False,
+                'top_micro': bool(top_micro),
+                'breakout_strong': False,
+                'golden_pass': bool(golden_pass),
+                'vol_pattern': bool(vol_ok),
+                'solid_breakout': bool(solid_breakout),
+                'zs_expanded': bool(zs_expanded),
+            }
+
+            # 加权评分 (同标准法权重)
+            WEIGHTS = {
+                'top_micro': 2,
+                'golden_pass': -2,
+                'support': -1,
+                'above_gg': 0,
+                'pullback_div': 0,
+                'breakout_strong': 0,
+                'vol_pattern': 0,
+                'solid_breakout': 1,
+                'zs_expanded': 1,
+            }
+            weighted_score = sum(
+                WEIGHTS[k] * (1 if v else 0)
+                for k, v in three_buy_checks.items()
+            )
+            passed_count = sum(1 for v in three_buy_checks.values() if v)
+
             if gap > 0.10:
                 strength = 'strong'
             elif gap > 0.03:
@@ -959,21 +1040,21 @@ def _find_3buy_standalone(engine, code, df):
                 'stop_price': stop_price,
                 'sig_idx': entry_idx,
                 'buy_strength': strength,
-                'golden_ratio_pass': False,
+                'golden_ratio_pass': golden_pass,
                 'pivot_zg': p1['zg'],
                 'pivot_zd': p1['zd'],
                 'pivot_gg': p1.get('gg', p1['zg']),
                 'breakout_high': p2.get('gg', p2['zg']),
                 'pullback_low': p2['zd'],
                 'zs_bi_count': p2.get('bi_count', 3),
-                'zs_expanded': p2.get('is_expanded', False),
-                'solid_breakout': True,
-                'three_buy_checks': {'pivot_method': True},
-                'three_buy_passed': 1,
-                'three_buy_weighted': 2,
+                'zs_expanded': zs_expanded,
+                'solid_breakout': solid_breakout,
+                'three_buy_checks': three_buy_checks,
+                'three_buy_passed': passed_count,
+                'three_buy_weighted': weighted_score,
                 'breakout_ratio': 0,
-                'vol_ratio': 0,
-                'pivot_method': True,  # 标记中枢法
+                'vol_ratio': round(vol_ratio, 2),
+                'pivot_method': True,
             })
 
     # 走势类型分类 — 附加到每个3买信号
@@ -1423,7 +1504,8 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
         if code in scanned:
             continue
         scanned.add(code)
-        weekly_trend, weekly_score, weekly_rise_pct, wbf = _detect_weekly_trend(code, hs)
+        weekly_trend, weekly_score, weekly_rise_pct, wbf = _detect_weekly_trend(
+            code, hs, daily_map.get(code))
         item['weekly_rise_pct'] = round(weekly_rise_pct, 1)
         item['weekly_bottom_fractal'] = wbf
         item['weekly_risk_reward'] = getattr(_detect_weekly_trend, 'weekly_risk_reward', None)
@@ -1444,31 +1526,55 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
         print('   无股票通过周线过滤')
         return []
 
-    # 6b. 并发获取30min数据 (8线程)
-    print(f'   [6b] 并发获取30min数据 ({len(weekly_passed)}只)...')
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    # 6b. 获取30min数据 (TDX本地5min→30min, Sina fallback)
+    print(f'   [6b] 获取30min数据 ({len(weekly_passed)}只)...')
 
     data_30m = {}
-    def _fetch_30min_one(code):
-        try:
-            df = fetch_sina_30min(code)
-            return (code, df)
-        except Exception:
-            return (code, pd.DataFrame())
+    tdx_30m_start = time.time()
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(_fetch_30min_one, item['code']): item['code']
-                   for item in weekly_passed}
-        done_count = 0
-        for f in as_completed(futures):
-            code, df = f.result()
-            data_30m[code] = df
-            done_count += 1
-            if done_count % 50 == 0:
-                print(f'     30min: {done_count}/{len(weekly_passed)}', flush=True)
+    # Phase 1: TDX本地5min→30min (极快)
+    codes_need_sina = []
+    for item in weekly_passed:
+        code = item['code']
+        try:
+            df5 = hs._read_tdx_5min(code)
+            if len(df5) >= 100:
+                df30 = df5.resample('30min').agg({
+                    'open': 'first', 'high': 'max',
+                    'low': 'min', 'close': 'last', 'volume': 'sum'
+                }).dropna()
+                if len(df30) >= 100:
+                    data_30m[code] = df30
+                    continue
+        except Exception:
+            pass
+        codes_need_sina.append(code)
+
+    tdx_count = len(data_30m)
+    print(f'     TDX本地: {tdx_count}/{len(weekly_passed)} ({time.time()-tdx_30m_start:.1f}s)', flush=True)
+
+    # Phase 2: Sina HTTP fallback (仅本地缺失的)
+    if codes_need_sina:
+        print(f'     Sina fallback: {len(codes_need_sina)}只...', flush=True)
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _fetch_30min_one(code):
+            try:
+                df = fetch_sina_30min(code)
+                return (code, df)
+            except Exception:
+                return (code, pd.DataFrame())
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            futures = {pool.submit(_fetch_30min_one, code): code
+                       for code in codes_need_sina}
+            for f in as_completed(futures):
+                code, df = f.result()
+                if len(df) >= 100:
+                    data_30m[code] = df
 
     valid_30m = sum(1 for df in data_30m.values() if len(df) >= 100)
-    print(f'   30min获取完成: {valid_30m}/{len(weekly_passed)} 有效')
+    print(f'   30min获取完成: {valid_30m}/{len(weekly_passed)} 有效 (TDX={tdx_count}, Sina={valid_30m-tdx_count})')
 
     # 6c. 批量获取实时报价
     print('   [6c] 批量获取实时报价...')
@@ -1675,17 +1781,31 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
         ml_score = 0.0
         ml_label = ''
         try:
-            from backtest.ml_signal_scorer import predict_signal
+            if not _ML_AVAILABLE:
+                raise ImportError('ml_signal_scorer not available')
             sig_dict = {
                 'signal_type': signal_type,
                 'confidence': item.get('confidence', 0.5),
                 'pivot_info': pivot_info,
                 'stop_price': stop_price,
             }
-            # 取该股票的日线数据（已在sig_cache中）
-            ml_daily = daily_map.get(code) or prefiltered_map.get(code)
+            # 取该股票的日线数据（daily_map → prefiltered_map → old_cache fallback）
+            ml_daily = daily_map.get(code)
+            if ml_daily is None:
+                ml_daily = prefiltered_map.get(code)
+            if ml_daily is None:
+                # Fallback: 从scanner_new_fw_cache_120.pkl加载
+                _oc_key = ('SH' if code[0] in ('6', '9') else 'SZ') + code + ('.SH' if code[0] in ('6', '9') else '.SZ')
+                if not hasattr(scan_enhanced, '_old_cache'):
+                    try:
+                        import pickle as _pkl
+                        with open('scanner_new_fw_cache_120.pkl', 'rb') as _f:
+                            scan_enhanced._old_cache = _pkl.load(_f)
+                    except Exception:
+                        scan_enhanced._old_cache = {}
+                ml_daily = scan_enhanced._old_cache.get(_oc_key)
             if ml_daily is not None and len(ml_daily) >= 30:
-                ml_pred = predict_signal(sig_dict, ml_daily, weekly_trend_str, market_env)
+                ml_pred = _ml_predict(sig_dict, ml_daily, weekly_trend_str, market_env)
                 p_strong = ml_pred.get('p_bigwin', 0.33)
                 p_weak = ml_pred.get('p_bigloss', 0.33)
                 ml_score = round(p_strong - p_weak, 3)

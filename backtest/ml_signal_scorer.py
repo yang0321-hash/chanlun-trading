@@ -43,6 +43,9 @@ FEATURE_COLS_FILE = os.path.join(MODEL_DIR, 'feature_columns.json')
 HOLD_DAYS = 5
 BUY_TYPES = ['1buy', '2buy', '3buy', 'quasi2buy', 'sub1buy', '2b3bbuy']
 
+# 模型缓存: {(signal_type): (clf, feature_cols)}
+_MODEL_CACHE = {}
+
 
 def extract_features(
     signal: dict,
@@ -385,7 +388,10 @@ def train_model(df: pd.DataFrame, signal_type: str = ''):
 
 
 def load_model(signal_type: str = ''):
-    """加载已训练的模型 (优先按类型，fallback到统一模型)"""
+    """加载已训练的模型 (带内存缓存，避免重复读磁盘)"""
+    if signal_type in _MODEL_CACHE:
+        return _MODEL_CACHE[signal_type]
+
     import xgboost as xgb
     suffix = f'_{signal_type}' if signal_type else ''
     model_path = os.path.join(MODEL_DIR, f'clf_triple{suffix}.json')
@@ -400,6 +406,8 @@ def load_model(signal_type: str = ''):
     clf.load_model(model_path)
     with open(fc_path, 'r') as f:
         feature_cols = json.load(f)
+
+    _MODEL_CACHE[signal_type] = (clf, feature_cols)
     return clf, feature_cols
 
 
