@@ -810,6 +810,9 @@ def run_daily_backtest(codes, params=None, start_date=None):
                 continue
             if b.confidence < 0.6:
                 continue
+            # 1买需要更高置信度(>=0.75), 减少假底部
+            if b.point_type == '1buy' and b.confidence < 0.75:
+                continue
             idx = b.index
             if idx < 50 or idx >= len(daily_map[code]):
                 continue
@@ -890,6 +893,18 @@ def run_daily_backtest(codes, params=None, start_date=None):
                 vol_ma20 = df['volume'].iloc[buy_idx-20:buy_idx].mean()
                 if vol_ma20 > 0 and vol_today < vol_ma20:
                     continue  # 突破无量, 跳过
+
+        # 1买成交量过滤: 底部需要量能信号 — 放量恐慌抛售或缩量卖盘枯竭
+        if buy_type == '1buy':
+            buy_idx = sig['buy_idx']
+            if 'volume' in df.columns and buy_idx >= 20:
+                vol_today = df['volume'].iloc[buy_idx]
+                vol_ma20 = df['volume'].iloc[buy_idx-20:buy_idx].mean()
+                if vol_ma20 > 0:
+                    vol_ratio = vol_today / vol_ma20
+                    # 要求: 放量(>=1.2x恐慌抛售有承接) 或 缩量(<=0.7x卖盘枯竭)
+                    if not (vol_ratio >= 1.2 or vol_ratio <= 0.7):
+                        continue  # 中性量能, 底部信号不可靠
 
         filtered.append(sig)
 
