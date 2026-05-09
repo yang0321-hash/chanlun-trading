@@ -860,6 +860,7 @@ def run_daily_backtest(codes, params=None, start_date=None):
         code = sig['code']
         df = daily_map[code]
         buy_date = sig['buy_date']
+        buy_type = sig['buy_type']
 
         # 月线方向
         df_monthly = resample_to_monthly(df)
@@ -881,6 +882,15 @@ def run_daily_backtest(codes, params=None, start_date=None):
                 if state == 'BEAR':
                     continue
 
+        # 3买成交量过滤: 突破日成交量 > 20日均量 (突破需要量能配合)
+        if buy_type in ('3buy', 'quasi3buy'):
+            buy_idx = sig['buy_idx']
+            if 'volume' in df.columns and buy_idx >= 20:
+                vol_today = df['volume'].iloc[buy_idx]
+                vol_ma20 = df['volume'].iloc[buy_idx-20:buy_idx].mean()
+                if vol_ma20 > 0 and vol_today < vol_ma20:
+                    continue  # 突破无量, 跳过
+
         filtered.append(sig)
 
     print(f'   过滤后: {len(filtered)} 个信号')
@@ -897,19 +907,17 @@ def run_daily_backtest(codes, params=None, start_date=None):
         entry_date = sig['buy_date']
         buy_type = sig['buy_type']
 
-        # 止损设置
+        # 止损设置 — 按买点类型差异化
         engine_stop = sig.get('stop_loss', 0)
         if buy_type in ('3buy', 'quasi3buy'):
-            # 3买: 止损在买点低点或-10%
+            # 3买: 宽trail(18%), 标准止损(-10%) — 突破信号给空间跑
             candidates = [entry_price * 0.90]
-            if 0 < sig['buy_low'] < entry_price:
-                candidates.append(sig['buy_low'])
             if 0 < engine_stop < entry_price:
                 candidates.append(engine_stop)
-            stop_price = min(candidates)  # 最远的
+            stop_price = min(candidates)
             stop_price = max(stop_price, entry_price * 0.90)
         else:
-            # 1买: 止损在1买低点或-10%
+            # 1买: 标准trail(12%), 标准止损(-10%)
             stop_price = sig['buy_low']
             if stop_price <= 0 or stop_price >= entry_price:
                 stop_price = entry_price * 0.90
@@ -923,7 +931,9 @@ def run_daily_backtest(codes, params=None, start_date=None):
             if s.point_type in ('2sell',) and s.index > entry_idx:
                 sell_dates.add(s.index)
 
-        # 逐日模拟 — 遍历到数据末尾(不是60天限制)
+        # 逐日模拟 — 遍历到数据末尾
+        # 3买用更宽的移动止损(突破信号需要空间), 1买用标准止损
+        sig_trail = 0.18 if buy_type in ('3buy', 'quasi3buy') else trail_pct
         highest = entry_price
         exit_price = None
         exit_date = None
@@ -939,11 +949,15 @@ def run_daily_backtest(codes, params=None, start_date=None):
 
             profit_pct = (price - entry_price) / entry_price
 
+            # 0. 3买保本保护: 盈利>8%后, 止损移到入场价(赢家不变输家)
+            if buy_type in ('3buy', 'quasi3buy') and profit_pct > 0.08:
+                stop_price = max(stop_price, entry_price)
+
             # 1. 止损
             if low <= stop_price:
                 exit_price = stop_price
                 exit_date = date
-                exit_reason = '止损'
+                exit_reason = '保本止损' if stop_price >= entry_price else '止损'
                 break
 
             # 2. 日线2卖
@@ -953,14 +967,14 @@ def run_daily_backtest(codes, params=None, start_date=None):
                 exit_reason = '日线2卖'
                 break
 
-            # 3. 移动止损 (盈利>5%后, 回撤>trail_pct平仓)
+            # 3. 移动止损 (盈利>5%后, 回撤>信号类型对应trail_pct平仓)
             highest = max(highest, high)
             if profit_pct > 0.05:
                 drawdown = (highest - low) / highest
-                if drawdown > trail_pct:
+                if drawdown > sig_trail:
                     exit_price = price
                     exit_date = date
-                    exit_reason = f'移动止损(回撤>{trail_pct*100:.0f}%)'
+                    exit_reason = f'移动止损(回撤>{sig_trail*100:.0f}%)'
                     break
 
             # 4. 时间止损: 持仓超过max_hold_days且未盈利
@@ -1752,6 +1766,63 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
         'params': p,
     }
     return final_trades, metrics
+
+
+# ==================== 兼容层: scan_enhanced_v5 依赖 ====================
+
+def find_daily_1buy_2buy(
+    engine,
+    code: str,
+    df: pd.DataFrame,
+) -> list:
+    """
+    返回日线1买/2买配对信号（兼容层）
+
+    1买信号 → find_daily_buy_signals (3buy/quasi3buy)
+    2买信号 → detect_30min_2buy
+
+    Args:
+        engine: SignalEngine 实例（当前未使用，保留接口）
+        code:   股票代码
+        df:     日线 DataFrame
+
+    Returns:
+        [{'1buy_idx', '1buy_price', '1buy_low', '2buy_idx', '2buy_price', '2buy_low'}, ...]
+    """
+    pairs = []
+
+    buys = find_daily_buy_signals(code, df)
+
+    for buy in buys:
+        idx_1b = buy['buy_idx']
+        if idx_1b >= len(df) - 5:
+            continue
+
+        df_after = df.iloc[idx_1b + 1:]
+        if len(df_after) < 30:
+            continue
+
+        try:
+            result_2b = detect_30min_2buy(df_after, min_confidence=0.5)
+        except Exception:
+            continue
+
+        if not result_2b:
+            continue
+
+        r2 = result_2b[0]
+        abs_2b_idx = idx_1b + 1 + r2['index']
+
+        pairs.append({
+            '1buy_idx': idx_1b,
+            '1buy_price': buy['buy_price'],
+            '1buy_low': buy['buy_low'],
+            '2buy_idx': abs_2b_idx,
+            '2buy_price': r2['price'],
+            '2buy_low': r2.get('stop', r2['price'] * 0.97),
+        })
+
+    return pairs
 
 
 if __name__ == '__main__':
