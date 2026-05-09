@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""CC15 多周期策略回测 V3 — 截断亏损,让利润奔跑
+"""CC15 多周期策略回测 V5 — 四级别联立 (2买版)
 
 规则:
-  入场: 日线2买信号 → 等待30分钟第2个底分型买入
+  入场: 月线定方向 + 周线看结构 + 日线2买 → 30min 2买确认入场
   止损(亏损端):
-    - 日线1买最低点 / -15%硬止损(首次入场)
+    - 日线2买最低点 / ATR动态止损 / -10%硬止损
     - 底背驰最低点(重新入场)
     - 亏损/微利(<5%)仓位: 480 bars时间止损
   减仓(盈利端, 结构确认):
@@ -25,6 +25,12 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 from data.hybrid_source import HybridSource
+from core.kline import KLine
+from core.fractal import FractalDetector
+from core.stroke import StrokeGenerator
+from core.pivot import PivotDetector
+from core.buy_sell_points import BuySellPointDetector
+from indicator.macd import MACD
 
 
 # ============ 30分钟级别缠论组件 (Swing算法, 隔离自core模块) ============
@@ -63,7 +69,7 @@ def _merge_inclusion_30min(high, low):
 
 
 def detect_fractals_30min(df):
-    """30分钟分型检测 — 兼容接口, 返回格式不变
+    """30分钟分型检测 — 使用Core缠论引擎
 
     用于: 找入场底分型 (entry_fractal = bottom_after[1])
     """
@@ -71,48 +77,29 @@ def detect_fractals_30min(df):
     if n < 5:
         return []
 
-    high = df['high'].values.astype(float)
-    low = df['low'].values.astype(float)
-    merged = _merge_inclusion_30min(high, low)
+    from core.kline import KLine
+    from core.fractal import FractalDetector, FractalType
 
-    # 分型检测
+    klines = KLine.from_dataframe(df.reset_index())
+    fd = FractalDetector(klines)
+
     fractals = []
-    for j in range(1, len(merged) - 1):
-        if (merged[j]['high'] > merged[j-1]['high'] and
-                merged[j]['high'] > merged[j+1]['high']):
-            fractals.append({
-                'type': 'top', 'idx': merged[j]['idx'],
-                'val': merged[j]['high'], 'midx': j
-            })
-        elif (merged[j]['low'] < merged[j-1]['low'] and
-              merged[j]['low'] < merged[j+1]['low']):
-            fractals.append({
-                'type': 'bottom', 'idx': merged[j]['idx'],
-                'val': merged[j]['low'], 'midx': j
-            })
-
-    # 顶底交替 + 间距
-    if not fractals:
-        return []
-    filtered = [fractals[0]]
-    for f in fractals[1:]:
-        if f['type'] == filtered[-1]['type']:
-            if f['type'] == 'top' and f['val'] > filtered[-1]['val']:
-                filtered[-1] = f
-            elif f['type'] == 'bottom' and f['val'] < filtered[-1]['val']:
-                filtered[-1] = f
-        else:
-            if f['midx'] - filtered[-1]['midx'] >= 2:
-                filtered.append(f)
-    return filtered
+    for f in fd.fractals:
+        ftype = 'top' if f.type == FractalType.TOP else 'bottom'
+        fractals.append({
+            'type': ftype,
+            'idx': f.index,
+            'val': f.value,
+            'midx': f.index,
+        })
+    return fractals
 
 
 def detect_strokes_30min(df_or_fractals):
-    """Swing算法构建笔 — 对齐TDX缠论
+    """Core缠论笔检测 — 替代Swing算法
 
     Args:
-        df_or_fractals: 可以传df(DataFrame)或fractals(list)
-                        传df时用swing算法, 传fractals时用旧算法(兼容)
+        df_or_fractals: 传df(DataFrame)用Core缠论, 传fractals(list)用兼容逻辑
     Returns:
         list of stroke dicts (格式与旧接口兼容)
     """
@@ -131,98 +118,33 @@ def detect_strokes_30min(df_or_fractals):
             })
         return strokes
 
-    # 新逻辑: Swing算法
+    # Core缠论: 分型→笔
     df = df_or_fractals
     n = len(df)
     if n < 5:
         return []
 
-    high = df['high'].values.astype(float)
-    low = df['low'].values.astype(float)
+    from core.kline import KLine
+    from core.fractal import FractalDetector
+    from core.stroke import StrokeGenerator
 
-    # 包含处理
-    merged = _merge_inclusion_30min(high, low)
+    klines = KLine.from_dataframe(df.reset_index())
+    fd = FractalDetector(klines)
+    sg = StrokeGenerator(klines, fd.fractals)
 
-    # Swing High/Low 检测
-    lookback = 5  # 左右各5根确认, 对齐日线lookback
-    nm = len(merged)
-    swing_points = []  # (merged_idx, 'high'|'low', value, original_idx)
-
-    for i in range(nm):
-        is_hi = True
-        is_lo = True
-        lo = max(0, i - lookback)
-        hi = min(nm - 1, i + lookback)
-        for j in range(lo, hi + 1):
-            if j == i:
-                continue
-            if merged[j]['high'] > merged[i]['high']:
-                is_hi = False
-            if merged[j]['low'] < merged[i]['low']:
-                is_lo = False
-            if not is_hi and not is_lo:
-                break
-        if is_hi:
-            swing_points.append((i, 'high', merged[i]['high'], merged[i]['idx']))
-        elif is_lo:
-            swing_points.append((i, 'low', merged[i]['low'], merged[i]['idx']))
-
-    if len(swing_points) < 2:
-        return []
-
-    # 合并相邻同类型 (保留更极端)
-    sp = [swing_points[0]]
-    for pt in swing_points[1:]:
-        last = sp[-1]
-        if pt[1] != last[1]:
-            sp.append(pt)
-        else:
-            if pt[1] == 'high' and pt[2] > last[2]:
-                sp[-1] = pt
-            elif pt[1] == 'low' and pt[2] < last[2]:
-                sp[-1] = pt
-
-    # 最小间距过滤
-    filtered = [sp[0]]
-    for pt in sp[1:]:
-        if pt[3] - filtered[-1][3] >= 5:
-            filtered.append(pt)
-        else:
-            last = filtered[-1]
-            if pt[1] == last[1]:
-                if pt[1] == 'high' and pt[2] > last[2]:
-                    filtered[-1] = pt
-                elif pt[1] == 'low' and pt[2] < last[2]:
-                    filtered[-1] = pt
-
-    # 确保顶底交替
-    final = [filtered[0]]
-    for pt in filtered[1:]:
-        if pt[1] != final[-1][1]:
-            final.append(pt)
-        else:
-            if pt[1] == 'high' and pt[2] > final[-1][2]:
-                final[-1] = pt
-            elif pt[1] == 'low' and pt[2] < final[-1][2]:
-                final[-1] = pt
-
-    # 构建strokes (格式兼容旧接口)
     strokes = []
-    for i in range(len(final) - 1):
-        start = final[i]
-        end = final[i + 1]
-        if start[1] == 'low' and end[1] == 'high':
-            start_type, end_type = 'bottom', 'top'
-        elif start[1] == 'high' and end[1] == 'low':
-            start_type, end_type = 'top', 'bottom'
-        else:
-            continue
+    for s in sg.strokes:
+        start_type = 'bottom' if s.is_up else 'top'
+        end_type = 'top' if s.is_up else 'bottom'
         strokes.append({
-            'start_idx': start[3], 'end_idx': end[3],
-            'start_type': start_type, 'end_type': end_type,
-            'start_val': start[2], 'end_val': end[2],
-            'high': max(start[2], end[2]),
-            'low': min(start[2], end[2]),
+            'start_idx': s.start_index,
+            'end_idx': s.end_index,
+            'start_type': start_type,
+            'end_type': end_type,
+            'start_val': s.start_value,
+            'end_val': s.end_value,
+            'high': s.high,
+            'low': s.low,
         })
     return strokes
 
@@ -274,8 +196,13 @@ def detect_macd_divergence_30min(df, strokes):
     up_strokes = [s for s in strokes if s['start_type'] == 'bottom' and s['end_type'] == 'top']
 
     # 底背驰: 多笔回溯（最多5笔），指数衰减加权
+    # P0修复: c笔必须包含≥2个次级别中枢，即K线数≥5
     for k in range(1, len(down_strokes)):
         curr = down_strokes[k]
+        # P0修复v2: c笔K线数≥3（1.5小时，平衡严格性与信号量）
+        # c笔K线数过滤：至少3根K线（1.5小时，有效过滤噪音微笔）
+        if curr['end_idx'] - curr['start_idx'] < 2:
+            continue
         curr_area = abs(sum(hist.iloc[curr['start_idx']:curr['end_idx']+1].values))
         is_divergence = False
         for lookback in range(1, min(6, k+1)):
@@ -294,6 +221,8 @@ def detect_macd_divergence_30min(df, strokes):
     # 顶背驰: 同样多笔回溯
     for k in range(1, len(up_strokes)):
         curr = up_strokes[k]
+        if curr['end_idx'] - curr['start_idx'] < 2:
+            continue
         curr_area = abs(sum(hist.iloc[curr['start_idx']:curr['end_idx']+1].values))
         is_divergence = False
         for lookback in range(1, min(6, k+1)):
@@ -310,90 +239,333 @@ def detect_macd_divergence_30min(df, strokes):
     return buy_div, sell_div
 
 
-# ============ 日线级别信号 ============
+# ============ 四级别联立: 月线→周线→日线→30min ============
 
-def run_daily_cc15(data_map):
-    """运行CC15日线引擎, 返回信号和买卖点位置"""
-    sys.path.insert(0, 'chanlun_unified')
-    from signal_engine_cc15 import SignalEngine
-    engine = SignalEngine()
-    signals = engine.generate(data_map, live_mode=False)
-    return engine, signals
+def resample_to_weekly(df_daily):
+    """日线→周线resample"""
+    df = df_daily.copy()
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+    weekly = df.resample('W').agg({
+        'open': 'first', 'high': 'max', 'low': 'min',
+        'close': 'last', 'volume': 'sum'
+    }).dropna()
+    return weekly
 
 
-def find_daily_1buy_2buy(engine, code, df):
-    """找出每只股票的日线1买(底背驰)和2买位置
+def resample_to_monthly(df_daily):
+    """日线→月线resample"""
+    df = df_daily.copy()
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+    monthly = df.resample('ME').agg({
+        'open': 'first', 'high': 'max', 'low': 'min',
+        'close': 'last', 'volume': 'sum'
+    }).dropna()
+    return monthly
+
+
+def check_monthly_direction(df_monthly, signal_date=None):
+    """月线定方向: 价格在MA6上方=多头, 下方=空头, 否则盘整
+
+    Args:
+        df_monthly: 月线DataFrame
+        signal_date: 信号日期(可选), 如果提供则检查该日期时的月线状态
+
+    Returns: 'up' / 'down' / 'range'
+    """
+    if len(df_monthly) < 10:
+        return 'range'
+    close = df_monthly['close']
+    ma6 = close.rolling(6).mean()
+    ma3 = close.rolling(3).mean()
+
+    if signal_date is not None:
+        # 找到signal_date对应的月线位置
+        ts = pd.Timestamp(signal_date)
+        mask = df_monthly.index <= ts
+        if mask.sum() < 10:
+            return 'range'
+        c = close[mask].iloc[-1]
+        m6 = ma6[mask].iloc[-1]
+        m3 = ma3[mask].iloc[-1]
+    else:
+        c = close.iloc[-1]
+        m6 = ma6.iloc[-1]
+        m3 = ma3.iloc[-1]
+
+    if c > m6 and m3 > m6:
+        return 'up'
+    elif c < m6 and m3 < m6:
+        return 'down'
+    else:
+        return 'range'
+
+
+def check_weekly_structure(df_weekly):
+    """周线看结构: 缠论笔方向 + 中枢位置
+
+    Returns: dict with 'stroke_dir', 'has_buy_signal', 'pivot_below'
+    """
+    if len(df_weekly) < 30:
+        return {'stroke_dir': 'unknown', 'has_buy_signal': False, 'pivot_below': False}
+
+    # 用简单笔检测 (swing high/low)
+    n = len(df_weekly)
+    high = df_weekly['high'].values
+    low = df_weekly['low'].values
+    close = df_weekly['close'].values
+
+    # Swing检测: lookback=3
+    swing_points = []
+    for i in range(3, n - 3):
+        is_high = all(high[i] >= high[j] for j in range(i-3, i+4) if j != i)
+        is_low = all(low[i] <= low[j] for j in range(i-3, i+4) if j != i)
+        if is_high:
+            swing_points.append(('high', i, high[i]))
+        elif is_low:
+            swing_points.append(('low', i, low[i]))
+
+    # 交替合并
+    if len(swing_points) < 2:
+        return {'stroke_dir': 'unknown', 'has_buy_signal': False, 'pivot_below': False}
+
+    merged = [swing_points[0]]
+    for pt in swing_points[1:]:
+        last = merged[-1]
+        if pt[0] != last[0]:
+            merged.append(pt)
+        else:
+            if pt[0] == 'high' and pt[2] > last[2]:
+                merged[-1] = pt
+            elif pt[0] == 'low' and pt[2] < last[2]:
+                merged[-1] = pt
+
+    # 最近笔方向
+    if len(merged) >= 2:
+        last_pt = merged[-1]
+        if last_pt[0] == 'high':
+            stroke_dir = 'down'  # 到顶了, 向下笔
+        else:
+            stroke_dir = 'up'  # 到底了, 向上笔
+    else:
+        stroke_dir = 'unknown'
+
+    # 简单中枢检测: 最近3笔
+    strokes = []
+    for i in range(len(merged) - 1):
+        p1, p2 = merged[i], merged[i+1]
+        if p1[0] == 'low' and p2[0] == 'high':
+            strokes.append({'high': p2[2], 'low': p1[2]})
+        elif p1[0] == 'high' and p2[0] == 'low':
+            strokes.append({'high': p1[2], 'low': p2[2]})
+
+    has_buy_signal = False
+    if len(strokes) >= 3:
+        # 最近中枢
+        s1, s2, s3 = strokes[-3], strokes[-2], strokes[-1]
+        zg = min(s1['high'], s2['high'], s3['high'])
+        zd = max(s1['low'], s2['low'], s3['low'])
+        if zg > zd:
+            c = close[-1]
+            # 价格在中枢下方或刚突破 = 买点区域
+            has_buy_signal = c <= zg * 1.02
+
+    return {
+        'stroke_dir': stroke_dir,
+        'has_buy_signal': has_buy_signal,
+        'last_swing': merged[-2:] if len(merged) >= 2 else merged,
+        'n_swing': len(merged),
+    }
+
+
+def detect_30min_2buy(df_30, window_start=None):
+    """在30min上运行核心缠论管线，检测2买信号 (BuySellPointDetector)
+
+    Args:
+        df_30: 30分钟DataFrame
+        window_start: 可选, 只处理此日期之后的数据(加速)
+
+    接受: 2buy, 2buy_strong, class2buy, 2b3bbuy
 
     Returns: list of {
-        '1buy_idx': int, '1buy_price': float, '1buy_low': float,
-        '2buy_idx': int, '2buy_price': float
+        'entry_idx': int,  'entry_price': float,
+        'stop_price': float,  '1buy_low': float,
+        'date': datetime, 'confidence': float, 'point_type': str
+    }
+    """
+    # 裁剪数据窗口以加速 (保留足够的前置数据用于缠论分析)
+    if window_start is not None:
+        ts = pd.Timestamp(window_start)
+        # 保留信号前200根bar (约2个月) 用于上下文
+        start_mask = df_30.index < ts
+        if start_mask.sum() > 200:
+            cutoff = start_mask.sum() - 200
+            df_30 = df_30.iloc[cutoff:]
+        elif len(df_30) > 800:
+            df_30 = df_30.iloc[-800:]
+
+    n = len(df_30)
+    if n < 60:
+        return []
+
+    try:
+        k30 = KLine.from_dataframe(df_30, strict_mode=False)
+        closes_30 = [k.close for k in k30.processed_data]
+        highs_30 = [k.high for k in k30.processed_data]
+        lows_30 = [k.low for k in k30.processed_data]
+        f30 = FractalDetector(k30, confirm_required=False).get_fractals()
+        if len(f30) < 4:
+            return []
+        s30 = StrokeGenerator(k30, f30, min_bars=3).get_strokes()
+        if len(s30) < 3:
+            return []
+        p30 = PivotDetector(k30, s30).get_pivots()
+        if not p30:
+            return []
+        m30 = MACD(pd.Series(df_30['close'].values))
+        d30 = BuySellPointDetector(f30, s30, [], p30, macd=m30,
+                                    closes=closes_30, highs=highs_30, lows=lows_30)
+        buys_30, _ = d30.detect_all()
+    except Exception:
+        return []
+
+    # 去重: 同index保留最高confidence
+    seen = {}
+    for b in buys_30:
+        if b.index not in seen or b.confidence > seen[b.index].confidence:
+            seen[b.index] = b
+
+    # 筛选2买类型
+    buy2_types = ('2buy', '2buy_strong', 'class2buy', '2b3bbuy')
+    results = []
+    for b in seen.values():
+        if b.point_type not in buy2_types:
+            continue
+        idx = b.index
+        if idx < 5 or idx >= n:
+            continue
+
+        entry_price = df_30['close'].iloc[idx]
+        stop = b.stop_loss if b.stop_loss > 0 else entry_price * 0.92
+        if stop >= entry_price:
+            stop = entry_price * 0.92
+
+        results.append({
+            'entry_idx': idx,
+            'entry_price': entry_price,
+            'stop_price': stop,
+            '1buy_low': stop,
+            'date': df_30.index[idx],
+            'confidence': b.confidence,
+            'point_type': b.point_type,
+            'reason': b.reason,
+        })
+
+    results.sort(key=lambda x: x['entry_idx'])
+    return results
+
+
+# ============ 日线级别信号 (核心缠论引擎) ============
+
+
+def find_daily_buy_signals(code, df, buys_cache=None):
+    """找日线级别1买信号 — 使用核心缠论引擎
+
+    V5: 回归1买策略 + 更严格的过滤
+
+    Args:
+        buys_cache: 如果提供, 使用缓存的(buys, sells)避免重复运行管线
+
+    Returns: list of {
+        'buy_idx': int, 'buy_price': float, 'buy_low': float,
+        'buy_date': datetime, 'buy_type': str, 'confidence': float
     }
     """
     n = len(df)
     if n < 120:
         return []
 
-    close = df['close']
-    high = df['high']
-    low = df['low']
+    try:
+        if buys_cache is not None:
+            buys, _ = buys_cache
+        else:
+            buys, _ = run_core_chanlun(df)
+    except Exception:
+        return []
 
-    # 检测笔
-    bi_buy, bi_sell, filtered_fractals, strokes = engine._detect_bi_deterministic(df)
+    # 去重: 同index保留最高confidence
+    seen = {}
+    for b in buys:
+        if b.index not in seen or b.confidence > seen[b.index].confidence:
+            seen[b.index] = b
 
-    # MACD
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    dif = ema12 - ema26
-    dea = dif.ewm(span=9, adjust=False).mean()
-    hist = 2 * (dif - dea)
+    kl = KLine.from_dataframe(df, strict_mode=False)
+    lows = [k.low for k in kl.processed_data]
 
-    # 底背驰(1买)
-    buy_div_set, sell_div_set, _, _ = engine._compute_area_divergence(strokes, hist, n)
-
-    # 2买
-    buy_2buy_set = engine._detect_2buy(strokes, buy_div_set, n)
-
-    # 构建1买信息: {idx: {'low': float, 'price': float}}
-    buy1_info = {}
-    for idx in buy_div_set:
-        if 0 <= idx < n:
-            # 找这个1买对应的下跌笔的最低点
-            buy1_info[idx] = {
-                'low': low.iloc[idx],
-                'price': close.iloc[idx],
-            }
-
-    # 构建2买信息, 关联到前面的1买
     results = []
-    # 找每个2买前面最近的1买
-    sorted_1buy = sorted(buy1_info.keys())
-
-    down_strokes = [s for s in strokes if s['start_type'] == 'top' and s['end_type'] == 'bottom']
-    up_strokes = [s for s in strokes if s['start_type'] == 'bottom' and s['end_type'] == 'top']
-
-    for idx_2buy in sorted(buy_2buy_set):
-        if idx_2buy >= n:
+    for b in seen.values():
+        if b.point_type not in ('3buy', 'quasi3buy'):
             continue
-        # 找前面最近的1买
-        prev_1buys = [i for i in sorted_1buy if i < idx_2buy]
-        if not prev_1buys:
+        idx = b.index
+        if idx < 50 or idx >= n:
             continue
-        idx_1buy = prev_1buys[-1]
+        if b.confidence < 0.5:
+            continue
+        # 3买止损: 中枢ZG (回踩不应进入中枢)
+        lookback = max(0, idx - 30)
+        local_lows = lows[lookback:idx + 1] if idx + 1 <= len(lows) else lows[lookback:]
+        buy_low = min(local_lows) if local_lows else df['low'].iloc[idx]
 
         results.append({
-            '1buy_idx': idx_1buy,
-            '1buy_price': buy1_info[idx_1buy]['price'],
-            '1buy_low': buy1_info[idx_1buy]['low'],
-            '2buy_idx': idx_2buy,
-            '2buy_price': close.iloc[idx_2buy],
-            '2buy_date': df.index[idx_2buy],
+            'buy_idx': idx,
+            'buy_price': b.price,
+            'buy_low': buy_low,
+            'buy_date': df.index[idx],
+            'buy_type': b.point_type,
+            'confidence': b.confidence,
+            'stop_loss': b.stop_loss,
+            'reason': b.reason,
         })
 
+    results.sort(key=lambda x: x['buy_idx'])
     return results
 
 
-def find_daily_2sell(engine, code, df):
-    """找出日线2卖位置 (类比2买的镜像: 顶背驰后回调不创新高的卖点)
+def run_core_chanlun(df):
+    """运行一次完整核心缠论管线, 返回(buys, sells)信号列表
+
+    避免重复运行管线 (每只股票只跑一次)
+    """
+    n = len(df)
+    if n < 120:
+        return [], []
+
+    kl = KLine.from_dataframe(df, strict_mode=False)
+    closes = [k.close for k in kl.processed_data]
+    lows = [k.low for k in kl.processed_data]
+    highs = [k.high for k in kl.processed_data]
+    fr = FractalDetector(kl, confirm_required=False).get_fractals()
+    if len(fr) < 4:
+        return [], []
+    st = StrokeGenerator(kl, fr, min_bars=3).get_strokes()
+    if len(st) < 3:
+        return [], []
+    pv = PivotDetector(kl, st).get_pivots()
+    if not pv:
+        return [], []
+    mc = MACD(pd.Series(df['close'].values))
+    det = BuySellPointDetector(fr, st, [], pv, macd=mc,
+                                closes=closes, highs=highs, lows=lows)
+    buys, sells = det.detect_all()
+    return buys, sells
+
+
+def find_daily_2sell(code, df, sells_cache=None):
+    """找出日线2卖位置 — 使用核心缠论引擎
+
+    Args:
+        sells_cache: 如果提供, 使用缓存的(buys, sells)避免重复运行管线
 
     Returns: set of idx where 2-sell occurs
     """
@@ -401,40 +573,18 @@ def find_daily_2sell(engine, code, df):
     if n < 120:
         return set()
 
-    close = df['close']
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    dif = ema12 - ema26
-    dea = dif.ewm(span=9, adjust=False).mean()
-    hist = 2 * (dif - dea)
+    try:
+        if sells_cache is not None:
+            _, sells = sells_cache
+        else:
+            _, sells = run_core_chanlun(df)
+    except Exception:
+        return set()
 
-    bi_buy, bi_sell, filtered_fractals, strokes = engine._detect_bi_deterministic(df)
-
-    # 顶背驰(1卖)
-    _, sell_div_set, _, _ = engine._compute_area_divergence(strokes, hist, n)
-
-    # 2卖: 1卖之后, 上涨笔高点不超过1卖前的高点
-    up_strokes = [s for s in strokes if s['start_type'] == 'bottom' and s['end_type'] == 'top']
     sell_2sell = set()
-
-    for idx_1sell in sell_div_set:
-        if idx_1sell >= n:
-            continue
-        # 找包含1卖的上涨笔
-        sell_up = None
-        for s in up_strokes:
-            if s['end_idx'] == idx_1sell or (s['start_idx'] <= idx_1sell <= s['end_idx']):
-                sell_up = s
-                break
-        if sell_up is None:
-            continue
-
-        sell_high = sell_up['end_val']  # 1卖时上涨笔的高点
-
-        # 找1卖之后所有上涨笔, 高点不超过sell_high → 2卖
-        for s in up_strokes:
-            if s['start_idx'] > idx_1sell and s['end_val'] < sell_high:
-                sell_2sell.add(s['end_idx'])
+    for s in sells:
+        if s.point_type in ('2sell',) and 0 <= s.index < n:
+            sell_2sell.add(s.index)
 
     return sell_2sell
 
@@ -511,6 +661,10 @@ def detect_daily_buy_divergence(df):
         prev_low = low.iloc[prev_low_idx]
         curr_low = low.iloc[curr_low_idx]
 
+        # P0修复v2: c段(当前段)必须包含≥3个交易日K线（1.5天）
+        if curr_end - curr_start < 2:
+            continue
+
         if curr_low < prev_low and curr_area < prev_area * 0.8:  # 面积缩小20%以上
             div_points.append({
                 'idx': curr_low_idx,
@@ -561,83 +715,7 @@ def _build_pivots_from_strokes(strokes):
     return pivots
 
 
-def find_daily_1buy_2buy(engine, code, df):
-    """找出每只股票的日线1买(底背驰)和2买位置
 
-    Returns: list of {
-        '1buy_idx': int, '1buy_price': float, '1buy_low': float,
-        '2buy_idx': int, '2buy_price': float,
-        'trend_type': str, 'trend_strength': float
-    }
-    """
-    n = len(df)
-    if n < 120:
-        return []
-
-    close = df['close']
-    high = df['high']
-    low = df['low']
-
-    # 检测笔
-    bi_buy, bi_sell, filtered_fractals, strokes = engine._detect_bi_deterministic(df)
-
-    # MACD
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    dif = ema12 - ema26
-    dea = dif.ewm(span=9, adjust=False).mean()
-    hist = 2 * (dif - dea)
-
-    # 底背驰(1买)
-    buy_div_set, sell_div_set, _, _ = engine._compute_area_divergence(strokes, hist, n)
-
-    # 2买
-    buy_2buy_set = engine._detect_2buy(strokes, buy_div_set, n)
-
-    # 构建1买信息: {idx: {'low': float, 'price': float}}
-    buy1_info = {}
-    for idx in buy_div_set:
-        if 0 <= idx < n:
-            buy1_info[idx] = {
-                'low': low.iloc[idx],
-                'price': close.iloc[idx],
-            }
-
-    # 走势类型分类
-    trend_type_val = ''
-    trend_strength_val = 0.0
-    if len(strokes) >= 6:
-        pivots_2buy = _build_pivots_from_strokes(strokes)
-        if len(pivots_2buy) >= 2:
-            from core.trend_type import classify_trend_type
-            tr = classify_trend_type(pivots_2buy)
-            trend_type_val = tr.current_type.value
-            trend_strength_val = round(tr.trend_strength, 3)
-
-    # 构建2买信息, 关联到前面的1买
-    results = []
-    sorted_1buy = sorted(buy1_info.keys())
-
-    for idx_2buy in sorted(buy_2buy_set):
-        if idx_2buy >= n:
-            continue
-        prev_1buys = [i for i in sorted_1buy if i < idx_2buy]
-        if not prev_1buys:
-            continue
-        idx_1buy = prev_1buys[-1]
-
-        results.append({
-            '1buy_idx': idx_1buy,
-            '1buy_price': buy1_info[idx_1buy]['price'],
-            '1buy_low': buy1_info[idx_1buy]['low'],
-            '2buy_idx': idx_2buy,
-            '2buy_price': close.iloc[idx_2buy],
-            '2buy_date': df.index[idx_2buy],
-            'trend_type': trend_type_val,
-            'trend_strength': trend_strength_val,
-        })
-
-    return results
 
 
 # ============ 多周期回测主逻辑 ============
@@ -676,6 +754,391 @@ def fetch_sina_30min(symbol, datalen=2000):
         return pd.DataFrame()
 
 
+def run_daily_backtest(codes, params=None, start_date=None):
+    """纯日线级别回测 — 覆盖完整数据周期(4+年)
+
+    策略: 月线方向 + 周线结构 + 日线买点 → 日线级别出场
+    不依赖30分钟数据, 样本量更大, 统计意义更强
+    """
+    p = params or {}
+    max_positions = p.get('max_positions', 5)
+    trail_pct = p.get('trail_pct', 0.12)  # 移动止损回撤%
+    max_hold_days = p.get('max_hold_days', 60)  # 最大持仓天数
+
+    hs = HybridSource()
+    print(f'=== 纯日线回测 V5 (月线+周线+日线) ===')
+    print(f'规则: 月线方向 + 周线结构 + 日线1买/3买 → 日线出场')
+    print(f'出场: 结构止损 + 移动止损 + 日线2卖 + 时间止损')
+    print()
+
+    # 加载日线数据
+    print('[1] 加载日线数据...')
+    daily_map = {}
+    for code in codes:
+        df = hs.get_kline(code, period='daily')
+        if start_date and isinstance(df.index, pd.DatetimeIndex):
+            df = df[df.index >= pd.Timestamp(start_date)]
+        if len(df) >= 200:
+            daily_map[code] = df
+    print(f'   日线: {len(daily_map)} 只')
+
+    # 识别买点信号
+    print('[2] 识别日线买点信号...')
+    all_signals = []
+    daily_cache = {}
+    for code in daily_map:
+        try:
+            cache = run_core_chanlun(daily_map[code])
+            daily_cache[code] = cache
+        except Exception:
+            daily_cache[code] = ([], [])
+
+        buys, _ = cache if code in daily_cache else ([], [])
+        sells_cache = daily_cache.get(code, ([], []))
+
+        # 去重
+        seen = {}
+        for b in buys:
+            if b.index not in seen or b.confidence > seen[b.index].confidence:
+                seen[b.index] = b
+
+        kl = KLine.from_dataframe(daily_map[code], strict_mode=False)
+        lows = [k.low for k in kl.processed_data]
+
+        for b in seen.values():
+            if b.point_type not in ('1buy', '3buy', 'quasi3buy'):
+                continue
+            if b.confidence < 0.6:
+                continue
+            idx = b.index
+            if idx < 50 or idx >= len(daily_map[code]):
+                continue
+            lookback = max(0, idx - 20)
+            local_lows = lows[lookback:idx + 1] if idx + 1 <= len(lows) else lows[lookback:]
+            buy_low = min(local_lows) if local_lows else daily_map[code]['low'].iloc[idx]
+
+            all_signals.append({
+                'code': code,
+                'buy_idx': idx,
+                'buy_price': b.price,
+                'buy_low': buy_low,
+                'buy_date': daily_map[code].index[idx],
+                'buy_type': b.point_type,
+                'confidence': b.confidence,
+                'stop_loss': b.stop_loss,
+                'reason': b.reason,
+            })
+
+    # 去重
+    dedup = {}
+    for s in all_signals:
+        key = (s['code'], s['buy_date'])
+        if key not in dedup or s['confidence'] > dedup[key]['confidence']:
+            dedup[key] = s
+    all_signals = list(dedup.values())
+    type_counts = {}
+    for s in all_signals:
+        t = s['buy_type']
+        type_counts[t] = type_counts.get(t, 0) + 1
+    print(f'   找到 {len(all_signals)} 个信号: {type_counts}')
+
+    # 月线+周线+市场环境过滤
+    print('[3] 月线+周线+市场环境过滤...')
+
+    # 市场环境
+    market_env = None
+    try:
+        from indicator.market_environment import MarketEnvironment
+        market_env = MarketEnvironment()
+        if not market_env.records:
+            market_env = None
+    except Exception:
+        market_env = None
+
+    filtered = []
+    for sig in all_signals:
+        code = sig['code']
+        df = daily_map[code]
+        buy_date = sig['buy_date']
+
+        # 月线方向
+        df_monthly = resample_to_monthly(df)
+        month_dir = check_monthly_direction(df_monthly, signal_date=buy_date)
+        if month_dir == 'down':
+            continue
+
+        # 周线结构
+        df_weekly = resample_to_weekly(df)
+        weekly_struct = check_weekly_structure(df_weekly)
+        if weekly_struct['stroke_dir'] == 'down' and not weekly_struct['has_buy_signal']:
+            continue
+
+        # 市场环境
+        if market_env is not None:
+            d = str(buy_date)[:10].replace('-', '')
+            if len(d) == 8:
+                state = market_env.get_state_for_date(d)
+                if state == 'BEAR':
+                    continue
+
+        filtered.append(sig)
+
+    print(f'   过滤后: {len(filtered)} 个信号')
+
+    # 日线级别逐bar交易模拟
+    print('[4] 日线交易模拟...')
+    trades = []
+
+    for sig in filtered:
+        code = sig['code']
+        df = daily_map[code]
+        entry_idx = sig['buy_idx']
+        entry_price = sig['buy_price']
+        entry_date = sig['buy_date']
+        buy_type = sig['buy_type']
+
+        # 止损设置
+        engine_stop = sig.get('stop_loss', 0)
+        if buy_type in ('3buy', 'quasi3buy'):
+            # 3买: 止损在买点低点或-10%
+            candidates = [entry_price * 0.90]
+            if 0 < sig['buy_low'] < entry_price:
+                candidates.append(sig['buy_low'])
+            if 0 < engine_stop < entry_price:
+                candidates.append(engine_stop)
+            stop_price = min(candidates)  # 最远的
+            stop_price = max(stop_price, entry_price * 0.90)
+        else:
+            # 1买: 止损在1买低点或-10%
+            stop_price = sig['buy_low']
+            if stop_price <= 0 or stop_price >= entry_price:
+                stop_price = entry_price * 0.90
+            stop_price = max(stop_price, entry_price * 0.90)
+
+        # 找日线2卖信号
+        sells_cache = daily_cache.get(code, ([], []))
+        _, sells = sells_cache
+        sell_dates = set()
+        for s in sells:
+            if s.point_type in ('2sell',) and s.index > entry_idx:
+                sell_dates.add(s.index)
+
+        # 逐日模拟 — 遍历到数据末尾(不是60天限制)
+        highest = entry_price
+        exit_price = None
+        exit_date = None
+        exit_reason = ''
+        n = len(df)
+
+        for i in range(entry_idx + 1, n):
+            price = df['close'].iloc[i]
+            low = df['low'].iloc[i]
+            high = df['high'].iloc[i]
+            date = df.index[i]
+            days_held = i - entry_idx
+
+            profit_pct = (price - entry_price) / entry_price
+
+            # 1. 止损
+            if low <= stop_price:
+                exit_price = stop_price
+                exit_date = date
+                exit_reason = '止损'
+                break
+
+            # 2. 日线2卖
+            if i in sell_dates:
+                exit_price = price
+                exit_date = date
+                exit_reason = '日线2卖'
+                break
+
+            # 3. 移动止损 (盈利>5%后, 回撤>trail_pct平仓)
+            highest = max(highest, high)
+            if profit_pct > 0.05:
+                drawdown = (highest - low) / highest
+                if drawdown > trail_pct:
+                    exit_price = price
+                    exit_date = date
+                    exit_reason = f'移动止损(回撤>{trail_pct*100:.0f}%)'
+                    break
+
+            # 4. 时间止损: 持仓超过max_hold_days且未盈利
+            if days_held >= max_hold_days and profit_pct < 0.05:
+                exit_price = price
+                exit_date = date
+                exit_reason = '时间止损'
+                break
+
+            # 5. 安全止损: 持仓超过120天, 从高点回撤>20%
+            if days_held > 120 and profit_pct > 0.05:
+                drawdown = (highest - low) / highest
+                if drawdown > 0.20:
+                    exit_price = price
+                    exit_date = date
+                    exit_reason = '安全止损(回撤>20%)'
+                    break
+
+        if exit_price is None:
+            # 理论上不应到这里, 但安全起见
+            exit_price = df['close'].iloc[-1]
+            exit_date = df.index[-1]
+            exit_reason = '数据截止'
+
+        ret = (exit_price - entry_price) / entry_price
+        trades.append({
+            'code': code,
+            'entry_date': entry_date,
+            'entry_price': entry_price,
+            'stop_price': stop_price,
+            'exit_date': exit_date,
+            'exit_price': exit_price,
+            'exit_reason': exit_reason,
+            'return': ret,
+            'buy_type': buy_type,
+            'confidence': sig['confidence'],
+            'hold_days': (exit_date - entry_date).days if hasattr(exit_date, '__sub__') else 0,
+        })
+
+    # 去重: 同一股票同一入场日
+    dedup = {}
+    for t in trades:
+        key = (t['code'], t['entry_date'].strftime('%Y-%m-%d') if hasattr(t['entry_date'], 'strftime') else str(t['entry_date'])[:10])
+        if key not in dedup or t['return'] > dedup[key]['return']:
+            dedup[key] = t
+    trades = list(dedup.values())
+
+    # 组合模拟 — 风险感知仓位管理
+    trades.sort(key=lambda x: x['entry_date'])
+    open_pos = {}
+    capital = 1_000_000
+    peak_capital = 1_000_000
+    equity = []
+    closed = []
+    max_dd_threshold = 0.25  # 回撤超25%停止开仓
+
+    for t in trades:
+        # 平到期仓位
+        expired = [c for c, p in open_pos.items() if p['trade']['exit_date'] <= t['entry_date']]
+        for c in expired:
+            pos = open_pos.pop(c)
+            alloc = pos['alloc']
+            pnl = alloc * pos['trade']['return']
+            capital += alloc + pnl
+            pos['trade']['pnl'] = pnl
+            closed.append(pos['trade'])
+            equity.append((pos['trade']['exit_date'], capital))
+            peak_capital = max(peak_capital, capital)
+
+        if t['code'] in open_pos or len(open_pos) >= max_positions:
+            continue
+
+        # 回撤控制: 当前回撤超阈值时不开新仓
+        current_dd = (capital - peak_capital) / peak_capital
+        if current_dd < -max_dd_threshold:
+            continue
+
+        # 仓位: 基于置信度调整 (conf 0.6=60%, 0.8=80%, 1.0=100%)
+        conf = t.get('confidence', 0.7)
+        base_alloc = capital / max_positions
+        alloc = base_alloc * min(conf / 0.8, 1.0)
+        alloc = max(alloc, base_alloc * 0.5)  # 至少半仓
+
+        capital -= alloc
+        open_pos[t['code']] = {'trade': t, 'alloc': alloc}
+
+    # 平剩余
+    for c, pos in open_pos.items():
+        alloc = pos['alloc']
+        pnl = alloc * pos['trade']['return']
+        capital += alloc + pnl
+        pos['trade']['pnl'] = pnl
+        closed.append(pos['trade'])
+        equity.append((pos['trade']['exit_date'], capital))
+
+    final = closed
+
+    # 统计
+    returns = [t['return'] for t in final]
+    wins = [t for t in final if t['return'] > 0]
+    losses = [t for t in final if t['return'] <= 0]
+    win_rate = len(wins) / len(final) if final else 0
+    total_return = (capital - 1_000_000) / 1_000_000
+    avg_win = np.mean([t['return'] for t in wins]) if wins else 0
+    avg_loss = abs(np.mean([t['return'] for t in losses])) if losses else 0.01
+    profit_factor = avg_win / avg_loss if avg_loss > 0 else 0
+
+    if len(equity) >= 2:
+        eq_arr = np.array([e[1] for e in equity])
+        peak = np.maximum.accumulate(eq_arr)
+        dd = (eq_arr - peak) / peak
+        max_dd = dd.min()
+        daily_ret = np.diff(eq_arr) / eq_arr[:-1]
+        sharpe = np.mean(daily_ret) / np.std(daily_ret) * np.sqrt(252) if np.std(daily_ret) > 0 else 0
+    else:
+        max_dd = 0
+        sharpe = 0
+
+    # 退出原因
+    reasons = {}
+    for t in final:
+        r = t['exit_reason']
+        reasons[r] = reasons.get(r, 0) + 1
+
+    # 按买点类型统计
+    type_stats = {}
+    for t in final:
+        bt = t.get('buy_type', '?')
+        if bt not in type_stats:
+            type_stats[bt] = {'n': 0, 'wins': 0, 'ret_sum': 0}
+        type_stats[bt]['n'] += 1
+        if t['return'] > 0:
+            type_stats[bt]['wins'] += 1
+        type_stats[bt]['ret_sum'] += t['return']
+
+    print()
+    print('=' * 60)
+    print(f'纯日线回测 ({len(final)}笔, 最多{max_positions}只)')
+    print('=' * 60)
+    print(f'总收益:     {total_return*100:+.2f}%')
+    print(f'最终权益:   {capital:,.0f}')
+    print(f'最大回撤:   {max_dd*100:.2f}%')
+    print(f'Sharpe:     {sharpe:.2f}')
+    print(f'盈亏比:     {profit_factor:.2f}')
+    print(f'胜率:       {win_rate*100:.1f}% ({len(wins)}/{len(final)})')
+    print(f'平均收益:   {np.mean(returns)*100:.2f}%')
+    print(f'盈利均值:   {avg_win*100:.2f}%')
+    print(f'亏损均值:   {-avg_loss*100:.2f}%')
+    if returns:
+        print(f'最大单笔盈: {max(returns)*100:.2f}%')
+        print(f'最大单笔亏: {min(returns)*100:.2f}%')
+    print()
+    print('买点类型统计:')
+    for bt, st in sorted(type_stats.items()):
+        wr = st['wins'] / st['n'] * 100 if st['n'] > 0 else 0
+        avg_r = st['ret_sum'] / st['n'] * 100 if st['n'] > 0 else 0
+        print(f'  {bt}: {st["n"]}笔, 胜率{wr:.0f}%, 平均{avg_r:+.1f}%')
+    print()
+    print('退出原因:')
+    for r, c in sorted(reasons.items(), key=lambda x: -x[1]):
+        print(f'  {r}: {c}笔')
+    print()
+    print('=== 交易明细 ===')
+    for t in final:
+        pnl_str = f' PnL={t.get("pnl", 0):+,.0f}' if t.get('pnl') else ''
+        print(f'  {t["code"]} {t["buy_type"]} {t["entry_date"].strftime("%Y-%m-%d")}'
+              f' 入:{t["entry_price"]:.2f} 出:{t["exit_price"]:.2f} {t["return"]*100:+.2f}%'
+              f' {t["exit_reason"]} ({t.get("hold_days", "?")}天){pnl_str}')
+
+    return final, {
+        'total_return': total_return, 'max_drawdown': max_dd,
+        'sharpe': sharpe, 'profit_factor': profit_factor,
+        'win_rate': win_rate, 'n_trades': len(final),
+        'avg_return': np.mean(returns) if returns else 0,
+        'avg_win': avg_win, 'avg_loss': avg_loss,
+    }
+
+
 def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
                      params=None, verbose=True):
     # Strategy parameters (defaults = current best)
@@ -688,8 +1151,9 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
 
     hs = HybridSource()
 
-    print(f'=== CC15 多周期策略回测 V3 (结构确认 + 让利润奔跑) ===')
-    print(f'规则: 日线2买 → 30min第2底分型入场 → 中枢结构确认减仓 → 盈利不加时间止损')
+    print(f'=== CC15 四级别联立回测 V5 (月线→周线→日线3买→30min) ===')
+    print(f'规则: 月线方向 + 周线结构 + 日线3买(趋势跟随) → 30min 2买确认')
+    print(f'引擎: 核心缠论引擎 (BuySellPointDetector)')
     print()
 
     # 加载日线数据
@@ -701,65 +1165,86 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
             daily_map[code] = df
     print(f'   日线: {len(daily_map)} 只')
 
-    # 运行CC15日线引擎
-    print('[2] 运行CC15日线引擎...')
-    engine, daily_signals = run_daily_cc15(daily_map)
-
-    # 找日线1买/2买
-    print('[3] 识别日线1买/2买 + 2卖...')
-    all_2buys = []
-    daily_2sell_map = {}   # code -> set of 2-sell idx
+    # 找日线3买信号 (使用核心缠论引擎, 每只股票只跑一次管线)
+    print('[2] 识别日线3买信号 (核心缠论引擎)...')
+    all_buys = []
+    daily_2sell_map = {}
+    daily_cache = {}  # code -> (buys, sells)
     for code in daily_map:
-        pairs = find_daily_1buy_2buy(engine, code, daily_map[code])
-        for p in pairs:
-            p['code'] = code
-            all_2buys.append(p)
-        daily_2sell_map[code] = find_daily_2sell(engine, code, daily_map[code])
-    print(f'   找到 {len(all_2buys)} 个日线2买信号')
+        try:
+            cache = run_core_chanlun(daily_map[code])
+            daily_cache[code] = cache
+        except Exception:
+            daily_cache[code] = ([], [])
+        signals = find_daily_buy_signals(code, daily_map[code], buys_cache=daily_cache[code])
+        for s in signals:
+            s['code'] = code
+            all_buys.append(s)
+        daily_2sell_map[code] = find_daily_2sell(code, daily_map[code], sells_cache=daily_cache[code])
 
-    # 去重: 同一只股票同一2买日只保留一个
+    type_counts = {}
+    for s in all_buys:
+        t = s['buy_type']
+        type_counts[t] = type_counts.get(t, 0) + 1
+    print(f'   找到 {len(all_buys)} 个日线买点信号: {type_counts}')
+
+    # 去重: 同一只股票同一买点日只保留一个
     seen = set()
-    unique_2buys = []
-    for item in all_2buys:
-        key = (item['code'], str(item.get('2buy_date', '')))
+    unique_buys = []
+    for item in all_buys:
+        key = (item['code'], str(item.get('buy_date', '')))
         if key not in seen:
             seen.add(key)
-            unique_2buys.append(item)
-    all_2buys = unique_2buys
-    print(f'   去重后: {len(all_2buys)} 个')
+            unique_buys.append(item)
+    all_buys = unique_buys
+    print(f'   去重后: {len(all_buys)} 个')
 
-    # 加载30分钟数据(新浪源, ~1年)
-    print('[4] 加载30分钟数据(新浪, ~2000 bars/只)...')
+    # 加载30分钟数据: 优先Sina(覆盖1年), TDX补充
+    print('[3] 加载30分钟数据(Sina优先)...')
     min30_map = {}
+    n_sina = 0
+    n_tdx = 0
     for code in codes:
-        df_30 = fetch_sina_30min(code)
-        if len(df_30) >= 100:
-            min30_map[code] = df_30
-            print(f'   {code}: {len(df_30)} bars ({df_30.index[0].strftime("%Y-%m-%d")} ~ {df_30.index[-1].strftime("%Y-%m-%d")})')
-    print(f'   30分钟数据: {len(min30_map)} 只')
+        # 优先用Sina (覆盖约1年, 2000 bars, 真实数据)
+        df_sina = fetch_sina_30min(code)
+        if df_sina is not None and len(df_sina) >= 200:
+            min30_map[code] = df_sina
+            n_sina += 1
+            continue
+        # Fallback: TDX (少数股票有更长的真实数据)
+        df_30 = hs.get_kline(code, period='30min')
+        if df_30 is not None and len(df_30) >= 100:
+            valid_mask = df_30.index.year >= 2020
+            df_30_clean = df_30[valid_mask]
+            if len(df_30_clean) >= 200:
+                min30_map[code] = df_30_clean
+                n_tdx += 1
+    print(f'   30分钟数据: {len(min30_map)} 只 (Sina={n_sina}, TDX={n_tdx})')
 
-    print('[5] 匹配交易...')
+    print('[4] 匹配交易...')
     trades = []
 
-    # 市场环境过滤: 仅在明确熊市(MA20<MA60)时过滤
-    print('   加载市场环境(上证指数)...')
-    market_bearish_dates = None
+    # 市场环境过滤: 使用TDX本地数据 (MA250+斜率+动量)
+    print('   加载市场环境(上证指数TDX本地)...')
+    market_env = None
+    market_signal_weights = None
     try:
-        import akshare as ak
-        idx_df = ak.stock_zh_index_daily(symbol="sh000001")
-        idx_df['date'] = pd.to_datetime(idx_df['date'])
-        idx_df = idx_df.set_index('date').sort_index()
-        idx_df['ma20'] = idx_df['close'].rolling(20).mean()
-        idx_df['ma60'] = idx_df['close'].rolling(60).mean()
-        # MA20 < MA60 = 明确熊市, 禁止入场
-        market_bearish_dates = set(
-            idx_df[idx_df['ma20'] < idx_df['ma60']].index.strftime('%Y-%m-%d').tolist()
-        )
-        # 统计熊市比例
-        total_days = len(idx_df.iloc[-300:])
-        bear_days = len([d for d in market_bearish_dates
-                         if d >= idx_df.index[-300].strftime('%Y-%m-%d')])
-        print(f'   近300天熊市日: {bear_days}/{total_days} ({bear_days*100//max(total_days,1)}%)')
+        from indicator.market_environment import MarketEnvironment
+        market_env = MarketEnvironment()
+        if market_env.records:
+            ms = market_env.get_market_state()
+            market_signal_weights = market_env.SIGNAL_WEIGHTS
+            # 统计回测期间的市场状态
+            states = {'BULL': 0, 'NEUTRAL': 0, 'BEAR': 0}
+            for item in all_buys:
+                d = str(item.get('buy_date', ''))[:10].replace('-', '')
+                if d and len(d) == 8:
+                    s = market_env.get_state_for_date(d)
+                    states[s] = states.get(s, 0) + 1
+            print(f'   当前: {ms.state} | 信号日分布: BULL={states["BULL"]} NEUTRAL={states["NEUTRAL"]} BEAR={states["BEAR"]}')
+        else:
+            print('   未找到上证指数数据(跳过环境过滤)')
+            market_env = None
     except Exception as e:
         print(f'   市场环境加载失败(跳过过滤): {e}')
 
@@ -768,74 +1253,107 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
     for code in daily_map:
         daily_buy_div_map[code] = detect_daily_buy_divergence(daily_map[code])
 
-    for item in all_2buys:
+    for item in all_buys:
         code = item['code']
         if code not in min30_map:
             continue
         df_30 = min30_map[code]
 
         df_daily = daily_map[code]
-        buy_date = item['2buy_date']
+        buy_date = item['buy_date']
+        buy_type = item['buy_type']
 
-        # 市场环境过滤: 仅在明确熊市(MA20<MA60)时跳过
-        if market_bearish_dates is not None:
-            buy_date_str = pd.Timestamp(buy_date).strftime('%Y-%m-%d')
-            if buy_date_str in market_bearish_dates:
-                continue  # 明确熊市, 跳过此信号
+        # ========= 第一层: 月线定方向 (用信号日期时的月线状态) =========
+        df_monthly = resample_to_monthly(df_daily)
+        month_dir = check_monthly_direction(df_monthly, signal_date=buy_date)
+        if month_dir == 'down':
+            continue  # 月线空头, 不做多
+        item['monthly_dir'] = month_dir
 
-        # 30分钟数据从什么时候开始
+        # ========= 第二层: 周线看结构 =========
+        df_weekly = resample_to_weekly(df_daily)
+        weekly_struct = check_weekly_structure(df_weekly)
+        # 周线向下笔 + 无买点信号 = 不入场
+        if weekly_struct['stroke_dir'] == 'down' and not weekly_struct['has_buy_signal']:
+            continue
+        item['weekly_dir'] = weekly_struct['stroke_dir']
+
+        # ========= 市场环境过滤 =========
+        if market_env is not None:
+            buy_date_str = str(buy_date)[:10].replace('-', '')
+            if len(buy_date_str) == 8:
+                state = market_env.get_state_for_date(buy_date_str)
+                weights = market_env.get_signal_weights_for_date(buy_date_str)
+                if state == 'BEAR':
+                    continue
+                item['market_state'] = state
+                item['market_weight'] = weights.get(buy_type, 1.0)
+
+        # ========= 30min数据检查 =========
         min_30_date = df_30.index[0]
         max_30_date = df_30.index[-1]
-
-        # 2买信号必须在30min数据范围内
         if pd.Timestamp(buy_date) < min_30_date or pd.Timestamp(buy_date) > max_30_date:
             continue
 
-        # 止损价: 日线1买最低点
-        stop_price = item['1buy_low']
-
-        # 在30分钟级别找入场点: 2买信号日之后的第2个底分型
-        fractals_30 = detect_fractals_30min(df_30)
-        if not fractals_30:
+        # ========= 第四层: 30min 2买确认入场 =========
+        # 日线2买出现后, 等待30min级别的2买确认
+        # 只分析买点日期前后的窗口(加速)
+        signals_30 = detect_30min_2buy(df_30, window_start=buy_date)
+        if not signals_30:
             continue
 
-        # 找2买日期之后的底分型
-        bottom_after = [f for f in fractals_30
-                        if f['type'] == 'bottom' and df_30.index[f['idx']] >= pd.Timestamp(buy_date)]
+        # 找日线买点日期之后的30min 2买信号 (允许30天内确认)
+        valid_entries = [s for s in signals_30
+                         if s['date'] >= pd.Timestamp(buy_date)
+                         and s['date'] <= pd.Timestamp(buy_date) + pd.Timedelta(days=30)
+                         and s.get('confidence', 0) >= 0.5]
 
-        if len(bottom_after) < 2:
+        if not valid_entries:
             continue
 
-        # 第2个底分型作为入场点
-        entry_fractal = bottom_after[1]
-        entry_idx = entry_fractal['idx']
-        entry_price = entry_fractal['val']  # 底分型的val就是low
+        # 取置信度最高的30min 2买信号作为入场点
+        entry_signal = max(valid_entries, key=lambda s: s.get('confidence', 0))
+        entry_idx = entry_signal['entry_idx']
+        entry_price = entry_signal['entry_price']
+        entry_date = entry_signal['date']
 
-        # 量能过滤: 增强版 — 缩量转折+量价配合
-        if 'volume' in df_30.columns:
-            vol = df_30['volume'].values.astype(float)
-            if entry_idx >= 5 and vol[entry_idx] > 0:
-                avg_vol_5 = np.mean(vol[max(0, entry_idx-5):entry_idx])
-                avg_vol_20 = np.mean(vol[max(0, entry_idx-20):entry_idx]) if entry_idx >= 20 else avg_vol_5
-                entry_vol = vol[entry_idx]
+        # 止损逻辑: ATR动态止损 + 结构止损
+        atr_window = min(14, entry_idx)
+        if atr_window >= 5:
+            tr = []
+            for j in range(max(1, entry_idx - atr_window), entry_idx + 1):
+                h = df_30['high'].iloc[j]
+                l = df_30['low'].iloc[j]
+                pc = df_30['close'].iloc[j - 1]
+                tr.append(max(h - l, abs(h - pc), abs(l - pc)))
+            atr_val = sum(tr) / len(tr) if tr else entry_price * 0.03
+        else:
+            atr_val = entry_price * 0.03
+        atr_stop = entry_price - 2 * atr_val
+        # 止损策略根据买点类型不同
+        buy_type = item['buy_type']
+        engine_stop = item.get('stop_loss', 0)
+        min30_stop = entry_signal['stop_price']
 
-                # 基本过滤: 成交量不能极低
-                if avg_vol_5 > 0 and entry_vol < avg_vol_5 * 0.5:
-                    continue
-
-                # 缩量→放量转折加分（后续在评分中使用，这里只做极端过滤）
-                # 极端缩量+价格不涨 = 无效信号
-                if avg_vol_20 > 0 and entry_vol < avg_vol_20 * 0.3:
-                    # 近5根K线价格也没有上涨
-                    if entry_idx >= 5:
-                        recent_return = (df_30['close'].iloc[entry_idx] - df_30['close'].iloc[entry_idx-5]) / df_30['close'].iloc[entry_idx-5]
-                        if recent_return < 0:
-                            continue  # 缩量下跌，跳过
-        entry_date = df_30.index[entry_idx]
-
-        # 止损检查: 入场价不能低于止损价太多
-        if entry_price < stop_price:
-            continue
+        if buy_type in ('3buy', 'quasi3buy'):
+            # 3买止损: ATR + 引擎止损, 取较远的给空间, 硬止损-10%
+            candidates = [atr_stop]
+            if 0 < engine_stop < entry_price:
+                candidates.append(engine_stop)
+            if 0 < min30_stop < entry_price:
+                candidates.append(min30_stop)
+            stop_price = min(candidates)  # 取最远的(给空间)
+            stop_price = max(stop_price, entry_price * 0.90)  # 3买硬止损-10%
+        else:
+            # 1买止损: 结构止损 + ATR, 取最远的(给更多空间)
+            daily_buy_low = item['buy_low']
+            candidates = [atr_stop]
+            if 0 < daily_buy_low < entry_price:
+                candidates.append(daily_buy_low)
+            if 0 < min30_stop < entry_price:
+                candidates.append(min30_stop)
+            stop_price = min(candidates)
+            stop_price = max(stop_price, entry_price * 0.85)  # 1买硬止损-15%
 
         # ========= 支持重新入场的交易循环 =========
         # sub_trades: 同一个2买信号可能产生多次交易(止损→重新入场)
@@ -889,22 +1407,22 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
 
                 # --- 止损优先级最高(亏损端) ---
 
-                # 1. 硬止损: 1买低点(首次) / 底背驰低点(重入场)
+                # 1. 硬止损: 结构止损 / 底背驰低点(重入场)
                 if price <= current_stop_price:
                     exit_price = max(current_stop_price, df_30['low'].iloc[i])
                     exit_date = date_30
                     if reentry_count > 0:
                         exit_reason = '止损(底背驰低点)'
                     else:
-                        exit_reason = '止损(1买低点)'
+                        exit_reason = '止损(结构止损)'
                     was_stopped_out = True
                     break
 
-                # 2. -15%硬止损(仅首次入场)
-                if reentry_count == 0 and profit_pct < -0.15:
-                    exit_price = max(current_entry_price * 0.85, df_30['low'].iloc[i])
+                # 2. -10%硬止损(安全网)
+                if profit_pct < -0.10:
+                    exit_price = max(current_entry_price * 0.90, df_30['low'].iloc[i])
                     exit_date = date_30
-                    exit_reason = '硬止损(-15%)'
+                    exit_reason = '硬止损(-10%)'
                     break
 
                 # --- 日线终极卖出 ---
@@ -1046,28 +1564,23 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
             if pd.Timestamp(div_date) > max_30_date:
                 break
 
-            # 在30min找底背驰日之后的第2个底分型 → 重新入场
-            bottom_reentry = [f for f in fractals_30
-                              if f['type'] == 'bottom' and df_30.index[f['idx']] >= pd.Timestamp(div_date)]
+            # 重新入场: 在30min找背驰日之后的2买信号
+            reentry_signals = detect_30min_2buy(df_30, window_start=div_date)
+            valid_reentry = [s for s in reentry_signals
+                             if s['date'] >= pd.Timestamp(div_date)
+                             and s['date'] <= pd.Timestamp(div_date) + pd.Timedelta(days=15)]
+            if not valid_reentry:
+                break
 
-            if len(bottom_reentry) < 2:
-                # 只有1个底分型, 用第一个也行
-                if len(bottom_reentry) < 1:
-                    break
-                reentry_fractal = bottom_reentry[0]
-            else:
-                reentry_fractal = bottom_reentry[1]
+            reentry_sig = valid_reentry[0]
+            new_entry_idx = reentry_sig['entry_idx']
+            new_entry_price = reentry_sig['entry_price']
+            new_entry_date = reentry_sig['date']
+            new_stop_price = reentry_sig['stop_price']
 
-            new_entry_idx = reentry_fractal['idx']
-            new_entry_price = reentry_fractal['val']
-            new_entry_date = df_30.index[new_entry_idx]
-
-            # 新止损 = 底背驰最低点(跌破说明背驰是假的)
-            new_stop_price = next_div['low']
-
-            # 止损价不能高于入场价(理论上不应该, 保底处理)
+            # 止损价不能高于入场价
             if new_stop_price >= new_entry_price:
-                break  # 入场价已在背驰低点之下, 不合理, 放弃重入场
+                break
 
             reentry_count += 1
             current_entry_idx = new_entry_idx
@@ -1079,13 +1592,23 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
         # 把sub_trades加入总trades
         trades.extend(sub_trades)
 
+    # 去重: 同一股票同一入场日只保留一笔 (取return最高的)
+    trade_dedup = {}
+    for t in trades:
+        key = (t['code'], t['entry_date'].strftime('%Y-%m-%d'))
+        if key not in trade_dedup or t['return'] > trade_dedup[key]['return']:
+            trade_dedup[key] = t
+    trades = list(trade_dedup.values())
+
     # 汇总
-    print(f'   有效交易: {len(trades)} 笔')
+    print(f'   有效交易: {len(trades)} 笔 (去重后)')
     print()
 
     if not trades:
         print('无有效交易')
-        return trades
+        return [], {'total_return': 0, 'max_drawdown': 0, 'sharpe': 0,
+                    'profit_factor': 0, 'win_rate': 0, 'n_trades': 0,
+                    'avg_return': 0, 'avg_win': 0, 'avg_loss': 0, 'params': p}
 
     # ========= 组合级别模拟 =========
     trades.sort(key=lambda x: x['entry_date'])
@@ -1232,9 +1755,106 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
 
 
 if __name__ == '__main__':
-    codes = ['000001', '000333', '000858', '002415', '002600',
-             '600036', '600519', '601318', '300750', '300308',
-             '601899', '300502', '002594', '600276', '000651',
-             '603259', '601138', '300059', '600030', '601166']
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--stocks', type=int, default=50, help='Number of stocks to test')
+    parser.add_argument('--all', action='store_true', help='Test all available stocks')
+    parser.add_argument('--daily', action='store_true', help='Pure daily-level backtest (no 30min)')
+    parser.add_argument('--start', type=str, default=None, help='Start date (YYYY-MM-DD)')
+    args = parser.parse_args()
 
-    trades, metrics = run_mtf_backtest(codes)
+    # 股票池: 沪深300成分股
+    pool = [
+        '000001','000002','000063','000333','000338','000425','000538','000568',
+        '000625','000651','000661','000725','000768','000776','000783','000786',
+        '000858','000895','000938','000963','000977',
+        '002001','002007','002008','002024','002027','002049','002120',
+        '002415','002460','002475','002500','002555','002594','002600',
+        '002601','002714','002736',
+        '300003','300014','300015','300033','300059','300122','300124',
+        '300308','300347','300408','300413','300433','300496','300502',
+        '300750','300760',
+        '600009','600016','600019','600025','600028','600029',
+        '600030','600031','600036','600048','600050','600061','600085','600089',
+        '600104','600109','600111','600115','600132','600150','600153','600160',
+        '600176','600196','600208','600219','600276','600282','600298','600309',
+        '600325','600332','600346','600352','600362','600369','600372','600383',
+        '600390','600406','600415','600426','600433','600436','600438','600460',
+        '600519','600535','600547','600570','600588','600589',
+        '600595','600600','600606','600623','600637',
+        '600655','600660','600669','600674','600690','600702','600703','600704',
+        '600718','600732','600733','600739','600741',
+        '600745','600748','600754','600755','600763','600779',
+        '600782','600786','600787','600795',
+        '600801','600803','600809',
+        '600823','600837','600845','600848','600854','600859',
+        '600862','600867','600872','600875','600879','600884','600885','600887',
+        '600893','600895','600900','600901','600903','600908','600909','600918',
+        '600919','600926','600933','600941','600958',
+        '600989','600993','600995','600998','600999',
+        '601006','601009','601012','601015',
+        '601016','601018','601021','601038',
+        '601056','601060',
+        '601066','601069','601077','601079',
+        '601088','601099',
+        '601100','601101','601108','601111',
+        '601117','601118','601126','601127',
+        '601138','601155','601156',
+        '601162','601166','601168','601169',
+        '601177','601179','601182',
+        '601185','601186','601198',
+        '601199','601200','601203',
+        '601205','601206','601208','601211',
+        '601212','601216','601217',
+        '601221','601225','601226','601228',
+        '601229','601231','601233',
+        '601236','601238','601239',
+        '601258','601277','601279',
+        '601288','601298','601311','601318','601319',
+        '601326','601328','601336',
+        '601348','601360','601368','601369','601377',
+        '601390','601399','601600','601601','601606','601607',
+        '601611','601615','601618',
+        '601628','601633','601636','601637','601641',
+        '601643','601648','601658','601660',
+        '601664','601665','601666','601668','601669',
+        '601677','601678','601685','601686','601689',
+        '601696','601698','601699','601700',
+        '601717','601718','601727','601728',
+        '601731','601732','601733','601734',
+        '601739','601746','601755','601766',
+        '601777','601778','601788','601789','601790',
+        '601799','601800','601808',
+        '601816','601818','601820','601825',
+        '601827','601828','601833','601838',
+        '601839','601857','601858','601860',
+        '601862','601865','601866','601869',
+        '601872','601875','601877','601878',
+        '601880','601881','601882','601886',
+        '601888','601889','601890','601893',
+        '601895','601896','601898','601899',
+        '601900','601901','601906','601908',
+        '601912','601916','601919','601921',
+        '601928','601929','601933','601939',
+        '601952','601956','601958','601963',
+        '601965','601968','601969','601971',
+        '601975','601976','601978','601989',
+        '601991','601992','601995','601996',
+        '601997','601998','601999',
+    ]
+
+    if args.all:
+        codes = pool
+    else:
+        # Select N stocks from pool
+        codes = pool[:args.stocks]
+
+    if args.daily:
+        trades, metrics = run_daily_backtest(codes, start_date=args.start)
+    else:
+        trades, metrics = run_mtf_backtest(codes)
+    print()
+    print('=== 回测结果 ===')
+    for k, v in metrics.items():
+        if k != 'params':
+            print(f'  {k}: {v}')
