@@ -8,6 +8,7 @@
   4. 综合排名输出
 """
 import sys, os
+from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, '.')
 for k in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']:
@@ -23,7 +24,7 @@ from data.hybrid_source import HybridSource
 from backtest_cc15_mtf import (
     detect_fractals_30min, detect_strokes_30min,
     detect_pivot_30min,
-    run_daily_cc15, find_daily_1buy_2buy,
+    find_daily_1buy_2buy,
     fetch_sina_30min,
 )
 
@@ -184,8 +185,10 @@ def calc_sector_momentum(daily_map, sector_map, lookback=5):
         if len(df) < lookback + 1:
             continue
         sector = sector_map.get(code)
+        # [修复] sector_map为空时(KShare失败)，不过滤股票
+        # 用股票代码本身代替行业做聚类，保证全市场都能参与动量计算
         if not sector:
-            continue
+            sector = f'_stock_{code}'
         ret = (df['close'].iloc[-1] / df['close'].iloc[-lookback-1] - 1) * 100
         if sector not in sector_returns:
             sector_returns[sector] = []
@@ -455,6 +458,223 @@ def _weekly_chanlun_score(df_w):
         return max(0, min(1, score))
     except Exception:
         return 0.3
+
+
+def _fetch_realtime_quotes_today(codes: list) -> dict:
+    """通过腾讯实时行情接口获取当前价格（秒级）
+
+    Returns: {code: {price, prev_close, chg_pct, volume, name}}
+    """
+    import urllib.request, re
+
+    result = {}
+    if not codes:
+        return result
+
+    # 腾讯实时行情：每批≤15个（过多会超时）
+    BATCH = 15
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+        'Referer': 'https://finance.qq.com/'
+    }
+    for i in range(0, len(codes), BATCH):
+        batch = codes[i:i+BATCH]
+        # 腾讯格式: sh000001,sz300936,bj...
+        qstr = ','.join(batch)
+        url = 'https://qt.gtimg.cn/q=' + qstr
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as r:
+                raw = r.read().decode('gbk', errors='replace')
+            for line in raw.strip().split('\n'):
+                m = re.match(r'v_(?:sh|sz|bj)(\w+)=\"(\d+)~(.*)"', line)
+                if m:
+                    code = m.group(1)
+                    parts = m.group(3).split('~')
+                    if len(parts) < 5:
+                        continue
+                    try:
+                        price = float(parts[3])
+                        prev = float(parts[4])
+                        result[code] = {
+                            'price': price,
+                            'prev_close': prev,
+                            'chg_pct': (price - prev) / prev * 100 if prev else 0,
+                            'volume': float(parts[5]) if parts[5] else 0,
+                            'name': parts[1],
+                        }
+                    except (ValueError, IndexError):
+                        continue
+        except Exception:
+            continue
+    return result
+
+
+def _get_sh_index_via_tencent(n: int = 30) -> list:
+    """通过腾讯行情获取上证指数近期日K线（用于E版过滤）
+
+    返回: [{date, open, close, high, low, volume}, ...]
+    """
+    import urllib.request, json
+
+    try:
+        url = 'https://web.ifzq.gtimg.cn/appstock/app/kline/kline?_var=kline_day&param=sh000001,day,,,' + str(n)
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            raw = r.read().decode('utf-8')
+        # 格式: kline_day={"code":0,"data":{"sh000001":{"day":[[date,open,close,high,low,vol],...]}}}
+        # 去掉前缀kline_day=，直接json解析
+        json_str = raw.strip()
+        if json_str.startswith('kline_day='):
+            json_str = json_str[len('kline_day='):]
+        data = json.loads(json_str)
+        day_bars = data.get('data', {}).get('sh000001', {}).get('day', [])
+        records = []
+        for bar in day_bars[-n:]:
+            if len(bar) >= 6:
+                try:
+                    records.append({
+                        'date': bar[0],
+                        'open': float(bar[1]),
+                        'close': float(bar[2]),
+                        'high': float(bar[3]),
+                        'low': float(bar[4]),
+                        'volume': float(bar[5]),
+                    })
+                except (ValueError, IndexError):
+                    continue
+        return records
+    except Exception:
+        return []
+
+
+def _get_sh_index_via_tushare(n: int = 30) -> list:
+    """通过tushare获取上证指数日线数据（用于E版过滤）"""
+    try:
+        import tushare as ts
+        TOKEN = '445af3e7113dd4984a0ac217c32686ec6321161eac11a435529bc07d'
+        ts.set_token(TOKEN)
+        api = ts.pro_api()
+        df = api.index_daily(ts_code='000001.SH', start_date='20250101')
+        df['trade_date'] = pd.to_datetime(df['trade_date'])
+        df = df.sort_values('trade_date').tail(n)
+        records = []
+        for _, row in df.iterrows():
+            ds = str(row['trade_date'].date()).replace('-', '')
+            records.append({'date': ds, 'close': float(row['close'])})
+        return records
+    except Exception:
+        return []
+
+
+def _compute_daily_trend_from_records(records: list) -> dict:
+    """从指数records计算每日trend映射
+
+    records: market_env.records (list of {date, close, ...})
+    返回: {date_str: 'up'|'down'|'side'}
+    """
+    if not records:
+        return {}
+
+    # 按日期排序
+    sorted_recs = sorted(records, key=lambda x: x['date'])
+    closes = [r['close'] for r in sorted_recs]
+
+    trend_map = {}
+    for i, rec in enumerate(sorted_recs):
+        if i < 10:
+            trend_map[rec['date']] = 'side'
+            continue
+
+        window = closes[max(0, i-19):i+1]
+        ma5 = sum(window[-5:]) / 5
+        ma10 = sum(window[-10:]) / 10
+        current = window[-1]
+
+        if current > ma5 and ma5 > ma10:
+            trend_map[rec['date']] = 'up'
+        elif current < ma5 and ma5 < ma10:
+            trend_map[rec['date']] = 'down'
+        else:
+            trend_map[rec['date']] = 'side'
+
+    return trend_map
+
+
+def _apply_e_version_filters(all_signals: list, market_env, loose_regime: bool = True) -> list:
+    """E版本过滤器：日线趋势过滤 + 大盘仓位调整
+
+    - 日线向下(down)时过滤掉买点
+    - 根据大盘环境调整仓位系数
+    - loose_regime: True=宽松阈值(1.01/0.99), False=严格阈值(1.02/0.98)
+    """
+    records = getattr(market_env, 'records', []) or []
+    if not records:
+        # 优先腾讯（快），tushare备选
+        records = _get_sh_index_via_tencent(n=60)
+        if not records:
+            records = _get_sh_index_via_tushare(n=60)
+    trend_map = _compute_daily_trend_from_records(records)
+
+    # 获取市场环境
+    ms = market_env.get_market_state()
+    regime = ms.state if ms else 'NEUTRAL'
+
+    # 宽松模式阈值
+    if loose_regime:
+        bull_thresh = 1.01
+        bear_thresh = 0.99
+    else:
+        bull_thresh = 1.02
+        bear_thresh = 0.98
+
+    # 基于MA5/MA20重新判定（更精确）
+    if records:
+        sorted_recs = sorted(records, key=lambda x: x['date'])
+        closes = [r['close'] for r in sorted_recs]
+        if len(closes) >= 20:
+            ma5_now = sum(closes[-5:]) / 5
+            ma20_now = sum(closes[-20:]) / 20
+            if ma5_now > ma20_now * bull_thresh:
+                eff_regime = 'BULL'
+            elif ma5_now < ma20_now * bear_thresh:
+                eff_regime = 'BEAR'
+            else:
+                eff_regime = 'NEUTRAL'
+        else:
+            eff_regime = regime
+    else:
+        eff_regime = regime
+
+    # 仓位系数
+    pos_map = {
+        'BULL': 1.0,
+        'NEUTRAL': 0.6,
+        'BEAR': 0.5,
+    }
+    pos_coef = pos_map.get(eff_regime, 0.6)
+
+    # 过滤 + 仓位标注
+    filtered = []
+    down_count = 0
+    for sig in all_signals:
+        sig_date = sig.get('sig_date')
+        if sig_date is not None:
+            date_str = str(sig_date.date()).replace('-', '')
+            trend = trend_map.get(date_str, 'side')
+            if trend == 'down':
+                down_count += 1
+                continue  # 日线向下，过滤
+
+        sig['pos_coef'] = pos_coef
+        sig['eff_regime'] = eff_regime
+        filtered.append(sig)
+
+    regime_icon = {'BULL': '[UP]', 'NEUTRAL': '[--]', 'BEAR': '[DN]'}.get(eff_regime, '[??]')
+    print(f'   [E版过滤] regime={eff_regime}{regime_icon} 仓位系数={pos_coef:.0%}  '
+          f'过滤down信号={down_count}个 剩余={len(filtered)}个')
+
+    return filtered
 
 
 def _detect_market_regime():
@@ -924,6 +1144,13 @@ def _find_3buy_standalone(engine, code, df):
                         else:
                             strength = 'normal'
 
+                        # 3买成交量过滤: 突破日成交量需>=20日均量 (回测验证)
+                        if 'volume' in df.columns and j >= 20:
+                            vol_breakout = df['volume'].iloc[j]
+                            vol_ma20 = df['volume'].iloc[j-20:j].mean()
+                            if vol_ma20 > 0 and vol_breakout < vol_ma20:
+                                break  # 突破无量, 跳过此中枢的3买
+
                         results.append({
                             'signal_type': '3buy',
                             'entry_price': entry_price,
@@ -1198,7 +1425,8 @@ def _mp_worker(args):
         'volume': sdata['volume'],
     }, index=sdata['index'])
 
-    sys.path.insert(0, 'chanlun_unified')
+    sys.path.insert(0, str(Path(__file__).parent))
+    sys.path.insert(0, str(Path(__file__).parent / 'chanlun_unified'))
     from signal_engine_cc15 import SignalEngine
     from backtest_cc15_mtf import find_daily_1buy_2buy
     engine = SignalEngine()
@@ -1217,11 +1445,25 @@ def _mp_worker(args):
     except Exception:
         pass
 
+    # 计算日线走势类型（用于2买过滤）
+    _daily_trend_type = ''
+    try:
+        from core.pivot import detect_pivots
+        _, pivots_tmp = detect_pivots(engine.strokes)
+        if pivots_tmp:
+            _tr = classify_trend_type(pivots_tmp)
+            _daily_trend_type = _tr.current_type.value
+    except Exception:
+        pass
+
     signals = []
     try:
         pairs = find_daily_1buy_2buy(engine, code, df)
         for p in pairs:
             if p['2buy_idx'] >= len(df):
+                continue
+            # 2买过滤: 排除日线下跌趋势（与3买一致）
+            if _daily_trend_type == 'down':
                 continue
             sig_date = df.index[p['2buy_idx']]
             if sig_date >= pd.Timestamp(cutoff):
@@ -1240,14 +1482,29 @@ def _mp_worker(args):
                 idx = p.get('1buy_idx', -1)
                 if idx < 0 or idx >= len(df):
                     continue
+                # 1买置信度过滤: >=0.75 (回测验证: 57%→66%胜率)
+                conf = p.get('confidence', 0.5)
+                if conf < 0.75:
+                    continue
                 sig_date = df.index[idx]
                 if sig_date >= pd.Timestamp(cutoff):
+                    # 1买成交量确认: 放量(>=1.2x)或缩量(<=0.7x)
+                    vol_ok = True
+                    if 'volume' in df.columns and idx >= 20:
+                        vol_today = df['volume'].iloc[idx]
+                        vol_ma20 = df['volume'].iloc[idx-20:idx].mean()
+                        if vol_ma20 > 0:
+                            vol_ratio = vol_today / vol_ma20
+                            if not (vol_ratio >= 1.2 or vol_ratio <= 0.7):
+                                vol_ok = False
+                    if not vol_ok:
+                        continue
                     signals.append({
                         'code': code, 'signal_type': '1buy',
                         'entry_price': p.get('1buy_price', df['close'].iloc[idx]),
                         'stop_price': p.get('1buy_low', df['low'].iloc[idx]),
                         'sig_idx': idx, 'sig_date': sig_date,
-                        'confidence': p.get('confidence', 0.5),
+                        'confidence': conf,
                     })
 
         threes = _find_3buy_standalone(engine, code, df)
@@ -1502,6 +1759,10 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
 
     all_signals = cached_signals + new_signals
 
+    # === E版本过滤器: 日线趋势过滤 + 大盘仓位 ===
+    if all_signals:
+        all_signals = _apply_e_version_filters(all_signals, market_env, loose_regime=True)
+
     # 按类型统计
     type_counts = {}
     for s in all_signals:
@@ -1569,13 +1830,12 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
         if weekly_rise_pct < 20.0 and not wbf:
             continue  # 周线涨幅不够，除非有底分型
         if weekly_trend == 'bear':
-            item['weekly_veto'] = True
-        else:
-            item['weekly_veto'] = False
+            continue  # 周线空头直接排除
+        item['weekly_veto'] = False
         item['weekly_trend'] = weekly_trend
         item['weekly_score'] = weekly_score
         weekly_passed.append(item)
-    print(f'   周线过滤: {len(weekly_passed)}/{len(scanned)} 通过 (涨幅>=20%)')
+    print(f'   周线过滤: {len(weekly_passed)}/{len(scanned)} 通过 (涨幅>=20%+非空头)')
 
     if not weekly_passed:
         print('   无股票通过周线过滤')
@@ -1916,6 +2176,8 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
             'three_buy_weighted': item.get('three_buy_weighted', 0),
             'trend_type': trend_type_val,
             'trend_strength': trend_str_val,
+            'pos_coef': item.get('pos_coef', 1.0),
+            'eff_regime': item.get('eff_regime', ''),
             'ml_score': ml_score,
             'ml_label': ml_label,
             'td_boost': item.get('td_boost', 0),
@@ -1993,7 +2255,8 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
               f'{st:<6} '
               f'{r["sector"]:<8} '
               f'{r["sector_ret"]:>+6.1f}% {r["price"]:>8.2f} {r["entry_price"]:>8.2f} '
-              f'{r["risk_reward"]:>5.1f} {r["total_score"]:>4} {r.get("ml_label","")[:4]:>4} {r.get("weekly_rise_pct",0):>6.1f}% {r["weekly_trend"]:<10} {t_lbl} {r["2buy_date"]:<12}')
+              f'{r["risk_reward"]:>5.1f} {r["total_score"]:>4} {r.get("ml_label","")[:4]:>4} {r.get("weekly_rise_pct",0):>6.1f}% {r["weekly_trend"]:<10} {t_lbl} {r["2buy_date"]:<12}'
+              f' 仓位:{r.get("pos_coef",1.0):.0%} {r.get("eff_regime","")}')
 
     # 周线底分型候选（盈亏比排序）
     wbf_results = [r for r in results if r.get('weekly_bottom_fractal') and r.get('weekly_risk_reward')]
