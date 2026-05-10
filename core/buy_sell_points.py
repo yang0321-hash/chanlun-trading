@@ -31,6 +31,7 @@ from .trend_type import TrendTypeClassifier, TrendType, TrendTypeResult
 from .td_sequential import analyze_td, td_confirm_buy
 from indicator.macd import MACD
 from indicator.volume_dynamics import VolumeDynamics, VolumeDivergenceResult
+from .gravity import ZhongshuGravity
 
 
 @dataclass
@@ -1793,104 +1794,124 @@ class BuySellPointDetector:
                 ))
 
     def _detect_second_buy(self) -> None:
-        """批量检测所有2买点（加权评分 + 2买3买重叠检测）"""
+        """检测所有2买点（结构约束 + IC加权评分）
+
+        2买定义: 1买后第一次回调不破1买低点，且回调在结构上与1买的中枢关联。
+        结构约束:
+          - 1买必须有关联中枢
+          - 反弹笔必须触及中枢ZD（确保结构意义）
+          - 只取第一个反弹+第一个回调（真正的2买确认）
+          - margin在0-50%之间（防止跨趋势周期配对）
+          - 中枢邻近性加分（回调在时间/价格上接近中枢）
+        """
         for bp in list(self._buy_points):
             if bp.point_type not in ('1buy', 'sub1buy'):
                 continue
 
+            bp_pivot = bp.related_pivot
+            if not bp_pivot:
+                continue
+
+            # 第一个反弹笔（1买之后最近的上升笔）
             up_after = [s for s in self.strokes
                         if s.is_up and s.start_index > bp.index]
             if not up_after:
                 continue
+            up_s = up_after[0]
 
-            for up_s in up_after:
-                pullback = [s for s in self.strokes
-                            if s.is_down and s.start_index > up_s.end_index
-                            and s.end_index <= up_s.end_index + 50]
-                if not pullback:
-                    continue
+            # 反弹必须有结构意义: 至少触及1买价格上方5%或中枢ZD(取较低者)
+            min_bounce = min(bp_pivot.zd, bp.price * 1.05) * (1 - self.fuzzy_tolerance)
+            if up_s.end_value < min_bounce:
+                continue
 
-                for pb in pullback:
-                    if pb.end_value <= bp.price:
-                        continue
+            # 第一个回调笔（反弹之后50根K线内）
+            pb_candidates = [s for s in self.strokes
+                             if s.is_down and s.start_index > up_s.end_index
+                             and s.end_index <= up_s.end_index + 50]
+            if not pb_candidates:
+                continue
+            pb = pb_candidates[0]
 
-                    # ===== 加权评分 =====
-                    confidence = 0.40
+            # margin约束: 回调价 > 1买价, 且不超过50%
+            margin = (pb.end_value - bp.price) / bp.price
+            if margin <= 0 or margin > 0.50:
+                continue
 
-                    # 回踩深度: 越浅越强（权重加大）
-                    pullback_depth = (pb.end_value - bp.price) / bp.price
-                    confidence += min(pullback_depth * 8, 0.25)
+            # 中枢邻近性: 回调价格在1买价格和中枢ZG之间
+            price_near = (pb.end_value >= bp.price * 0.98
+                          and pb.end_value <= bp_pivot.zg * 1.10)
+            pivot_proximity = price_near
 
-                    # 缩量确认 (归因: 单独负贡献, 降权)
-                    vol_ratio = self._stroke_volume_ratio(pb)
-                    vol_info = ''
-                    if vol_ratio > 0:
-                        if vol_ratio < 0.7:
-                            confidence += 0.03
-                            vol_info = f', 缩量回调(量比{vol_ratio:.1f})'
-                        elif vol_ratio < 0.9:
-                            confidence += 0.01
-                            vol_info = f', 温和缩量(量比{vol_ratio:.1f})'
-                        elif vol_ratio > 1.5:
-                            confidence -= 0.08
-                            vol_info = f', 放量回调(量比{vol_ratio:.1f})'
+            # ===== 重新校准的IC评分 (base 0.30, cap 0.95) =====
+            confidence = 0.30
 
-                    # MACD辅助: DIF从零轴下方回升
-                    macd_info = ''
-                    if self.macd:
-                        try:
-                            dif_s = self.macd.get_dif_series()
-                            idx = min(pb.end_index - self.macd._kline_offset, len(dif_s) - 1)
-                            if idx > 0 and dif_s.iloc[idx - 1] < 0 and dif_s.iloc[idx] >= 0:
-                                confidence += 0.05
-                                macd_info = ', MACD金叉'
-                        except (IndexError, AttributeError):
-                            pass
+            # 回调幅度% (IC=+0.173, max +0.12)
+            cb_pct = abs(pb.price_change_pct) / 100
+            confidence += min(cb_pct * 0.40, 0.12)
 
-                    # 子级别确认
-                    sub_info = ''
-                    sub_ok, _, sub_desc = self._check_sub_level_buy(
-                        pb.end_index, ['2buy', '1buy']
-                    )
-                    if sub_ok:
-                        confidence += 0.10
-                        sub_info = f', {sub_desc}'
+            # 反弹幅度% (IC=+0.158, max +0.10)
+            bn_pct = abs(up_s.price_change_pct) / 100
+            confidence += min(bn_pct * 0.25, 0.10)
 
-                    # ===== 2买3买重叠检测 =====
-                    is_overlap = False
-                    overlap_info = ''
-                    for pivot in reversed(self.pivots):
-                        if pivot.start_index <= bp.index <= pivot.end_index + 30:
-                            if pb.end_value > pivot.zg:
-                                is_overlap = True
-                                confidence += 0.15
-                                overlap_info = f', 2买3买重叠(回踩>ZG={pivot.zg:.2f})'
-                            break
+            # 中枢宽度% (IC=+0.065, max +0.05)
+            if bp_pivot.zg > bp_pivot.zd:
+                pw_pct = (bp_pivot.zg - bp_pivot.zd) / pb.end_value
+                confidence += min(pw_pct * 0.35, 0.05)
 
-                    # 上涨笔放量加分
-                    up_vol_ratio = self._stroke_volume_ratio(up_s)
-                    if up_vol_ratio > 1.2:
-                        confidence += 0.05
+                # 反弹力度 (IC=+0.045, max +0.03)
+                bounce_str = up_s.amplitude / (bp_pivot.zg - bp_pivot.zd)
+                confidence += min(bounce_str * 0.015, 0.03)
 
-                    confidence = max(0.1, min(1.0, confidence))
-                    stop_loss = pb.low * 0.99
+            # 中枢数量 (IC=+0.018, max +0.02)
+            confidence += min(len(self.pivots) * 0.004, 0.02)
 
-                    # 重叠用独立类型，否则普通2买
-                    pt_type = '2b3bbuy' if is_overlap else '2buy'
-                    base_reason = f'2买3买重叠: 回踩>ZG不进中枢' if is_overlap else f'2买: 回调不破{bp.point_type}{bp.price:.2f}'
+            # margin安全距离 (IC=+0.016, max +0.05)
+            confidence += min(margin * 3, 0.05)
 
-                    self._buy_points.append(BuySellPoint(
-                        point_type=pt_type,
-                        price=pb.end_value,
-                        index=pb.end_index,
-                        related_pivot=bp.related_pivot,
-                        related_strokes=[up_s, pb],
-                        confidence=confidence,
-                        stop_loss=stop_loss,
-                        reason=f'{base_reason}{vol_info}{macd_info}{sub_info}'
-                    ))
-                    break
-                break
+            # 中枢邻近性加分 (max +0.15)
+            if pivot_proximity:
+                confidence += 0.10
+                # 回调接近ZD = 理想2买位置
+                if bp_pivot.zd > 0 and abs(pb.end_value - bp_pivot.zd) / bp_pivot.zd < 0.02:
+                    confidence += 0.05
+
+            # margin质量: 5-20%为最佳区间
+            if 0.05 <= margin <= 0.20:
+                confidence += 0.05
+            elif margin > 0.30:
+                confidence -= 0.05
+
+            # 子级别确认
+            sub_info = ''
+            sub_ok, _, sub_desc = self._check_sub_level_buy(
+                pb.end_index, ['2buy', '1buy']
+            )
+            if sub_ok:
+                confidence += 0.08
+                sub_info = f', {sub_desc}'
+
+            confidence = max(0.10, min(0.95, confidence))
+
+            reason_parts = [
+                f'2买: 回调不破{bp.point_type}{bp.price:.2f}',
+                f'回调={cb_pct:.1%} 反弹={bn_pct:.1%}',
+                f'margin={margin:.1%}',
+            ]
+            if pivot_proximity:
+                reason_parts.append(f'中枢附近(ZD={bp_pivot.zd:.2f})')
+            if sub_info:
+                reason_parts.append(sub_info.lstrip(', '))
+
+            self._buy_points.append(BuySellPoint(
+                point_type='2buy',
+                price=pb.end_value,
+                index=pb.end_index,
+                related_pivot=bp.related_pivot,
+                related_strokes=[up_s, pb],
+                confidence=confidence,
+                stop_loss=pb.low * 0.99,
+                reason=', '.join(reason_parts),
+            ))
 
     def _detect_second_sell(self) -> None:
         """批量检测所有2卖点（增强版：结构质量+子级别确认）"""
@@ -1998,15 +2019,16 @@ class BuySellPointDetector:
                         penetration = (zg - pb.end_value) / zg
                         confidence -= min(penetration * 20, 0.15)
 
-                    # 中枢引力加分
+                    # 中枢引力验证 (V73 ZhongshuGravity)
                     gravity_info = ''
-                    gravity = pivot.gravity_index(pb.end_value)
-                    if gravity > 5.0:
-                        confidence += 0.08
-                        gravity_info = f', 强引力(g={gravity:.1f})'
-                    elif gravity > 2.0:
-                        confidence += 0.04
-                        gravity_info = f', 中引力(g={gravity:.1f})'
+                    if pivot.zg > pivot.zd:
+                        gv = ZhongshuGravity.validate_3buy(pivot, pb.low, pb.end_value)
+                        if not gv['is_valid_3buy']:
+                            confidence *= 0.7
+                            gravity_info = f', 假三买(引力={gv["gravity"].gravity_index:.1f})'
+                        else:
+                            gravity_info = f', 真三买(引力={gv["gravity"].gravity_index:.1f})'
+                        confidence += gv['confidence_modifier']
 
                     # 收敛/发散加分
                     consolidation_info = ''
@@ -2222,15 +2244,17 @@ class BuySellPointDetector:
             elif self._sub_strokes:
                 confidence -= 0.05
 
-            # 中枢引力
+            # 中枢引力验证 (V73 ZhongshuGravity)
             gravity_info = ''
-            gravity = p1.gravity_index(p2_zd)
-            if gravity > 5.0:
-                confidence += 0.08
-                gravity_info = f', 强引力(g={gravity:.1f})'
-            elif gravity > 2.0:
-                confidence += 0.04
-                gravity_info = f', 中引力(g={gravity:.1f})'
+            if p1_zg > p1_zd:
+                pullback_price = p2_zd
+                gv = ZhongshuGravity.validate_3buy(p1, pullback_price, p2_zd)
+                if not gv['is_valid_3buy']:
+                    confidence *= 0.7
+                    gravity_info = f', 假三买(引力={gv["gravity"].gravity_index:.1f})'
+                else:
+                    gravity_info = f', 真三买(引力={gv["gravity"].gravity_index:.1f})'
+                confidence += gv['confidence_modifier']
 
             # === 3买增强过滤: MACD方向 + 突破量能 ===
             pivot_3buy_filter_info = ''

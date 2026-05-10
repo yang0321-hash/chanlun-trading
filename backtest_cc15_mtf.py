@@ -925,12 +925,14 @@ def run_daily_backtest(codes, params=None, start_date=None):
         # 止损设置 — 按买点类型差异化
         engine_stop = sig.get('stop_loss', 0)
         if buy_type in ('3buy', 'quasi3buy'):
-            # 3买: 宽trail(18%), 标准止损(-10%) — 突破信号给空间跑
+            # 3买: 宽trail(18%), 标准止损(-10%)
             candidates = [entry_price * 0.90]
             if 0 < engine_stop < entry_price:
                 candidates.append(engine_stop)
             stop_price = min(candidates)
             stop_price = max(stop_price, entry_price * 0.90)
+        elif buy_type == '2buy':
+            pass  # unused
         else:
             # 1买: 标准trail(12%), 标准止损(-10%)
             stop_price = sig['buy_low']
@@ -964,7 +966,7 @@ def run_daily_backtest(codes, params=None, start_date=None):
 
             profit_pct = (price - entry_price) / entry_price
 
-            # 0. 3买保本保护: 盈利>8%后, 止损移到入场价(赢家不变输家)
+            # 0. 3买保本保护: 盈利>8%后, 止损移到入场价
             if buy_type in ('3buy', 'quasi3buy') and profit_pct > 0.08:
                 stop_price = max(stop_price, entry_price)
 
