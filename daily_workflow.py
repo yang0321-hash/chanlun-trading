@@ -331,7 +331,7 @@ def run_committee(candidates: List[dict], hs: HybridSource,
         pm = PositionManager()
         positions_data = {
             'capital': pm.capital,
-            'max_positions': 10,
+            'max_positions': 5,
             'positions': [
                 {
                     'code': p.code,
@@ -460,7 +460,7 @@ def _diversify_results(results: List[dict], sector_map: Dict[str, str]) -> List[
             continue
         sector = r.get('sector', '未知')
         sector_seen[sector] = sector_seen.get(sector, 0) + 1
-        if sector_seen[sector] > 2:  # 同行业最多推荐2只
+        if sector_seen[sector] > 1:  # 同行业最多推荐1只 (回测验证)
             r['decision'] = 'hold'
             r['diversify_downgrade'] = True
             r.setdefault('key_factors', []).append(
@@ -1150,6 +1150,65 @@ def main():
         print(f'  规则引擎: 调整{adjusted}只 拦截{vetoed}只')
     except Exception as e:
         print(f'  规则引擎异常: {e}')
+
+    # ---- Phase 2.9: 回撤控制 + 持仓上限 + 行业去重 (回测参数同步) ----
+    print()
+    print('[2.9] 回撤控制 + 持仓上限 + 行业去重...')
+    portfolio_status = {}
+    try:
+        from trading_agents.position_manager import PositionManager as _PM29
+        pm29 = _PM29()
+        pm29.update_drawdown()
+        portfolio_status = pm29.get_portfolio_status()
+        dd_scale = portfolio_status['dd_scale']
+        current_dd = portfolio_status['drawdown']
+        print(f'  持仓: {portfolio_status["position_count"]}/{portfolio_status["max_positions"]} '
+              f'回撤: {current_dd:.1%} 缩仓: {dd_scale:.0%} '
+              f'已占行业: {portfolio_status["sectors_in_use"] or "无"}')
+
+        dd_blocked = pos_blocked = sector_blocked = 0
+        for r in committee_results:
+            if r.get('decision') != 'buy':
+                continue
+            code = r.get('symbol', '') or r.get('code', '')
+            sector = r.get('sector', '')
+
+            if dd_scale == 0:
+                r['decision'] = 'hold'
+                r['dd_blocked'] = True
+                r.setdefault('key_factors', []).append(
+                    f'回撤控制: 组合回撤{current_dd:.1%}>25%, 停止开仓')
+                dd_blocked += 1
+                continue
+
+            if portfolio_status['position_count'] >= pm29.MAX_POSITIONS:
+                r['decision'] = 'hold'
+                r['pos_blocked'] = True
+                r.setdefault('key_factors', []).append(
+                    f'持仓上限: {portfolio_status["position_count"]}/{pm29.MAX_POSITIONS}已满')
+                pos_blocked += 1
+                continue
+
+            if sector and pm29.is_sector_full(sector):
+                r['decision'] = 'hold'
+                r['sector_blocked'] = True
+                r.setdefault('key_factors', []).append(
+                    f'行业去重: {sector}已有持仓(限{pm29.SECTOR_LIMIT}只/行业)')
+                sector_blocked += 1
+                continue
+
+            if dd_scale < 1.0:
+                orig_pos = r.get('position_pct', 0.2)
+                r['position_pct'] = orig_pos * dd_scale
+                r['dd_reduced'] = True
+
+        total_blocked = dd_blocked + pos_blocked + sector_blocked
+        if total_blocked:
+            print(f'  拦截: 回撤={dd_blocked} 持仓上限={pos_blocked} 行业={sector_blocked}')
+        else:
+            print(f'  全部通过')
+    except Exception as e:
+        print(f'  回撤控制异常: {e}')
 
     # ---- Phase 3: 更新持仓 ----
     print()

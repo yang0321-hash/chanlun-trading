@@ -2271,12 +2271,12 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
 
     results = [r for r in results if r['total_score'] >= MIN_SCORE]
 
-    # P0-2: 置信度过滤 (CONF≥0.7, 回测验证阈值)
+    # P0-2: 置信度过滤 (CONF≥0.6, 回测验证阈值)
     _conf_before = len(results)
-    results = [r for r in results if r.get('confidence', 0.7) >= 0.7]
+    results = [r for r in results if r.get('confidence', 0.6) >= 0.6]
     _conf_filtered = _conf_before - len(results)
     if _conf_filtered > 0:
-        print(f'   置信度过滤: {_conf_filtered}只 CONF<0.7 已移除')
+        print(f'   置信度过滤: {_conf_filtered}只 CONF<0.6 已移除')
 
     results.sort(key=lambda x: x['total_score'], reverse=True)
 

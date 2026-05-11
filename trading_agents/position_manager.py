@@ -240,3 +240,97 @@ class PositionManager:
                     'pnl_pct': (price - pos.entry_price) / pos.entry_price * 100,
                 })
         return warnings
+
+    # ==================== 回撤控制 (回测验证参数同步) ====================
+
+    MAX_POSITIONS = 5
+    DD_REDUCE_THRESHOLD = 0.15
+    DD_STOP_THRESHOLD = 0.25
+    SECTOR_LIMIT = 1
+
+    def _get_or_init_peak_capital(self) -> float:
+        meta_path = POSITIONS_FILE.replace('positions.json', 'portfolio_meta.json')
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, 'r', encoding='utf-8') as f:
+                    meta = json.load(f)
+                return meta.get('peak_capital', self.capital)
+            except Exception:
+                pass
+        return self.capital
+
+    def _save_peak_capital(self, peak: float):
+        meta_path = POSITIONS_FILE.replace('positions.json', 'portfolio_meta.json')
+        os.makedirs(os.path.dirname(meta_path) or '.', exist_ok=True)
+        try:
+            with open(meta_path, 'w', encoding='utf-8') as f:
+                json.dump({'peak_capital': peak,
+                           'updated': datetime.now().strftime('%Y-%m-%d')},
+                          f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def update_drawdown(self, price_map=None):
+        if price_map:
+            position_value = self.get_total_value(price_map)
+        else:
+            position_value = sum(
+                p.entry_price * p.shares for p in self.positions.values())
+        cash = max(0, self.capital - position_value)
+        current_capital = cash + position_value
+        peak = self._get_or_init_peak_capital()
+        if current_capital > peak:
+            peak = current_capital
+            self._save_peak_capital(peak)
+        self._current_capital = current_capital
+        self._peak_capital = peak
+
+    def get_drawdown(self, price_map=None) -> float:
+        if not hasattr(self, '_peak_capital'):
+            self.update_drawdown(price_map)
+        if self._peak_capital <= 0:
+            return 0.0
+        return (self._current_capital - self._peak_capital) / self._peak_capital
+
+    def get_position_count(self) -> int:
+        return len(self.positions)
+
+    def get_dd_scale(self, price_map=None) -> float:
+        dd = self.get_drawdown(price_map)
+        if dd < -self.DD_STOP_THRESHOLD:
+            return 0.0
+        elif dd < -self.DD_REDUCE_THRESHOLD:
+            return 0.5
+        return 1.0
+
+    def can_open_position(self, sector: str = '',
+                          price_map=None) -> Tuple[bool, str]:
+        if len(self.positions) >= self.MAX_POSITIONS:
+            return False, f'持仓已满({len(self.positions)}/{self.MAX_POSITIONS})'
+        dd = self.get_drawdown(price_map)
+        if dd < -self.DD_STOP_THRESHOLD:
+            return False, f'回撤过深({dd:.1%}), 停止开仓'
+        if sector:
+            if sector in self.get_sectors_in_use():
+                return False, f'行业{sector}已有持仓(限{self.SECTOR_LIMIT}只)'
+        return True, ''
+
+    def is_sector_full(self, sector: str) -> bool:
+        if not sector:
+            return False
+        return any(p.sector == sector for p in self.positions.values() if p.sector)
+
+    def get_sectors_in_use(self) -> set:
+        return {p.sector for p in self.positions.values()
+                if p.sector and p.sector != '未知'}
+
+    def get_portfolio_status(self, price_map=None) -> dict:
+        dd = self.get_drawdown(price_map)
+        return {
+            'position_count': len(self.positions),
+            'max_positions': self.MAX_POSITIONS,
+            'drawdown': round(dd, 4),
+            'dd_scale': self.get_dd_scale(price_map),
+            'sectors_in_use': list(self.get_sectors_in_use()),
+            'can_open': dd >= -self.DD_STOP_THRESHOLD,
+        }
