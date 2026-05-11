@@ -505,17 +505,25 @@ def find_daily_buy_signals(code, df, buys_cache=None):
 
     results = []
     for b in seen.values():
-        if b.point_type not in ('3buy', 'quasi3buy'):
+        if b.point_type not in ('2buy', '3buy', 'quasi3buy'):
             continue
         idx = b.index
         if idx < 50 or idx >= n:
             continue
         if b.confidence < 0.5:
             continue
-        # 3买止损: 中枢ZG (回踩不应进入中枢)
-        lookback = max(0, idx - 30)
-        local_lows = lows[lookback:idx + 1] if idx + 1 <= len(lows) else lows[lookback:]
-        buy_low = min(local_lows) if local_lows else df['low'].iloc[idx]
+
+        # 止损逻辑按买点类型区分 (缠论原文)
+        if b.point_type == '2buy':
+            # 2买止损: 一买低点 (回踩不破前低)
+            lookback = max(0, idx - 60)
+            local_lows = lows[lookback:idx + 1] if idx + 1 <= len(lows) else lows[lookback:]
+            buy_low = min(local_lows) if local_lows else df['low'].iloc[idx]
+        else:
+            # 3买止损: 中枢ZG (回踩不应进入中枢)
+            lookback = max(0, idx - 30)
+            local_lows = lows[lookback:idx + 1] if idx + 1 <= len(lows) else lows[lookback:]
+            buy_low = min(local_lows) if local_lows else df['low'].iloc[idx]
 
         results.append({
             'buy_idx': idx,
@@ -1326,65 +1334,52 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
         if pd.Timestamp(buy_date) < min_30_date or pd.Timestamp(buy_date) > max_30_date:
             continue
 
-        # ========= 第四层: 30min 2买确认入场 =========
-        # 日线2买出现后, 等待30min级别的2买确认
-        # 只分析买点日期前后的窗口(加速)
-        signals_30 = detect_30min_2buy(df_30, window_start=buy_date)
-        if not signals_30:
-            continue
+        # ========= 第四层: 30min入场确认 (底分型+阳线+量≥5日均) =========
+        # 缠论原文: 30min底分型确认即入场, 不要求30min出2买
+        from lib.entry_confirm_30min import confirm_entry_30min
+        confirm_result = confirm_entry_30min(df_30, pd.Timestamp(buy_date))
 
-        # 找日线买点日期之后的30min 2买信号 (允许30天内确认)
-        valid_entries = [s for s in signals_30
-                         if s['date'] >= pd.Timestamp(buy_date)
-                         and s['date'] <= pd.Timestamp(buy_date) + pd.Timedelta(days=30)
-                         and s.get('confidence', 0) >= 0.5]
-
-        if not valid_entries:
-            continue
-
-        # 取置信度最高的30min 2买信号作为入场点
-        entry_signal = max(valid_entries, key=lambda s: s.get('confidence', 0))
-        entry_idx = entry_signal['entry_idx']
-        entry_price = entry_signal['entry_price']
-        entry_date = entry_signal['date']
-
-        # 止损逻辑: ATR动态止损 + 结构止损
-        atr_window = min(14, entry_idx)
-        if atr_window >= 5:
-            tr = []
-            for j in range(max(1, entry_idx - atr_window), entry_idx + 1):
-                h = df_30['high'].iloc[j]
-                l = df_30['low'].iloc[j]
-                pc = df_30['close'].iloc[j - 1]
-                tr.append(max(h - l, abs(h - pc), abs(l - pc)))
-            atr_val = sum(tr) / len(tr) if tr else entry_price * 0.03
+        if confirm_result.confirmed:
+            # 三条件全满足: 底分型+阳线+放量 → 最佳入场
+            entry_idx = confirm_result.confirm_bar_idx
+            entry_price = confirm_result.entry_price
+            entry_date = df_30.index[entry_idx]
         else:
-            atr_val = entry_price * 0.03
-        atr_stop = entry_price - 2 * atr_val
-        # 止损策略根据买点类型不同
+            # 无确认: 用日线买点当天的第一个30min bar作为入场
+            bars_after = df_30.index[df_30.index >= pd.Timestamp(buy_date)]
+            if len(bars_after) == 0:
+                continue
+            entry_idx = df_30.index.get_loc(bars_after[0])
+            entry_price = float(df_30['close'].iloc[entry_idx])
+            entry_date = df_30.index[entry_idx]
+
+        # 止损逻辑: 按缠论原文区分买点类型
         buy_type = item['buy_type']
-        engine_stop = item.get('stop_loss', 0)
-        min30_stop = entry_signal['stop_price']
+        daily_buy_low = item['buy_low']
 
-        if buy_type in ('3buy', 'quasi3buy'):
-            # 3买止损: ATR + 引擎止损, 取较远的给空间, 硬止损-10%
-            candidates = [atr_stop]
-            if 0 < engine_stop < entry_price:
-                candidates.append(engine_stop)
-            if 0 < min30_stop < entry_price:
-                candidates.append(min30_stop)
-            stop_price = min(candidates)  # 取最远的(给空间)
-            stop_price = max(stop_price, entry_price * 0.90)  # 3买硬止损-10%
+        if buy_type == '2buy':
+            # 2买止损 = 一买低点 (回踩不破前低, 给大空间)
+            stop_price = daily_buy_low
+            stop_price = max(stop_price, entry_price * 0.90)  # 硬止损-10%
         else:
-            # 1买止损: 结构止损 + ATR, 取最远的(给更多空间)
-            daily_buy_low = item['buy_low']
+            # 3买止损 = 中枢ZG 或 一买低点, 取较远的给空间
+            # 日线ATR(14)计算
+            buy_idx_daily = item['buy_idx']
+            atr_val = entry_price * 0.03
+            if buy_idx_daily >= 14 and buy_idx_daily < len(df_daily):
+                tr_sum = 0
+                for j in range(max(1, buy_idx_daily - 13), buy_idx_daily + 1):
+                    h = float(df_daily['high'].iloc[j])
+                    l = float(df_daily['low'].iloc[j])
+                    pc = float(df_daily['close'].iloc[j - 1])
+                    tr_sum += max(h - l, abs(h - pc), abs(l - pc))
+                atr_val = tr_sum / 14
+            atr_stop = entry_price - atr_val * 0.75
             candidates = [atr_stop]
             if 0 < daily_buy_low < entry_price:
                 candidates.append(daily_buy_low)
-            if 0 < min30_stop < entry_price:
-                candidates.append(min30_stop)
             stop_price = min(candidates)
-            stop_price = max(stop_price, entry_price * 0.85)  # 1买硬止损-15%
+            stop_price = max(stop_price, entry_price * 0.88)  # 硬止损-12%
 
         # ========= 支持重新入场的交易循环 =========
         # sub_trades: 同一个2买信号可能产生多次交易(止损→重新入场)
@@ -1416,14 +1411,16 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
                         entry_pivot = pv
                     latest_pivot = pv
 
-            # ========= V3: 结构确认减仓 + 盈利不加时间止损 =========
-            reduce_phase = 0
+            # ========= 两段止盈: 第一笔顶分型卖50% + 5笔后顶背离清仓 =========
+            reduce_phase = 0  # 0=全仓, 1=已减50%
             reduce1_price = None
             reduce1_date = None
-            reduce2_price = None
-            reduce2_date = None
-            broke_zg_bar = None  # 记录跌破ZG的bar位置
-            highest_price = current_entry_price  # 移动止损追踪
+            first_top_fractal_done = False
+            stroke_count_after_entry = 0
+            highest_price = current_entry_price
+
+            # 找入场后的笔 (只看入场点之后的)
+            entry_strokes = [s for s in strokes_30 if s['end_idx'] > current_entry_idx]
 
             # 逐bar模拟退出
             exit_price = None
@@ -1436,9 +1433,9 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
                 date_30 = df_30.index[i]
                 profit_pct = (price - current_entry_price) / current_entry_price
 
-                # --- 止损优先级最高(亏损端) ---
+                # --- 止损 (亏损端) ---
 
-                # 1. 硬止损: 结构止损 / 底背驰低点(重入场)
+                # 1. 结构止损
                 if price <= current_stop_price:
                     exit_price = max(current_stop_price, df_30['low'].iloc[i])
                     exit_date = date_30
@@ -1449,16 +1446,15 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
                     was_stopped_out = True
                     break
 
-                # 2. -10%硬止损(安全网)
-                if profit_pct < -0.10:
-                    exit_price = max(current_entry_price * 0.90, df_30['low'].iloc[i])
+                # 2. -12%硬止损(安全网)
+                if profit_pct < -0.12:
+                    exit_price = max(current_entry_price * 0.88, df_30['low'].iloc[i])
                     exit_date = date_30
-                    exit_reason = '硬止损(-10%)'
+                    exit_reason = '硬止损(-12%)'
+                    was_stopped_out = True
                     break
 
                 # --- 日线终极卖出 ---
-
-                # 3. 日线2卖 → 全清
                 df_daily_index_dates = set()
                 for idx_2s in sell_2sell_idx:
                     if 0 <= idx_2s < len(df_daily):
@@ -1473,88 +1469,75 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
                 if exit_price:
                     break
 
-                # --- 30min结构确认卖出(分级) ---
+                # --- 盈利端: 两段止盈 ---
 
-                # 更新最新中枢(中枢上移追踪)
-                for pv in pivots_30:
-                    if pv['start_idx'] > current_entry_idx and pv['end_idx'] <= i:
-                        if latest_pivot is None or pv['end_idx'] > latest_pivot['end_idx']:
-                            latest_pivot = pv
+                # 统计入场后已完成的笔数
+                completed_strokes = [s for s in entry_strokes if s['end_idx'] <= i]
+                stroke_count_after_entry = len(completed_strokes)
 
-                # 4. Phase 0→1: 形成中枢 + 跌破ZG → 减30%(结构性转弱)
-                #    必须在ZD之前检查, 否则ZD全清会跳过ZG减仓
-                if reduce_phase == 0 and latest_pivot and i > latest_pivot['end_idx']:
-                    if price < latest_pivot['ZG']:
-                        reduce_phase = 1
-                        reduce1_price = price
-                        reduce1_date = date_30
-                        broke_zg_bar = i
+                highest_price = max(highest_price, price)
 
-                # 5. Phase 1→2: 跌破ZG后反弹无法收回 → 再减20%(确认趋势结束)
-                if reduce_phase == 1 and broke_zg_bar is not None:
-                    if i > broke_zg_bar + 1:
-                        # 反弹到ZG以上 = 趋势恢复, 取消减仓
-                        if latest_pivot and price > latest_pivot['ZG']:
-                            reduce_phase = 0
-                            reduce1_price = None
-                            reduce1_date = None
-                            broke_zg_bar = None
-                        # 继续下跌或横盘超过8根bar没收回 → 确认减20%
-                        elif i - broke_zg_bar >= 8:
-                            reduce_phase = 2
-                            reduce2_price = price
-                            reduce2_date = date_30
+                # 阶段1: 第一笔向上笔完成(顶分型) → 减仓50%
+                if reduce_phase == 0 and stroke_count_after_entry >= 1:
+                    first_stroke = completed_strokes[0]
+                    # 第一笔是向上笔(底→顶)
+                    if first_stroke['start_type'] == 'bottom' and first_stroke['end_type'] == 'top':
+                        # 等第一笔结束后确认顶分型
+                        if i >= first_stroke['end_idx']:
+                            reduce_phase = 1
+                            # 取顶分型附近的价格作为减仓价
+                            reduce1_price = df_30['close'].iloc[first_stroke['end_idx']]
+                            reduce1_date = df_30.index[first_stroke['end_idx']]
 
-                # 6. 跌破最新中枢ZD → 全清(止损线)
-                #    在减仓检查之后执行, 确保ZG减仓有机会先触发
-                if latest_pivot and i > latest_pivot['end_idx']:
-                    if price < latest_pivot['ZD']:
+                # 阶段2: 走完5笔 + 顶背离(1卖) → 清仓剩余50%
+                if reduce_phase == 1 and stroke_count_after_entry >= 5:
+                    # 检查最新的向下笔是否有顶背离
+                    # 顶背离: 第5笔(向下笔)低点创新低但MACD面积缩小
+                    if i in sell_div_30:
                         exit_price = price
                         exit_date = date_30
-                        exit_reason = '清仓(跌破中枢ZD)'
+                        exit_reason = '顶背离清仓(5笔1卖)'
                         break
 
-                # 7. 盈利保护: 盈利>breakeven_trigger后止损移到成本价
-                if profit_pct > breakeven_trigger and current_stop_price < current_entry_price:
+                # 盈利保护: 盈利>5%后止损移到成本价
+                if profit_pct > 0.05 and current_stop_price < current_entry_price:
                     current_stop_price = current_entry_price
 
-                # 8. 分级移动止损:
-                #    Phase 0: 宽止损(20%回撤), 让ZG减仓有机会先触发
-                #    Phase 1+: 紧止损(12%回撤), 结构已转弱, 加速保护
-                highest_price = max(highest_price, price)
-                if profit_pct > 0.05:
+                # 盈利后移动止损: 从最高点回撤15%
+                if profit_pct > 0.05 and reduce_phase == 0:
                     drawdown = (highest_price - price) / highest_price
-                    trail_threshold = trail_phase0 if reduce_phase == 0 else trail_phase1
-                    if drawdown > trail_threshold:
+                    if drawdown > 0.15:
                         exit_price = price
                         exit_date = date_30
-                        exit_reason = f'移动止损(P{reduce_phase}回撤)'
+                        exit_reason = '移动止损(回撤15%)'
                         break
-                else:
-                    # 9. 亏损/微利仓位: 时间止损
-                    if i - current_entry_idx >= time_stop_bars:
+                elif profit_pct > 0.05 and reduce_phase == 1:
+                    drawdown = (highest_price - price) / highest_price
+                    if drawdown > 0.10:
                         exit_price = price
                         exit_date = date_30
-                        exit_reason = '时间止损(微利)'
+                        exit_reason = '移动止损(减仓后回撤10%)'
                         break
+
+                # 时间止损: 600根30min(约75个交易日)无盈利
+                if profit_pct <= 0 and i - current_entry_idx >= time_stop_bars:
+                    exit_price = price
+                    exit_date = date_30
+                    exit_reason = '时间止损(微利)'
+                    break
 
             if exit_price is None:
                 exit_price = df_30['close'].iloc[-1]
                 exit_date = df_30.index[-1]
                 exit_reason = '未退出(用最新价)'
 
-            # 计算加权收益
+            # 计算加权收益 (两段: 50%第一笔顶 + 50%清仓)
             if reduce_phase == 0:
                 total_ret = (exit_price - current_entry_price) / current_entry_price
-            elif reduce_phase == 1:
+            else:
                 ret1 = (reduce1_price - current_entry_price) / current_entry_price
                 ret2 = (exit_price - current_entry_price) / current_entry_price
-                total_ret = 0.3 * ret1 + 0.7 * ret2
-            elif reduce_phase == 2:
-                ret1 = (reduce1_price - current_entry_price) / current_entry_price
-                ret2 = (reduce2_price - current_entry_price) / current_entry_price
-                ret3 = (exit_price - current_entry_price) / current_entry_price
-                total_ret = 0.3 * ret1 + 0.2 * ret2 + 0.5 * ret3
+                total_ret = 0.5 * ret1 + 0.5 * ret2
 
             sub_trades.append({
                 'code': code,
@@ -1568,8 +1551,6 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
                 'reduce_phase': reduce_phase,
                 'reduce1_price': reduce1_price,
                 'reduce1_date': reduce1_date,
-                'reduce2_price': reduce2_price,
-                'reduce2_date': reduce2_date,
                 'reentry': reentry_count,
                 'hold_bars': df_30.index.get_loc(exit_date) - current_entry_idx if exit_date in df_30.index else 0,
             })
