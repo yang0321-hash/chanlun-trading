@@ -291,3 +291,66 @@ def td_confirm_buy(
     boost = round(max(-0.10, min(0.15, boost)), 3)
     detail = " | ".join(details) if details else "无TD信号"
     return boost, detail
+
+
+def td_confirm_sell(
+    td_result: 'TDResult',
+    bar_index: int,
+    sell_type: str,
+) -> Tuple[float, str]:
+    """用TD结果确认缠论卖点 (v7.3: 卖点必须TD确认, 77% vs 47%)
+
+    Args:
+        td_result: TD分析结果
+        bar_index: 卖点在K线序列中的位置
+        sell_type: 卖点类型 (1sell/2sell/3sell)
+
+    Returns:
+        (confidence_boost, detail_str)
+        boost范围: -0.10 ~ +0.20
+    """
+    reading = td_result.get_at(bar_index)
+    if not reading:
+        return 0.0, '无TD数据'
+
+    boost = 0.0
+    details = []
+
+    # TD Sell Setup
+    if reading.setup_sell >= 9:
+        boost += 0.12
+        details.append(f"SellSetup={reading.setup_sell}(完成)")
+    elif reading.setup_sell >= 8:
+        boost += 0.07
+        details.append(f"SellSetup={reading.setup_sell}")
+
+    # TD Sell Countdown
+    if reading.cd_sell >= 13:
+        boost += 0.20
+        details.append("SellCD=13(反转)")
+    elif reading.cd_sell >= 10:
+        boost += 0.12
+        details.append(f"SellCD={reading.cd_sell}")
+    elif reading.cd_sell >= 8:
+        boost += 0.07
+        details.append(f"SellCD={reading.cd_sell}")
+
+    # 附近卖点信号
+    nearby_score = td_result.get_sell_score_at(bar_index, lookback=8)
+    if nearby_score > 0.5:
+        boost += 0.05
+        details.append(f"近8日SellTD={nearby_score:.2f}")
+
+    # 反向信号(买点TD活跃 → 减分)
+    buy_score = td_result.get_buy_score_at(bar_index, lookback=8)
+    if buy_score > 0.5:
+        boost -= 0.05
+        details.append(f"BuyTD={buy_score:.2f}")
+
+    # 2sell/3sell更可靠
+    type_mult = {'1sell': 0.8, '2sell': 1.3, '3sell': 1.3}.get(sell_type, 1.0)
+    boost *= type_mult
+
+    boost = round(max(-0.10, min(0.20, boost)), 3)
+    detail = " | ".join(details) if details else "无TD卖出信号"
+    return boost, detail

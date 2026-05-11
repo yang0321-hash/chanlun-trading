@@ -136,6 +136,59 @@ class MarketEnvironment:
             return None
         return (closes[-1] - closes[-period - 1]) / closes[-period - 1] * 100
 
+    def get_state_for_date(self, date: str) -> str:
+        """
+        返回指定日期的市场状态: BULL/NEUTRAL/BEAR
+
+        用于回测时按历史日期判断大盘环境。
+        date格式: 'YYYYMMDD' 或 'YYYY-MM-DD'
+        """
+        date_clean = date.replace('-', '')
+        # 找到该日期在records中的位置
+        idx = None
+        for i, r in enumerate(self._records):
+            if r['date'] >= date_clean:
+                idx = i
+                break
+        if idx is None:
+            idx = len(self._records) - 1
+
+        # 需要至少270条记录才能算MA250+斜率
+        if idx < 270:
+            return 'NEUTRAL'
+
+        closes_up_to = [self._records[i]['close'] for i in range(idx + 1)]
+        close = closes_up_to[-1]
+        n = len(closes_up_to)
+
+        # MA250
+        ma250 = sum(closes_up_to[-250:]) / 250
+        # MA250斜率
+        if n >= 270:
+            ma250_20ago = sum(closes_up_to[-270:-20]) / 250
+            slope = (ma250 - ma250_20ago) / ma250_20ago * 100
+        else:
+            slope = 0
+
+        # 20日动量
+        if n >= 21:
+            mom = (close - closes_up_to[-21]) / closes_up_to[-21] * 100
+        else:
+            mom = 0
+
+        # 判定
+        if close >= ma250 and slope > 0:
+            return 'BULL'
+        elif slope > 0 or mom > 0:
+            return 'NEUTRAL'
+        else:
+            return 'BEAR'
+
+    def get_signal_weights_for_date(self, date: str) -> Dict[str, float]:
+        """返回指定日期环境下各买点类型的权重"""
+        state = self.get_state_for_date(date)
+        return dict(self.SIGNAL_WEIGHTS.get(state, self.SIGNAL_WEIGHTS['NEUTRAL']))
+
     def get_state(self) -> str:
         """返回当前市场状态: BULL/NEUTRAL/BEAR"""
         ms = self.get_market_state()

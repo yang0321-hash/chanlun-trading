@@ -146,7 +146,8 @@ class StrokeGenerator:
         self,
         kline: KLine,
         fractals: Optional[List[Fractal]] = None,
-        min_bars: int = 5
+        min_bars: int = 5,
+        sub_extreme_pct: float = 0.30,
     ):
         """
         初始化笔生成器
@@ -155,9 +156,11 @@ class StrokeGenerator:
             kline: K线对象
             fractals: 分型列表，如果为None则自动检测
             min_bars: 笔的最小K线数量
+            sub_extreme_pct: 次高点过滤阈值，回调/反弹幅度 < 前一笔的此比例则忽略
         """
         self.kline = kline
         self.min_bars = min_bars
+        self.sub_extreme_pct = sub_extreme_pct
 
         if fractals is None:
             detector = FractalDetector(kline, confirm_required=False)
@@ -341,6 +344,59 @@ class StrokeGenerator:
                 length=len(bars),
                 bars=bars,
             ))
+
+        # 阶段6: 次高点过滤 — 去除幅度不足的噪声笔
+        if self.sub_extreme_pct > 0 and len(self.strokes) >= 3:
+            self.strokes = self._filter_sub_extreme(self.strokes, self.sub_extreme_pct)
+
+    def _filter_sub_extreme(self, strokes: List[Stroke], threshold: float) -> List[Stroke]:
+        """
+        次高(低)点过滤
+
+        如果一段笔的幅度太小（相对前一笔不到threshold），
+        则这个分型是次级的，忽略让笔继续延伸。
+        """
+        if len(strokes) < 3:
+            return strokes
+
+        filtered = [strokes[0], strokes[1]]
+        for i in range(2, len(strokes)):
+            curr = strokes[i]
+            prev = filtered[-1]
+            prev_prev = filtered[-2]
+
+            prev_amp = abs(prev.end_value - prev.start_value)
+            curr_amp = abs(curr.end_value - curr.start_value)
+
+            if prev_amp > 0:
+                ratio = curr_amp / prev_amp
+                if ratio < threshold:
+                    # 次级分型，忽略但更新同方向极值
+                    if curr.is_up and curr.end_value > prev.end_value:
+                        filtered[-1] = self._merge_strokes(filtered[-1], curr)
+                    elif curr.is_down and curr.end_value < prev.end_value:
+                        filtered[-1] = self._merge_strokes(filtered[-1], curr)
+                    continue
+
+            filtered.append(curr)
+        return filtered
+
+    def _merge_strokes(self, base: Stroke, extension: Stroke) -> Stroke:
+        """合并两笔：base的起点 + extension的终点"""
+        bars = base.bars + extension.bars
+        return Stroke(
+            type=base.type,
+            start_index=base.start_index,
+            end_index=extension.end_index,
+            start_fractal=base.start_fractal,
+            end_fractal=extension.end_fractal,
+            start_value=base.start_value,
+            end_value=extension.end_value,
+            high=max(base.high, extension.high),
+            low=min(base.low, extension.low),
+            length=len(bars),
+            bars=bars,
+        )
 
     def _compare_fractal_strength(self, f1: Fractal, f2: Fractal) -> int:
         """
@@ -529,7 +585,8 @@ class StrokeGenerator:
 def generate_strokes(
     kline: KLine,
     fractals: Optional[List[Fractal]] = None,
-    min_bars: int = 5
+    min_bars: int = 5,
+    sub_extreme_pct: float = 0.30,
 ) -> List[Stroke]:
     """
     便捷函数：生成K线序列的所有笔
@@ -538,9 +595,10 @@ def generate_strokes(
         kline: K线对象
         fractals: 分型列表，None则自动检测
         min_bars: 最小K线数
+        sub_extreme_pct: 次高点过滤阈值
 
     Returns:
         笔列表
     """
-    generator = StrokeGenerator(kline, fractals, min_bars)
+    generator = StrokeGenerator(kline, fractals, min_bars, sub_extreme_pct)
     return generator.get_strokes()
