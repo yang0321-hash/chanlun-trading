@@ -184,16 +184,8 @@ class UnifiedExitManager:
 
         # === 3. Fixed stop loss ===
         if self.config.use_fixed_stop and record.fixed_stop_loss > 0:
-            # 阶梯保本+锁利: 盈利越多止损越高
-            if profit_pct >= 0.15:
-                lock_stop = record.entry_price * 1.08
-                if record.fixed_stop_loss < lock_stop:
-                    record.fixed_stop_loss = lock_stop
-            elif profit_pct >= 0.08:
-                lock_stop = record.entry_price * 1.03
-                if record.fixed_stop_loss < lock_stop:
-                    record.fixed_stop_loss = lock_stop
-            elif profit_pct >= 0.03:
+            # v3a风格: 盈利>5%后止损提到保本
+            if profit_pct >= 0.05:
                 if record.fixed_stop_loss < record.entry_price:
                     record.fixed_stop_loss = record.entry_price
                     record.breakeven_raised = True
@@ -248,10 +240,7 @@ class UnifiedExitManager:
                 # ATR-adaptive trailing: stop = highest - N * ATR
                 # 按买点类型使用不同ATR倍数:
                 # 3buy=3.0 (趋势确立, 给空间), 其他=1.0 (抄底信号, 紧止损)
-                multiplier = self.config.atr_trailing_multiplier
-                bpt = record.buy_point_type
-                if bpt in ('3buy', 'quasi3buy', '2b3bbuy'):
-                    multiplier = max(multiplier, 3.0)  # 3买类给大空间
+                multiplier = self.config.get_atr_multiplier(record.buy_point_type)
                 if trend_status in ('STRONG_UP', 'strong_up') and profit_pct > 0.15:
                     multiplier *= 1.5  # 强趋势且已有15%+利润，放宽50%
                 atr_trailing_stop = record.highest_price - atr_value * multiplier

@@ -5,7 +5,7 @@
 """
 
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 
 @dataclass
@@ -54,46 +54,67 @@ class FilterConfig:
 
 @dataclass
 class ExitConfig:
-    """出场管理配置"""
+    """出场管理配置 — v3a区间套风格: 背驰止盈+动态跟踪, 不预设固定止盈"""
     use_chanlun_stop: bool = True         # 缠论止损
     use_fixed_stop: bool = True          # 固定止损
     use_trailing_stop: bool = True       # 跟踪止损
-    use_partial_profit: bool = True      # 分批止盈
+    use_partial_profit: bool = False     # 分批止盈 — 关闭! v3a用背驰+跟踪代替
     use_time_stop: bool = True           # 时间止损
 
-    fixed_stop_pct: float = 0.05         # 固定止损比例 5%（1买/2买默认）
-    fixed_stop_pct_3buy: float = 0.05   # 三买固定止损比例 5%（三买回踩确认，止损更紧）
-    trailing_activation: float = 0.03    # 跟踪止损激活点 3% (原5%, 更早保护利润)
-    trailing_offset: float = 0.08        # 跟踪止损回撤 8%
+    fixed_stop_pct: float = 0.12         # 固定止损比例 12% (v3a原版)
+    fixed_stop_pct_3buy: float = 0.12    # 三买固定止损 12%
+    trailing_activation: float = 0.05    # 跟踪止损激活点 5% (v3a原版)
+    trailing_offset: float = 0.03        # 跟踪止损回撤 3% (v3a原版)
     profit_targets: List[Tuple[float, float]] = field(default_factory=lambda: [
-        (0.08, 0.2),   # 盈利8%卖20% (原5%卖30%, 让利润多跑)
-        (0.15, 0.2),   # 盈利15%卖20% (原10%卖30%)
-        (0.25, 0.3),   # 盈利25%卖30% (原15%卖40%, 剩余30%靠ATR跟踪)
+        (0.08, 0.2),   # 不使用(use_partial_profit=False)
+        (0.15, 0.2),
+        (0.25, 0.3),
     ])
-    time_stop_bars: int = 60             # 时间止损K线数
+    time_stop_bars: int = 80             # 时间止损K线数 80 (v3a原版, 约5天)
 
-    # === 动态止盈参数 ===
-    use_atr_trailing: bool = True        # ATR自适应跟踪止损
-    atr_trailing_multiplier: float = 3.0 # ATR跟踪止损倍数
-    atr_period: int = 14                 # ATR计算周期
+    # === ATR跟踪止损参数 (v73实测优化) ===
+    use_atr_trailing: bool = True        # 启用ATR跟踪止损
+    atr_trailing_multiplier: float = 0.5  # 默认0.5x ATR（v73全类型最优）
+    atr_period: int = 14
 
-    use_dynamic_targets: bool = True     # 趋势自适应分批止盈
-    # 趋势自适应止盈目标: (profit_pct, sell_ratio)
+    # === v73 ATR止损分段参数 ===
+    # 来源: v73 _atr_stop_result.json 实测最优值
+    # 规则: consolidationB/3B用0.75x(波段回调紧止损); 1B/2B用1.5x(给空间等反弹);
+    #       quasi2B用0.5x(次级买点, 紧止损); sub1B用0.5x(谨慎)
+    atr_multipliers_by_type: Dict[str, float] = field(default_factory=lambda: {
+        '1buy':    0.75,   # 1B: 0.75x ATR (v73: 胜率55.9%→75%, avg 5.91%→8.67%)
+        '2buy':    1.50,   # 2B: 1.5x ATR (v73: 胜率42.1%→?, avg 7.38%)
+        '3buy':    0.75,   # 3B: 0.75x ATR (v73: 胜率64.9%, avg 6.18%)
+        'sub1buy': 0.50,   # 盘整背驰1B类: 紧止损
+        'quasi2buy': 0.50, # 类2B: 0.5x ATR (v73 quasi2B baseline胜率55%)
+        'quasi3buy': 0.75, # 类3B: 0.75x
+        '2b3bbuy': 1.50,   # 2B+3B混合: 1.5x
+        # v73补充类型（兼容性）
+        'consolidationB': 0.50,  # 盘整背驰(v73胜率69.5%→76.4%)
+        '3B': 0.75,
+        '2B': 1.50,
+        '1B': 0.75,
+        'quasi2B': 0.50,
+    })
+
+    def get_atr_multiplier(self, buy_point_type: str) -> float:
+        return self.atr_multipliers_by_type.get(buy_point_type, self.atr_trailing_multiplier)
+
+    use_dynamic_targets: bool = False    # 不用分批止盈
     dynamic_targets_strong: List[Tuple[float, float]] = field(default_factory=lambda: [
-        (0.15, 0.15),  # 强趋势: 15%先卖15% (原10%卖10%, 给更大空间)
-        (0.30, 0.20),  # 30%再卖20% (原20%卖15%)
-        (0.50, 0.15),  # 50%再卖15% (原35%卖25%)
-        # 剩余50%靠ATR跟踪止损（让利润跑更远）
+        (0.15, 0.15),
+        (0.30, 0.20),
+        (0.50, 0.15),
     ])
     dynamic_targets_normal: List[Tuple[float, float]] = field(default_factory=lambda: [
-        (0.08, 0.2),   # 正常: 8%卖20% (原5%卖30%, 让利润多跑)
-        (0.15, 0.2),   # 15%卖20% (原10%卖30%)
-        (0.25, 0.3),   # 25%卖30% (原15%卖40%, 剩余30%靠ATR跟踪)
+        (0.08, 0.2),
+        (0.15, 0.2),
+        (0.25, 0.3),
     ])
     dynamic_targets_weak: List[Tuple[float, float]] = field(default_factory=lambda: [
-        (0.03, 0.4),   # 弱势: 3%卖40%
-        (0.06, 0.35),  # 6%卖35%
-        (0.10, 0.25),  # 10%卖剩余
+        (0.03, 0.4),
+        (0.06, 0.35),
+        (0.10, 0.25),
     ])
 
     use_structure_exit: bool = True      # 结构加速出场
@@ -219,4 +240,56 @@ class UnifiedStrategyConfig:
         # 仓位
         config.position.max_position_pct = 0.25
         config.position.unconfirmed_ratio = 0.5
+        return config
+
+    @classmethod
+    def v73_daily(cls) -> 'UnifiedStrategyConfig':
+        """v7.3 策略: 日线CC15 + MA250环境 + 按买点类型ATR止损"""
+        config = cls(name='v7.3 Daily CC15策略')
+        config.timeframes.use_min30 = False
+        config.timeframes.use_weekly = False
+        config.exit.use_atr_trailing = True
+        config.exit.atr_multipliers_by_type = {
+            '1buy': 0.75, '2buy': 1.5, '3buy': 3.0,
+            'sub1buy': 0.5, 'quasi2buy': 0.5,
+            'quasi3buy': 1.5, '2b3bbuy': 1.5,
+        }
+        config.exit.fixed_stop_pct = 0.08
+        config.exit.trailing_activation = 0.03
+        config.exit.trailing_offset = 0.03
+        config.exit.time_stop_bars = 80
+        config.exit.use_dynamic_targets = False
+        config.position.max_position_pct = 0.30
+        return config
+
+    @classmethod
+    def v75_daily(cls) -> 'UnifiedStrategyConfig':
+        """v7.5 策略: v5扫描器 + 网格搜索优化出场参数
+
+        网格搜索结果 (74553笔交易):
+          1buy: 胜率59.6% → 均收+8.23% P/L=5.60 (ATR=1.0)
+          2buy: 胜率43.0% → 均收+2.69% P/L=2.75 (ATR=0.75)
+          vs v7.3基线: 1buy胜率59.9%/均收+8.65%, 2buy胜率42.5%/均收+2.41%
+
+        优化要点:
+          - trailing_offset对ATR跟踪模式无影响, 核心是ATR倍数
+          - 1买: 稍宽ATR(0.75→1.0) 均收提升, 胜率微降
+          - 2买: 紧ATR(1.5→0.75) + 紧止损(8%→5%) 均收+2.69% vs +2.41%
+        """
+        config = cls(name='v7.5 网格优化策略')
+        config.timeframes.use_min30 = False
+        config.timeframes.use_weekly = False
+        config.exit.use_atr_trailing = True
+        config.exit.atr_multipliers_by_type = {
+            '1buy': 1.0, '2buy': 0.75, '3buy': 3.0,
+            'sub1buy': 0.5, 'quasi2buy': 0.5,
+            'quasi3buy': 1.5, '2b3bbuy': 1.5,
+        }
+        config.exit.fixed_stop_pct = 0.10
+        config.exit.fixed_stop_pct_3buy = 0.12
+        config.exit.trailing_activation = 0.05
+        config.exit.trailing_offset = 0.03
+        config.exit.time_stop_bars = 80
+        config.exit.use_dynamic_targets = False
+        config.position.max_position_pct = 0.30
         return config
