@@ -1837,6 +1837,7 @@ def find_daily_1buy_2buy(
             '2buy_idx': abs_2b_idx,
             '2buy_price': r2['price'],
             '2buy_low': r2.get('stop', r2['price'] * 0.97),
+            'confidence': buy.get('confidence', 0.5),
         })
 
     return pairs
