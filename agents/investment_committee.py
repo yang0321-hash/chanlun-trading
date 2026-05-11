@@ -117,6 +117,10 @@ class InvestmentCommittee:
 
             try:
                 result = self.evaluate_one(candidate)
+                # 透传E版过滤器的仓位系数
+                for field in ('pos_coef', 'eff_regime'):
+                    if field in candidate and field not in result:
+                        result[field] = candidate[field]
                 results.append(result)
                 print(f' {result["decision"]} ({result["composite_score"]:.0f}分)')
             except Exception as e:

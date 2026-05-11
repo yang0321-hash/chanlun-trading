@@ -64,7 +64,27 @@ def code_to_pure(code: str) -> str:
 # ==================== 数据获取 ====================
 
 def get_all_stocks_today() -> Optional[pd.DataFrame]:
-    """获取全市场今日行情 (AKShare)"""
+    """获取全市场今日行情 (Tushare优先，AKShare备选)"""
+    # 优先用Tushare
+    try:
+        import tushare as ts
+        token = '445af3e7113dd4984a0ac217c32686ec6321161eac11a435529bc07d'
+        pro = ts.pro_api(token)
+        today = pd.Timestamp.now().strftime('%Y%m%d')
+        df = pro.daily(trade_date=today)
+        if df is not None and len(df) > 100:
+            df = df.rename(columns={
+                'ts_code': 'code', 'trade_date': 'date',
+                'pct_chg': 'pct_chg', 'change': 'change',
+                'close': 'price', 'vol': 'volume',
+            })
+            df['code'] = df['code'].apply(code_to_pure)
+            print(f'  Tushare获取 {len(df)} 只', flush=True)
+            return df
+    except Exception as e:
+        print(f'  Tushare失败: {e}', flush=True)
+
+    # AKShare备选
     try:
         import akshare as ak
         df = ak.stock_zh_a_spot_em()
@@ -86,18 +106,21 @@ def get_all_stocks_today() -> Optional[pd.DataFrame]:
 def get_all_stocks_tdx(hs: HybridSource) -> Optional[pd.DataFrame]:
     """备选: 从TDX本地数据计算今日涨跌幅"""
     try:
-        sector_map = load_sector_map()
+        from chanlun_unified.stock_pool import StockPoolManager
+        spm = StockPoolManager()
+        all_codes = spm.get_pool('tdx_all')
         rows = []
-        for code in sector_map:
+        for code in all_codes:
             try:
-                df = hs.get_kline(code, period='daily')
+                pure = code.split('.')[0]
+                df = hs.get_kline(pure, period='daily')
                 if df is None or len(df) < 2:
                     continue
                 last = df.iloc[-1]
                 prev = df.iloc[-2]
                 pct = (last['close'] - prev['close']) / prev['close'] * 100
                 rows.append({
-                    'code': code,
+                    'code': pure,
                     'name': '',
                     'price': last['close'],
                     'pct_chg': pct,
@@ -107,6 +130,7 @@ def get_all_stocks_tdx(hs: HybridSource) -> Optional[pd.DataFrame]:
             except Exception:
                 continue
         if rows:
+            print(f'  TDX本地获取 {len(rows)} 只', flush=True)
             return pd.DataFrame(rows)
         return None
     except Exception:

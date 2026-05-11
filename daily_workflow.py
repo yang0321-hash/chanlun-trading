@@ -146,7 +146,7 @@ def code_to_prefix(code: str) -> str:
 def run_scan_enhanced(hs: HybridSource, top_n: int = TOP_N) -> List[dict]:
     """主模式：使用 scan_enhanced_v3 扫描"""
     try:
-        from scan_enhanced_v3 import scan_enhanced
+        from scan_enhanced_v5 import scan_enhanced
         results = scan_enhanced(pool='tdx_all', lookback_days=30, min_price=2.0, max_price=2000.0, top_n=top_n)
         return results or []
     except Exception as e:
@@ -684,10 +684,13 @@ def build_feishu_card(committee_results: List[dict],
             name = r.get('name', '')
             score = r.get('composite_score', 0)
             stop = r.get('stop_loss', 0)
+            pos_coef = r.get('pos_coef', 1.0)
+            eff_regime = r.get('eff_regime', '')
             factors = ', '.join(r.get('key_factors', [])[:2])
+            regime_icon = {'BULL': '🟢', 'NEUTRAL': '🟡', 'BEAR': '🔴'}.get(eff_regime, '⚪')
             lines.append(
                 f'{i}. {code_to_prefix(code)} ({name}) '
-                f'评分:{score:.0f} 止损:{stop:.2f}')
+                f'评分:{score:.0f} 止损:{stop:.2f} {regime_icon}仓位:{pos_coef:.0%}')
             if factors:
                 lines.append(f'   {factors}')
         elements.append({

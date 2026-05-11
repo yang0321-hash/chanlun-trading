@@ -545,17 +545,22 @@ class SignalEngine:
             third_buy = self._detect_3buy_context(filtered_fractals, df)
 
         # ===== v13→v15: 面积背驰(区分趋势/盘整) + 2买预计算 =====
-        buy_div_set, sell_div_set, trend_buy_div, trend_sell_div = self._compute_area_divergence(strokes, macd_hist, n, use_pivots=use_pivots)
-        buy_2buy_set = self._detect_2buy(strokes, buy_div_set, n)
+        buy_div_set, sell_div_set, trend_buy_div, trend_sell_div, panbei_div, panbei_sell = self._compute_area_divergence(strokes, macd_hist, n, use_pivots=use_pivots)
+        # [修复] panbei_div = 盘背（笔级别），trend_buy_div = 中枢背驰（趋势级别）
+        # 盘背按原文应忽略，所有使用buy_div_set的地方改为只用中枢背驰trend_buy_div
+        # (注: buy_divergence_set 的正确值在 v14 区段定义)
 
         # ===== v14: 线段检测 + 线段背驰 + 2卖 =====
         segments = self._detect_segments(strokes)
         seg_buy_div, seg_sell_div = self._compute_segment_divergence(segments, strokes, macd_hist, n)
-        sell_2sell_set = self._detect_2sell(strokes, sell_div_set, n)
 
-        # 合并: 笔级别 + 线段级别背驰取并集
-        buy_divergence_set = buy_div_set | seg_buy_div
-        sell_divergence_set = sell_div_set | seg_sell_div
+        # [修复] 合并: 只用中枢背驰(趋势背驰+线段背驰)，盘背全部排除
+        # 原文第14课: "只有中枢级别的背驰才有意义，什么盘背就可以忽略了"
+        buy_divergence_set = trend_buy_div | seg_buy_div  # 趋势背驰|线段背驰，无盘背
+        sell_divergence_set = trend_sell_div | seg_sell_div
+
+        buy_2buy_set = self._detect_2buy(strokes, buy_divergence_set | panbei_div, n)
+        sell_2sell_set = self._detect_2sell(strokes, sell_divergence_set, n)
 
         # v3: 预计算中枢(v3买点检测需要)
         zhongshu_list = self._detect_zhongshu_from_strokes(strokes)
@@ -1163,6 +1168,38 @@ class SignalEngine:
             elif prev['type'] == 'bottom' and curr['type'] == 'top':
                 sell_signals.iloc[signal_idx] = True
 
+        # Step 4.5: 次极值过滤 — 去除幅度不足的噪声笔
+        # 如果连续两笔中后一笔幅度 < 前一笔的30%, 则次级分型可忽略
+        if len(filtered) >= 5:
+            se_pct = 0.30
+            se_filt = [filtered[0]]
+            for j in range(1, len(filtered)):
+                curr = filtered[j]
+                prev = se_filt[-1]
+                # 计算包含curr的笔的幅度
+                if len(se_filt) >= 2:
+                    prev_prev = se_filt[-2]
+                    prev_amp = abs(prev['val'] - prev_prev['val'])
+                    curr_amp = abs(curr['val'] - prev['val'])
+                    if prev_amp > 0 and curr_amp / prev_amp < se_pct:
+                        # 次级分型: 跳过但更新极值
+                        if curr['type'] == prev['type']:
+                            if (curr['type'] == 'top' and curr['val'] > prev['val']) or \
+                               (curr['type'] == 'bottom' and curr['val'] < prev['val']):
+                                se_filt[-1] = curr
+                        continue
+                se_filt.append(curr)
+            # 确保过滤后仍然顶底交替
+            final_filt = [se_filt[0]]
+            for f in se_filt[1:]:
+                if f['type'] != final_filt[-1]['type']:
+                    final_filt.append(f)
+                else:
+                    if (f['type'] == 'top' and f['val'] > final_filt[-1]['val']) or \
+                       (f['type'] == 'bottom' and f['val'] < final_filt[-1]['val']):
+                        final_filt[-1] = f
+            filtered = final_filt
+
         # Step 5: 构建笔列表 [v13] 用于背驰面积计算和中枢检测
         strokes = []
         for j in range(len(filtered) - 1):
@@ -1182,17 +1219,22 @@ class SignalEngine:
 
     def _compute_area_divergence(self, strokes: List[Dict], macd_hist: pd.Series, n: int,
                                   use_pivots: bool = False):
-        """v16: 缠论趋势背驰 (a+A+b+B+c) + 盘整背驰
+        """v16: 缠论趋势背驰 (a+A+b+B+c) + 盘整背驰(已降级)
 
         趋势背驰(缠论原文): 至少2个同级别中枢形成趋势, 最后中枢B的离开段c
         比进入段b力度弱(幅度AND MACD), 但价格走得更远.
-        盘整背驰: 连续同向笔MACD面积缩小(保留, 作为补充信号).
+
+        [修复] 盘整背驰: 不再混入buy_divergence，改为panbei_div独立追踪
+        原文第14课: "只有中枢级别的背驰才有意义，什么盘背就可以忽略了"
+        → 盘整背驰信号被标记但不使用，从源头排除
 
         Returns:
             buy_divergence: set of signal_idx — 底背驰(1买)位置
             sell_divergence: set of signal_idx — 顶背驰(1卖)位置
             trend_buy_div: set of signal_idx — 趋势底背驰(更强信号)
             trend_sell_div: set of signal_idx — 趋势顶背驰(更强信号)
+            panbei_div: set of signal_idx — 盘整背驰(已降级，不用于交易信号)
+            panbei_sell: set of signal_idx — 盘整背驰卖出(已降级，不用于交易信号)
         """
         buy_divergence = set()
         sell_divergence = set()
@@ -1292,6 +1334,9 @@ class SignalEngine:
         up_strokes = [s for s in strokes
                       if s['start_type'] == 'bottom' and s['end_type'] == 'top']
 
+        # === 2. 盘整背驰: 连续同向笔MACD面积缩小 — 原文说"可忽略"，独立标记 ===
+        panbei_div = set()   # [修复] 盘背独立追踪，不混入中枢背驰
+        panbei_sell = set()
         for k in range(1, len(down_strokes)):
             prev = down_strokes[k - 1]
             curr = down_strokes[k]
@@ -1300,7 +1345,7 @@ class SignalEngine:
             if curr['end_val'] < prev['end_val'] and curr_area < prev_area:
                 signal_idx = curr['end_idx'] + self.bi_confirm_delay
                 if 0 <= signal_idx < n:
-                    buy_divergence.add(signal_idx)
+                    panbei_div.add(signal_idx)
 
         for k in range(1, len(up_strokes)):
             prev = up_strokes[k - 1]
@@ -1310,9 +1355,9 @@ class SignalEngine:
             if curr['end_val'] > prev['end_val'] and curr_area < prev_area:
                 signal_idx = curr['end_idx'] + self.bi_confirm_delay
                 if 0 <= signal_idx < n:
-                    sell_divergence.add(signal_idx)
+                    panbei_sell.add(signal_idx)
 
-        return buy_divergence, sell_divergence, trend_buy_div, trend_sell_div
+        return buy_divergence, sell_divergence, trend_buy_div, trend_sell_div, panbei_div, panbei_sell
 
     def _detect_zhongshu_from_strokes(self, strokes: List[Dict]) -> List[Dict]:
         """v15: 从笔序列检测中枢(供背驰检测和3买检测共用)

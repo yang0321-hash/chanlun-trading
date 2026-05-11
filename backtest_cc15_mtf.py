@@ -754,7 +754,7 @@ def fetch_sina_30min(symbol, datalen=2000):
         return pd.DataFrame()
 
 
-def run_daily_backtest(codes, params=None, start_date=None):
+def run_daily_backtest(codes, params=None, start_date=None, conf_1buy=0.75):
     """纯日线级别回测 — 覆盖完整数据周期(4+年)
 
     策略: 月线方向 + 周线结构 + 日线买点 → 日线级别出场
@@ -810,8 +810,8 @@ def run_daily_backtest(codes, params=None, start_date=None):
                 continue
             if b.confidence < 0.6:
                 continue
-            # 1买需要更高置信度(>=0.75), 减少假底部
-            if b.point_type == '1buy' and b.confidence < 0.75:
+            # 1买需要更高置信度, 减少假底部
+            if b.point_type == '1buy' and b.confidence < conf_1buy:
                 continue
             idx = b.index
             if idx < 50 or idx >= len(daily_map[code]):

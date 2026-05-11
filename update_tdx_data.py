@@ -190,6 +190,7 @@ class TDXDataUpdater:
 
         # 合并数据
         combined_df = pd.concat([local_df, new_df], ignore_index=True)
+        combined_df['date'] = combined_df['date'].astype(str)
         combined_df = combined_df.drop_duplicates(subset=['date'], keep='last')
         combined_df = combined_df.sort_values('date').reset_index(drop=True)
 
