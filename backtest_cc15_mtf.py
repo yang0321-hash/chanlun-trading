@@ -23,6 +23,7 @@ for k in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']:
 
 import numpy as np
 import pandas as pd
+import json
 from datetime import datetime, timedelta
 from data.hybrid_source import HybridSource
 from core.kline import KLine
@@ -1186,7 +1187,7 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
     trail_phase1 = p.get('trail_phase1', 0.12)
     breakeven_trigger = p.get('breakeven_trigger', 0.20)
     time_stop_bars = p.get('time_stop_bars', 600)
-    max_positions = p.get('max_positions', 10)
+    max_positions = p.get('max_positions', 5)
 
     hs = HybridSource()
 
@@ -1340,18 +1341,13 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
         confirm_result = confirm_entry_30min(df_30, pd.Timestamp(buy_date))
 
         if confirm_result.confirmed:
-            # 三条件全满足: 底分型+阳线+放量 → 最佳入场
+            # 三条件全满足: 底分型+阳线+放量 → 入场
             entry_idx = confirm_result.confirm_bar_idx
             entry_price = confirm_result.entry_price
             entry_date = df_30.index[entry_idx]
         else:
-            # 无确认: 用日线买点当天的第一个30min bar作为入场
-            bars_after = df_30.index[df_30.index >= pd.Timestamp(buy_date)]
-            if len(bars_after) == 0:
-                continue
-            entry_idx = df_30.index.get_loc(bars_after[0])
-            entry_price = float(df_30['close'].iloc[entry_idx])
-            entry_date = df_30.index[entry_idx]
+            # 无确认: 跳过 (过滤低质量信号)
+            continue
 
         # 止损逻辑: 按缠论原文区分买点类型
         buy_type = item['buy_type']
@@ -1553,6 +1549,8 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
                 'reduce1_date': reduce1_date,
                 'reentry': reentry_count,
                 'hold_bars': df_30.index.get_loc(exit_date) - current_entry_idx if exit_date in df_30.index else 0,
+                'confidence': item.get('confidence', 0.5),
+                'buy_type': buy_type,
             })
 
             # ========= 止损后重新入场逻辑 =========
@@ -1612,8 +1610,23 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
             trade_dedup[key] = t
     trades = list(trade_dedup.values())
 
+    # 置信度过滤: 只保留confidence >= 0.6的交易
+    conf_threshold = p.get('conf_threshold', 0.6)
+    before_conf = len(trades)
+    trades = [t for t in trades if t.get('confidence', 0) >= conf_threshold]
+    print(f'   置信度过滤(>={conf_threshold}): {before_conf} → {len(trades)} 笔')
+
+    # 加载行业映射 (用于同行业去重)
+    sector_map = {}
+    for sp in ['chanlun_system/full_sector_map.json', 'chanlun_system/thshy_sector_map.json']:
+        if os.path.exists(sp):
+            with open(sp, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                sector_map = data.get('stock_to_sector', {})
+            break
+
     # 汇总
-    print(f'   有效交易: {len(trades)} 笔 (去重后)')
+    print(f'   有效交易: {len(trades)} 笔 (最终)')
     print()
 
     if not trades:
@@ -1625,11 +1638,14 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
     # ========= 组合级别模拟 =========
     trades.sort(key=lambda x: x['entry_date'])
 
-    open_positions = {}   # code -> {trade, alloc}
+    open_positions = {}   # code -> {trade, alloc, sector}
     capital = 1_000_000
+    peak_capital = 1_000_000
     equity_curve = []     # [(date, equity)]
     closed_trades = []
     skipped = 0
+    skipped_sector = 0
+    skipped_dd = 0
 
     for trade in trades:
         code = trade['code']
@@ -1647,21 +1663,38 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
             pos['trade']['pnl'] = pnl
             closed_trades.append(pos['trade'])
             equity_curve.append((pos['trade']['exit_date'], capital))
+            peak_capital = max(peak_capital, capital)
 
-        # 2. 检查同股是否已在仓
+        # 2. 回撤控制: >15%减半仓, >25%停止开仓
+        current_dd = (capital - peak_capital) / peak_capital if peak_capital > 0 else 0
+        if current_dd < -0.25:
+            skipped_dd += 1
+            continue
+        dd_scale = 0.5 if current_dd < -0.15 else 1.0
+
+        # 3. 检查同股是否已在仓
         if code in open_positions:
             skipped += 1
             continue
 
-        # 3. 检查持仓上限
+        # 4. 检查持仓上限
         if len(open_positions) >= max_positions:
             skipped += 1
             continue
 
-        # 4. 分配资金: 等权
-        alloc = capital / max_positions
+        # 5. 同行业去重: 同行业最多1只
+        trade_sector = sector_map.get(code, '')
+        if trade_sector:
+            same_sector = [c for c, p in open_positions.items()
+                           if p.get('sector') == trade_sector]
+            if same_sector:
+                skipped_sector += 1
+                continue
+
+        # 6. 分配资金: 等权 × 回撤缩仓
+        alloc = capital / max_positions * dd_scale
         capital -= alloc
-        open_positions[code] = {'trade': trade, 'alloc': alloc}
+        open_positions[code] = {'trade': trade, 'alloc': alloc, 'sector': trade_sector}
 
     # 平掉剩余持仓
     for c, pos in open_positions.items():
@@ -1727,6 +1760,10 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
     print(f'最大单笔亏: {min(returns)*100:.2f}%')
     if skipped:
         print(f'跳过(仓位满/重复): {skipped}笔')
+    if skipped_sector:
+        print(f'跳过(同行业): {skipped_sector}笔')
+    if skipped_dd:
+        print(f'跳过(回撤控制): {skipped_dd}笔')
     print()
     print(f'减仓阶段分布:')
     print(f'  未减仓(满仓进出): {phase_counts.get(0, 0)}笔')
