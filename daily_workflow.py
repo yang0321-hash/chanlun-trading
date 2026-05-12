@@ -147,7 +147,7 @@ def run_scan_enhanced(hs: HybridSource, top_n: int = TOP_N) -> List[dict]:
     """主模式：使用 scan_enhanced_v3 扫描"""
     try:
         from scan_enhanced_v5 import scan_enhanced
-        results = scan_enhanced(pool='tdx_all', lookback_days=30, min_price=2.0, max_price=2000.0, top_n=top_n)
+        results = scan_enhanced(pool='tdx_all', lookback_days=30, min_price=10.0, max_price=2000.0, top_n=top_n)
         return results or []
     except Exception as e:
         print(f'  scan_enhanced_v3 失败: {e}')

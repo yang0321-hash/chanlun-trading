@@ -1604,7 +1604,7 @@ def _mp_worker(args):
     return signals
 
 
-def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200.0,
+def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=10.0, max_price=200.0,
                   top_n=10):
     """增强版扫描"""
     hs = HybridSource()
@@ -2354,7 +2354,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--pool', default='tdx_all')
     parser.add_argument('--days', type=int, default=30)
-    parser.add_argument('--min-price', type=float, default=3.0)
+    parser.add_argument('--min-price', type=float, default=10.0)
     parser.add_argument('--max-price', type=float, default=200.0)
     parser.add_argument('--top', type=int, default=10)
     parser.add_argument('--committee', action='store_true', help='运行投资委员会评估')

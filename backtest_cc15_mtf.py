@@ -1223,6 +1223,17 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
         print(f'   成交额过滤(>={min_turnover/1e8:.0f}亿): {len(daily_map)} → {len(filtered)} 只')
     daily_map = filtered
 
+    # 过滤低价股 (低价股结构不清晰, 缠论识别准确率低)
+    min_price = p.get('min_price', 10.0)
+    price_filtered = {}
+    for code, df in daily_map.items():
+        last_close = df['close'].iloc[-1]
+        if last_close >= min_price:
+            price_filtered[code] = df
+    if len(price_filtered) < len(daily_map):
+        print(f'   低价股过滤(>={min_price:.0f}元): {len(daily_map)} → {len(price_filtered)} 只')
+    daily_map = price_filtered
+
     # 找日线3买信号 (使用核心缠论引擎, 每只股票只跑一次管线)
     print('[2] 识别日线3买信号 (核心缠论引擎)...')
     all_buys = []
