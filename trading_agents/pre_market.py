@@ -320,8 +320,7 @@ class PreMarketAgent:
                     continue
 
                 # 获取最近120天日线
-                prefix = code_to_prefix(code)
-                df = self.hs.get_daily(prefix, days=120)
+                df = self.hs.get_kline(code, period='daily')
                 if df is None or len(df) < 30:
                     continue
 
