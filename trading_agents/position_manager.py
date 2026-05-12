@@ -334,3 +334,52 @@ class PositionManager:
             'sectors_in_use': list(self.get_sectors_in_use()),
             'can_open': dd >= -self.DD_STOP_THRESHOLD,
         }
+
+    # ==================== T+1卖出队列 (A股T+1约束) ====================
+
+    @staticmethod
+    def _t1_file():
+        return POSITIONS_FILE.replace('positions.json', 't1_sell_queue.json')
+
+    def queue_t1_sell(self, code, sell_type, signal_price, reason=''):
+        """将卖出信号加入T+1队列 (当日记录, 次日开盘执行)"""
+        queue = self._t1_load()
+        queue[code] = {
+            'sell_type': sell_type,
+            'signal_price': round(signal_price, 3),
+            'signal_date': datetime.now().strftime('%Y-%m-%d'),
+            'reason': reason,
+            'status': 'pending',
+        }
+        self._t1_save(queue)
+
+    def get_t1_pending(self):
+        """获取今天需要执行的T+1卖出 (昨日或更早的pending)"""
+        today = datetime.now().strftime('%Y-%m-%d')
+        queue = self._t1_load()
+        return [{'code': c, **info} for c, info in queue.items()
+                if info.get('status') == 'pending' and info.get('signal_date') != today]
+
+    def mark_t1_executed(self, code):
+        """标记T+1卖出已执行"""
+        queue = self._t1_load()
+        if code in queue:
+            queue[code]['status'] = 'executed'
+            queue[code]['executed_date'] = datetime.now().strftime('%Y-%m-%d')
+            self._t1_save(queue)
+
+    def _t1_load(self):
+        path = self._t1_file()
+        if os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def _t1_save(self, queue):
+        path = self._t1_file()
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(queue, f, ensure_ascii=False, indent=2)

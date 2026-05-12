@@ -1558,6 +1558,19 @@ def _mp_worker(args):
             except Exception:
                 pass
 
+    # 小转大检测: 日线笔幅度衰减预警 (v73简化版)
+    # 完整版需要30min卖点, 这里只检测日线笔衰减
+    try:
+        from lib.small_to_large import detect_daily_pen_decay, apply_stl_adjust
+        for s in signals:
+            decay = detect_daily_pen_decay(strokes)
+            if decay and decay.get('detected'):
+                s['pen_decay_warning'] = decay['msg']
+                s['confidence'] = apply_stl_adjust(
+                    s.get('confidence', 0.5), s.get('signal_type', ''), decay)
+    except Exception:
+        pass
+
     # ATR分段止损 (v73: 按买点类型使用不同ATR倍数)
     _atr_mult_map = {
         '1buy': 0.75, '2buy': 1.50, '3buy': 0.75,
