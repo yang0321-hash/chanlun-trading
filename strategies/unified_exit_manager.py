@@ -184,10 +184,11 @@ class UnifiedExitManager:
 
         # === 3. Fixed stop loss ===
         if self.config.use_fixed_stop and record.fixed_stop_loss > 0:
-            # v3a风格: 盈利>5%后止损提到保本
-            if profit_pct >= 0.05:
-                if record.fixed_stop_loss < record.entry_price:
-                    record.fixed_stop_loss = record.entry_price
+            # 盈利>8%后止损提到入场价+3% (回测验证: 避免5%被震出)
+            if profit_pct >= 0.08:
+                breakeven_price = record.entry_price * 1.03
+                if record.fixed_stop_loss < breakeven_price:
+                    record.fixed_stop_loss = breakeven_price
                     record.breakeven_raised = True
 
             if price <= record.fixed_stop_loss:

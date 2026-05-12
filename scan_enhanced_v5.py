@@ -2291,6 +2291,22 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
     if _conf_filtered > 0:
         print(f'   置信度过滤: {_conf_filtered}只 CONF<0.6 已移除')
 
+    # 止损距离过滤: 止损距入场<2%说明空间不够, 跳过 (回测验证)
+    _stop_before = len(results)
+    filtered_results = []
+    for r in results:
+        entry = r.get('entry_price', r.get('2buy_price', 0))
+        stop = r.get('stop_price', r.get('1buy_low', 0))
+        if entry > 0 and stop > 0:
+            stop_dist = (entry - stop) / entry
+            if stop_dist < 0.02:
+                continue
+        filtered_results.append(r)
+    results = filtered_results
+    _stop_filtered = _stop_before - len(results)
+    if _stop_filtered > 0:
+        print(f'   止损距离过滤: {_stop_filtered}只 止损距<2% 已移除')
+
     results.sort(key=lambda x: x['total_score'], reverse=True)
 
     print(f'\n{"="*90}')
