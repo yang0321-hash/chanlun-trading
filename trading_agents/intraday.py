@@ -419,6 +419,14 @@ class IntradayAgent:
         # 止损检查
         self._check_stop_losses()
 
+        # T+1卖出检查 (昨日pending的卖出信号, 今日开盘执行)
+        if self.scan_count == 1:
+            self._check_t1_pending()
+
+        # 回撤状态更新 (每10轮)
+        if self.scan_count % 10 == 0:
+            self._update_drawdown()
+
         # 组合VaR实时监控 (每10轮一次)
         if self.scan_count % 10 == 0:
             self._check_portfolio_risk()
@@ -501,6 +509,40 @@ class IntradayAgent:
                     pass
         if price_map:
             self.pm.update_prices(price_map)
+
+    def _check_t1_pending(self):
+        """检查T+1卖出队列 — 昨日pending信号今日开盘执行"""
+        pending = self.pm.get_t1_pending()
+        if not pending:
+            return
+        for item in pending:
+            code = item['code']
+            name = item.get('name', code)
+            price = self.hs.get_realtime_price(code)
+            if not price or price <= 0:
+                continue
+            print(f'  [T+1 SELL] {code_to_prefix(code)} 执行卖出 {price:.2f} ({item["reason"]})')
+            self.pm.sell(code)
+            self.pm.mark_t1_executed(code)
+            send_notification(f'T+1卖出 {name}',
+                f'{code_to_prefix(code)} ({name})\n'
+                f'价格:{price:.2f}\n原因:{item.get("reason", "T+1队列")}')
+
+    def _update_drawdown(self):
+        """更新回撤状态"""
+        try:
+            price_map = {}
+            for pos in self.pm.get_all_positions():
+                p = self.hs.get_realtime_price(pos.code)
+                if p and p > 0:
+                    price_map[pos.code] = p
+            self.pm.update_drawdown(price_map)
+            dd = self.pm.get_drawdown()
+            dd_scale = self.pm.get_dd_scale()
+            if dd < -0.15:
+                print(f'  [DD] 回撤警告: {dd:.1%} 缩仓: {dd_scale:.0%}')
+        except Exception:
+            pass
 
     def _check_portfolio_risk(self):
         """盘中组合VaR/CVaR实时监控 — 风险超标时告警"""
