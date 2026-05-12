@@ -80,9 +80,9 @@ class MarketEnvironment:
     # 买点类型权重映射
     SIGNAL_WEIGHTS = {
         'BULL': {
-            '1buy': 1.0, '2buy': 1.2, '3buy': 1.0,
+            '1buy': 1.0, '2buy': 1.2, '3buy': 1.3,
             'quasi2buy': 1.0, 'quasi3buy': 0.5,
-            '2b3bbuy': 1.2, 'sub1buy': 1.5,
+            '2b3bbuy': 1.2, 'sub1buy': 1.2,
         },
         'NEUTRAL': {
             '1buy': 1.0, '2buy': 1.0, '3buy': 0.5,

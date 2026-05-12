@@ -1870,10 +1870,84 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=10.0, max_price=20
     td_hit = sum(1 for s in all_signals if s.get('td_boost', 0) != 0)
     print(f'   [5.5] TD Sequential: {td_hit}/{len(all_signals)} signals affected ({time.time()-t_td_start:.1f}s)')
 
-    # 6a. v7.3: 无周线过滤, MA250已在Step 5.5完成
-    print('   [6a] MA250环境已过滤, 跳过周线...')
-    weekly_passed = all_signals  # all_signals已通过MA250过滤
-    print(f'   候选信号: {len(weekly_passed)}个')
+    # 6a. 多级别联立: 月线定方向 + 周线看结构 (与回测一致)
+    print('   [6a] 月线+周线多级别过滤...')
+    weekly_passed = []
+    monthly_blocked = 0
+    weekly_blocked = 0
+    for item in all_signals:
+        code = item['code']
+        df = daily_map.get(code)
+        if df is None or len(df) < 60:
+            weekly_passed.append(item)
+            continue
+
+        # 月线方向: MA6+MA3判断
+        try:
+            monthly = df.resample('ME').agg({
+                'open': 'first', 'high': 'max', 'low': 'min',
+                'close': 'last', 'volume': 'sum'
+            }).dropna()
+            if len(monthly) >= 10:
+                mc = monthly['close']
+                ma6 = mc.rolling(6).mean().iloc[-1]
+                ma3 = mc.rolling(3).mean().iloc[-1]
+                c = mc.iloc[-1]
+                if c < ma6 and ma3 < ma6:
+                    monthly_blocked += 1
+                    continue
+        except Exception:
+            pass
+
+        # 周线结构: 最近笔方向
+        try:
+            weekly = df.resample('W').agg({
+                'open': 'first', 'high': 'max', 'low': 'min',
+                'close': 'last', 'volume': 'sum'
+            }).dropna()
+            if len(weekly) >= 30:
+                high = weekly['high'].values
+                low = weekly['low'].values
+                n = len(weekly)
+                # 简单swing检测
+                swing_points = []
+                for i in range(3, n - 3):
+                    is_high = all(high[i] >= high[j] for j in range(i-3, i+4) if j != i)
+                    is_low = all(low[i] <= low[j] for j in range(i-3, i+4) if j != i)
+                    if is_high:
+                        swing_points.append(('high', i))
+                    elif is_low:
+                        swing_points.append(('low', i))
+                # 交替合并
+                if len(swing_points) >= 2:
+                    merged = [swing_points[0]]
+                    for pt in swing_points[1:]:
+                        last = merged[-1]
+                        if pt[0] != last[0]:
+                            merged.append(pt)
+                        else:
+                            if pt[0] == 'high':
+                                merged[-1] = pt
+                            else:
+                                merged[-1] = pt
+                    # 最近笔向下 → 检查是否有底分型(买点)
+                    last_swing = merged[-1]
+                    if last_swing[0] == 'high':
+                        # 向下笔中, 检查倒数第二笔是否有低点创新低
+                        if len(merged) >= 4:
+                            # 有买点信号时允许通过
+                            pass
+                        else:
+                            weekly_blocked += 1
+                            continue
+        except Exception:
+            pass
+
+        weekly_passed.append(item)
+
+    _mtf_filtered = len(all_signals) - len(weekly_passed)
+    if _mtf_filtered > 0:
+        print(f'   多级别过滤: 月线={monthly_blocked} 周线={weekly_blocked} → 剩余{len(weekly_passed)}只')
 
     if not weekly_passed:
         print('   无股票通过周线过滤')
