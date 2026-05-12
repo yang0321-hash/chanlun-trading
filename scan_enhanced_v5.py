@@ -2167,28 +2167,8 @@ def scan_enhanced(pool='tdx_all', lookback_days=30, min_price=3.0, max_price=200
                 print(f'   [ML] 首次异常: {_ml_err.__class__.__name__}: {_ml_err}')
             pass
 
-        # === 小转大检测 (v7 from v73) ===
-        small_to_large = None
-        small_to_large_note = ''
-        try:
-            if len(df_30) >= 100:
-                small_to_large = detect_small_to_large(df_30, df_daily)
-                if small_to_large and small_to_large.get('detected'):
-                    # 买点减分/卖点加分
-                    total_score = int(apply_score_adjustment(
-                        total_score / 100.0, signal_type, small_to_large
-                    ) * 100)
-                    small_to_large_note = (
-                        f"小转大! {small_to_large['direction']} | "
-                        f"30m{small_to_large['sell_30m_type']} conf={small_to_large['sell_30m_conf']} | "
-                        f"笔衰减{small_to_large['decay_pct']}% | "
-                        f"中枢{small_to_large['pivot_count_30m']}个"
-                    )
-                    print(f'   ⚡ 小转大预警: {code} {signal_type} → score {total_score}')
-        except Exception as _stl_err:
-            if not hasattr(scan_enhanced, '_stl_err_logged'):
-                scan_enhanced._stl_err_logged = True
-                print(f'   [STL] 首次异常: {_stl_err.__class__.__name__}: {_stl_err}')
+        # 小转大检测已在Step5批量处理 (detect_daily_pen_decay)
+        small_to_large_note = item.get('pen_decay_warning', '')
 
         results.append({
             'code': code,
