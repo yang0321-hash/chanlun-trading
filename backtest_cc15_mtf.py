@@ -1205,6 +1205,24 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
             daily_map[code] = df
     print(f'   日线: {len(daily_map)} 只')
 
+    # 过滤低成交额股票 (排除大盘死股, 近20日均成交额<1亿)
+    min_turnover = p.get('min_turnover', 1e8)
+    filtered = {}
+    for code, df in daily_map.items():
+        recent = df.tail(20)
+        if 'amount' in recent.columns:
+            avg_amt = recent['amount'].mean()
+        elif 'volume' in recent.columns:
+            avg_close = recent['close'].mean()
+            avg_amt = recent['volume'].mean() * avg_close * 100
+        else:
+            avg_amt = 0
+        if avg_amt >= min_turnover:
+            filtered[code] = df
+    if len(filtered) < len(daily_map):
+        print(f'   成交额过滤(>={min_turnover/1e8:.0f}亿): {len(daily_map)} → {len(filtered)} 只')
+    daily_map = filtered
+
     # 找日线3买信号 (使用核心缠论引擎, 每只股票只跑一次管线)
     print('[2] 识别日线3买信号 (核心缠论引擎)...')
     all_buys = []
@@ -1377,6 +1395,11 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
             stop_price = min(candidates)
             stop_price = max(stop_price, entry_price * 0.88)  # 硬止损-12%
 
+        # 最小止损距离过滤: 止损距入场<2%说明空间不够, 跳过
+        stop_distance = (entry_price - stop_price) / entry_price
+        if stop_distance < 0.02:
+            continue
+
         # ========= 支持重新入场的交易循环 =========
         # sub_trades: 同一个2买信号可能产生多次交易(止损→重新入场)
         sub_trades = []
@@ -1495,9 +1518,9 @@ def run_mtf_backtest(codes, start_date='2025-01-01', end_date='2026-04-14',
                         exit_reason = '顶背离清仓(5笔1卖)'
                         break
 
-                # 盈利保护: 盈利>5%后止损移到成本价
-                if profit_pct > 0.05 and current_stop_price < current_entry_price:
-                    current_stop_price = current_entry_price
+                # 盈利保护: 盈利>8%后止损移到入场价+3% (保护利润, 避免被震出)
+                if profit_pct > 0.08 and current_stop_price < current_entry_price * 1.03:
+                    current_stop_price = current_entry_price * 1.03
 
                 # 盈利后移动止损: 从最高点回撤15%
                 if profit_pct > 0.05 and reduce_phase == 0:
