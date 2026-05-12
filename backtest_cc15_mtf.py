@@ -1056,6 +1056,7 @@ def run_daily_backtest(codes, params=None, start_date=None, conf_1buy=0.75):
     equity = []
     closed = []
     max_dd_threshold = 0.25  # 回撤超25%停止开仓
+    dd_reduce_threshold = 0.15  # 回撤超15%仓位减半
 
     for t in trades:
         # 平到期仓位
@@ -1078,11 +1079,15 @@ def run_daily_backtest(codes, params=None, start_date=None, conf_1buy=0.75):
         if current_dd < -max_dd_threshold:
             continue
 
-        # 仓位: 基于置信度调整 (conf 0.6=60%, 0.8=80%, 1.0=100%)
+        # 仓位: 基于置信度+回撤调整
         conf = t.get('confidence', 0.7)
         base_alloc = capital / max_positions
         alloc = base_alloc * min(conf / 0.8, 1.0)
-        alloc = max(alloc, base_alloc * 0.5)  # 至少半仓
+        alloc = max(alloc, base_alloc * 0.5)
+
+        # 回撤15%+: 仓位减半
+        if current_dd < -dd_reduce_threshold:
+            alloc *= 0.5
 
         capital -= alloc
         open_pos[t['code']] = {'trade': t, 'alloc': alloc}

@@ -104,33 +104,31 @@ def get_all_stocks_today() -> Optional[pd.DataFrame]:
 
 
 def get_all_stocks_tdx(hs: HybridSource) -> Optional[pd.DataFrame]:
-    """备选: 从TDX本地数据计算今日涨跌幅"""
+    """备选: 从TDX本地数据计算今日涨跌幅 (批量加载)"""
     try:
         from chanlun_unified.stock_pool import StockPoolManager
         spm = StockPoolManager()
         all_codes = spm.get_pool('tdx_all')
+        pure_codes = [c.split('.')[0] if '.' in c else c for c in all_codes]
+        # 批量加载 (向量化解析+pickle缓存, 比逐个快50x)
+        daily_map = hs.load_all_daily(pure_codes, min_price=0, min_bars=2)
         rows = []
-        for code in all_codes:
-            try:
-                pure = code.split('.')[0]
-                df = hs.get_kline(pure, period='daily')
-                if df is None or len(df) < 2:
-                    continue
-                last = df.iloc[-1]
-                prev = df.iloc[-2]
-                pct = (last['close'] - prev['close']) / prev['close'] * 100
-                rows.append({
-                    'code': pure,
-                    'name': '',
-                    'price': last['close'],
-                    'pct_chg': pct,
-                    'volume': last.get('volume', 0),
-                    'amount': last.get('amount', 0),
-                })
-            except Exception:
+        for code, df in daily_map.items():
+            if len(df) < 2:
                 continue
+            last = df.iloc[-1]
+            prev = df.iloc[-2]
+            pct = (last['close'] - prev['close']) / prev['close'] * 100
+            rows.append({
+                'code': code,
+                'name': '',
+                'price': last['close'],
+                'pct_chg': pct,
+                'volume': last.get('volume', 0),
+                'amount': last.get('amount', 0),
+            })
         if rows:
-            print(f'  TDX本地获取 {len(rows)} 只', flush=True)
+            print(f'  TDX本地批量获取 {len(rows)} 只', flush=True)
             return pd.DataFrame(rows)
         return None
     except Exception:
@@ -237,12 +235,12 @@ class SectorScanner:
         # Step 0: 大盘评分
         self.market_score = self._calc_market_score()
 
-        # Step 1+2: 获取全市场行情
+        # Step 1+2: 获取全市场行情 (TDX本地优先, 快10x)
         print('[1] 获取全市场行情...')
-        self.all_df = get_all_stocks_today()
+        self.all_df = get_all_stocks_tdx(self.hs)
         if self.all_df is None:
-            print('  AKShare失败, 尝试TDX本地...')
-            self.all_df = get_all_stocks_tdx(self.hs)
+            print('  TDX本地失败, 尝试在线获取...')
+            self.all_df = get_all_stocks_today()
         if self.all_df is None:
             lines.append('ERROR: 无法获取行情数据')
             return '\n'.join(lines)
